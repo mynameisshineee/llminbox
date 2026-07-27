@@ -1,0 +1,57 @@
+services:
+  llminbox:
+    build: .
+    # Parametrizable: con el nombre fijo, dos instancias colisionan y la segunda
+    # muere con "container name already in use". Quien quiera probar esto sin tumbar
+    # lo que ya tiene corriendo pone LLMINBOX_NAME y LLMINBOX_PORT.
+    container_name: ${LLMINBOX_NAME:-llminbox}
+    restart: unless-stopped
+    # SOLO loopback. Este servicio indexa el canon de coordinación de la flota;
+    # no tiene ningún motivo para escuchar en una interfaz de red.
+    ports: ["127.0.0.1:${LLMINBOX_PORT:-8077}:8077"]
+    environment:
+      LLMINBOX_DB: /data/llminbox.sqlite
+      LLMINBOX_POLL: "2.0"
+      # El token vive en ~/.llminbox.token (0600, fail-closed: sin él el
+      # compose ni arranca). `llmi up` lo genera si falta y lo exporta al
+      # subproceso — no hay ningún `.env` de por medio. NO va en el compose:
+      # esto se commitea, el token no.
+      LLMINBOX_TOKEN: "${LLMINBOX_TOKEN:?falta ~/.llminbox.token — corre: ./llmi up}"
+      # Vacío por defecto a propósito: un `docker compose up` crudo, sin haber
+      # corrido `llmi init`, arranca con CERO ledgers en vez de fallar contra
+      # rutas que no existen en tu máquina. `./llmi init` descubre los tuyos
+      # y escribe `docker-compose.override.yml` (que `docker compose` carga solo,
+      # sin `-f`) con el valor real y los bind-mounts que le corresponden a cada
+      # uno — ver ese fichero, GENERADO, para el porqué de cada montaje.
+      LLMINBOX_LEDGERS: "${LLMINBOX_LEDGERS:-}"
+      LLMINBOX_ROSTER: /censo.json
+    volumes:
+      # El ÍNDICE va en volumen nombrado, no en bind-mount: SQLite sobre el sistema
+      # de ficheros virtualizado de macOS es lento y su bloqueo es dudoso. El índice
+      # es derivado — si el volumen se pierde, se reconstruye en unos segundos.
+      - llminbox-data:/data
+      # Relativo al propio fichero de compose, no a un $HOME concreto: cualquiera
+      # que clone este repo lo tiene ya en el sitio correcto, sea cual sea su
+      # usuario o dónde puso el checkout.
+      #
+      # TIENE que existir ANTES de `docker compose up`: un bind-mount de FICHERO
+      # ausente, Docker lo sustituye en silencio por un DIRECTORIO vacío, y el
+      # extractor dentonces no reconoce a nadie (`[censo] no pude leer /censo.json:
+      # Is a directory`). Por eso `llmi init` y `llmi up` lo crean los dos
+      # (copiando `roster.example.json` si hace falta) antes de tocar Docker.
+      - ./roster.json:/censo.json:ro
+    healthcheck:
+      # Mira el CUERPO de /health, no solo el código HTTP: con el indexador
+      # muerto en bucle (ledger roto, censo ilegible, …) /health sigue
+      # devolviendo 200 con `{"ok": false}` — un healthcheck que solo comprueba
+      # el status marca "healthy" sobre un servicio mudo. Medido en vivo antes de
+      # este fix: `docker ps` decía "(healthy)" con varios ledgers vaciándose en
+      # silencio detrás. `/health` no lleva token (es la única ruta que no lo
+      # necesita), así que el propio healthcheck puede llamarlo directo.
+      test: ["CMD", "python3", "-c", "import json,urllib.request,sys; d=json.load(urllib.request.urlopen('http://127.0.0.1:8077/health',timeout=2)); sys.exit(0 if d.get('ok') else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+
+volumes:
+  llminbox-data:

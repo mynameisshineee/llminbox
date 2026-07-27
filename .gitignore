@@ -1,0 +1,17 @@
+# Config del usuario: rutas de SU máquina y nombres de SUS agentes.
+# El repo lleva los ejemplos; esto lo genera `llmi init`.
+docker-compose.override.yml
+roster.json
+# Sugerencias de censo que `llmi init` propone cuando roster.json YA existe
+# (no lo pisa) — nombres candidatos vistos en tus ledgers, para que los revises
+# a mano. No es config activa, así que no se commitea.
+roster.discovered.json
+# Mapa nombre-lógico → ruta de host de cada ledger, que `llmi init` escribe
+# para que `llmi stat` pueda comparar bytes host↔contenedor (detector de
+# deriva de montaje). Dato derivado de docker-compose.override.yml, no config.
+.llmi-mounts.json
+.env
+__pycache__/
+
+# política local de exclusión (rutas de esta máquina)
+.llminbox-excluir
