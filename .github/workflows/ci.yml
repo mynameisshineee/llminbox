@@ -28,6 +28,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v4
+        # La acción busca `packageManager` en el package.json de la RAÍZ del repo, y
+        # el nuestro vive en `web/`; `working-directory` no cambia dónde mira. Se pasa
+        # la versión explícita, y tiene que coincidir con la de web/package.json.
+        with: { version: 10.33.2 }
       - uses: actions/setup-node@v5
         with: { node-version: 24, cache: pnpm, cache-dependency-path: web/pnpm-lock.yaml }
       # --frozen-lockfile a propósito: si alguien cambia package.json sin regenerar

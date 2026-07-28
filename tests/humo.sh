@@ -8,6 +8,13 @@
 set -uo pipefail
 PUERTO="${PUERTO:-8199}"; NOMBRE="humo-$$"; TOK="humo-$(date +%s)"
 TMP="$(mktemp -d)"; FALLOS=0
+# `mktemp -d` crea el directorio en 700 y propiedad de quien lo llama. En Linux eso
+# significa que el contenedor —que corre como uid 1000, no como root— NO puede leer
+# el ledger montado dentro, y el servicio indexa CERO sin que el test sepa por qué.
+# En macOS no se nota: Docker Desktop virtualiza la propiedad (`fakeowner`) y todo
+# se lee. Cazado por el CI en la primera corrida real, que es exactamente para lo
+# que existe un gate que corre en la máquina de otro.
+chmod 755 "$TMP"
 limpiar() { docker rm -f "$NOMBRE" >/dev/null 2>&1; rm -rf "$TMP"; }
 trap limpiar EXIT
 
@@ -36,6 +43,12 @@ comp "token bueno → 200"      "200" "$(curl -s -o /dev/null -w '%{http_code}' 
 # falsador: /docs abierto fue un agujero real; si vuelve, esto da 200
 comp "/docs cerrado → 404"    "404" "$(curl -s -o /dev/null -w '%{http_code}' "$U/docs")"
 comp "/openapi cerrado → 404" "404" "$(curl -s -o /dev/null -w '%{http_code}' "$U/openapi.json")"
+
+# Antes que nada: si el servicio no puede LEER un ledger, todo lo de abajo da cero
+# y el test culpa al indexado. `/health` ya lo dice —cada ledger roto con su motivo—;
+# lo que faltaba era mirarlo.
+ROTOS=$(curl -s "$U/health" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("rotos") or "")')
+[ -z "$ROTOS" ] && ok "ningún ledger roto" || fallo "ningún ledger roto" "ninguno" "$ROTOS"
 
 echo "── indexado ──"
 comp "indexa las 2 entradas" "2" "$(curl -s "${A[@]}" "$U/stat" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["entradas"])')"
