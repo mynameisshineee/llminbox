@@ -1,3 +1,17 @@
+# ── etapa 1: la interfaz ──────────────────────────────────────────────────────
+# Se compila DENTRO de la imagen, así que quien la usa sigue haciendo
+# `docker compose up` y nada más — no necesita Node, ni pnpm, ni saber que esto
+# es React. El autohospedaje no se pierde por tener una etapa de compilación:
+# se perdería por depender de un CDN en tiempo de ejecución, y no hay ninguno.
+FROM node:24-slim AS web
+WORKDIR /web
+RUN corepack enable
+COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY web/ ./
+RUN pnpm build
+
+# ── etapa 2: el servicio ──────────────────────────────────────────────────────
 FROM python:3.13-slim
 
 # Sin compilador ni ruedas nativas: fastapi + uvicorn + pydantic bastan, y el
@@ -7,6 +21,10 @@ RUN pip install --no-cache-dir "fastapi==0.121.*" "uvicorn[standard]==0.39.*" "p
 
 WORKDIR /app
 COPY ledger_parse.py servicio.py ui.html /app/
+# La interfaz compilada en la etapa anterior. `ui.html` se conserva como
+# respaldo sin build — si algún día la etapa de Node falla, el servicio sigue
+# sirviendo una interfaz usable en vez de una página en blanco.
+COPY --from=web /static /app/static
 
 # No corre como root: el bind-mount de los ledgers es de escritura y un servicio
 # que puede reescribir el canon de la flota no necesita además ser root.

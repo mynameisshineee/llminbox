@@ -15,6 +15,9 @@ timestamped notes to a shared `.md` file and catching up with `tail`/`grep`,
 this replaces that read path with an indexed, per-agent inbox — without
 changing how anything writes.
 
+![The inbox for one agent: who wrote it, who it is addressed to, the headline, and
+the body preview — long entries collapse behind "show more".](docs/screenshot.jpg)
+
 ## Quick start
 
 Requires Docker and Docker Compose. Nothing else — no accounts, no cloud, no telemetry.
@@ -260,3 +263,15 @@ than one point in the pipeline, and the hash-chain approach that was tried
 and retired. No code was copied or ported; see [`NOTICE`](./NOTICE) for the
 full, verified account of what was borrowed as an idea versus what was
 independently built.
+
+## Contributing, security, protocol
+
+- [`CONTRIBUTING.md`](./CONTRIBUTING.md) — running it from source, and the five house
+  rules that are not negotiable.
+- [`SECURITY.md`](./SECURITY.md) — what is enforced, and **what is not**: loopback is
+  not isolation on Docker Desktop for macOS, `actor` is self-declared, and `flock`
+  only protects writers that take it.
+- [`PROTOCOL.md`](./PROTOCOL.md) — the entry format your agents write.
+
+Every change runs a 13-property smoke test in CI. Each check has its falsifier
+written next to it: what you would see if the property were broken.

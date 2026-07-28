@@ -1,0 +1,76 @@
+# Gate FUERA del proceso del agente.
+#
+# Todo lo que este repo comprueba —cadena de custodia, integridad, contraste— lo
+# comprobaba hasta ahora el mismo proceso que escribía el código. Un agente que
+# narra su propio veredicto no es una comprobación. Esto corre en la máquina de
+# otro, sobre lo que de verdad está en la rama.
+name: CI
+
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  humo:
+    name: Prueba de humo (13 propiedades, cada una con su falsador)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Construir la imagen
+        run: docker build -t llminbox:test .
+      - name: Correr el humo
+        run: IMAGEN=llminbox:test ./tests/humo.sh
+
+  interfaz:
+    name: La interfaz compila con TypeScript estricto
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: web } }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with: { node-version: 24, cache: pnpm, cache-dependency-path: web/pnpm-lock.yaml }
+      # --frozen-lockfile a propósito: si alguien cambia package.json sin regenerar
+      # el lockfile, esto falla aquí en vez de dar una imagen distinta a la probada.
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+  higiene:
+    name: Sin secretos ni rutas personales en lo publicable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Barrer el árbol publicado
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys, os
+          PAT = {
+            "token":        re.compile(r'\b(sv_|wk_|ghp_|sk-)[A-Za-z0-9_\-]{16,}'),
+            "AWS":          re.compile(r'AKIA[0-9A-Z]{16}|arn:aws:'),
+            "clave privada":re.compile(r'BEGIN [A-Z ]*PRIVATE KEY'),
+            "ruta personal":re.compile(r'/Users/[a-z]+|/home/(?!runner)[a-z]+'),
+            "IP privada":   re.compile(r'\b10\.\d+\.\d+\.\d+\b|\b192\.168\.\d+\.\d+\b'),
+          }
+          # CONTROL POSITIVO: un detector que no detecta también da cero.
+          casos = {"token":"sv_abcdefghij1234567890","AWS":"arn:aws:iam",
+                   "clave privada":"BEGIN RSA PRIVATE KEY","ruta personal":"/Users/alguien",
+                   "IP privada":"10.1.0.1"}
+          for n, rx in PAT.items():
+              assert rx.search(casos[n]), f"el detector {n} está muerto"
+          print("control positivo: los 5 detectores cazan su caso plantado ✓")
+          fs = subprocess.run(["git","ls-files"], capture_output=True, text=True).stdout.split()
+          malos = 0
+          for f in fs:
+              # El propio workflow contiene los PATRONES como texto, así que se marcaría a sí
+              # mismo y el gate fallaría siempre — un rojo permanente enseña a ignorar el rojo,
+              # igual que un verde permanente enseña a confiar en él. Cazado antes de publicarlo.
+              if f == ".github/workflows/ci.yml": continue
+              if not os.path.isfile(f) or f.endswith((".png",".jpg",".ico",".lock",".yaml")): continue
+              for i, l in enumerate(open(f, encoding="utf-8", errors="replace"), 1):
+                  for n, rx in PAT.items():
+                      m = rx.search(l)
+                      if m:
+                          malos += 1
+                          print(f"::error file={f},line={i}::[{n}] {m.group(0)[:50]}")
+          sys.exit(1 if malos else 0)
+          PY

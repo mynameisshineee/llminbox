@@ -15,3 +15,7 @@ __pycache__/
 
 # política local de exclusión (rutas de esta máquina)
 .llminbox-excluir
+
+# la interfaz compilada la genera el Dockerfile, no se commitea
+web/node_modules/
+static/

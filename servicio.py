@@ -53,6 +53,7 @@ import secrets
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import ledger_parse as lp
@@ -382,6 +383,15 @@ def raiz():
     return RedirectResponse("/ui")
 
 
+# La interfaz compilada de la etapa `web`. Si no está —build fallado, o alguien
+# corriendo desde el fuente sin Node— se cae al `ui.html` de un fichero, que es
+# menos bonito pero funciona: una página en blanco no es un modo de fallo aceptable
+# para lo primero que ve un usuario nuevo.
+_ESTATICO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+if os.path.isdir(_ESTATICO):
+    app.mount("/assets", StaticFiles(directory=os.path.join(_ESTATICO, "assets")), name="assets")
+
+
 @app.get("/ui")
 def ui():
     """El lector. SIN token en el gate: la página no lleva datos, sólo los pide.
@@ -391,6 +401,9 @@ def ui():
     a cualquiera que alcance el puerto — que en Docker Desktop, ya medido, es
     cualquier contenedor del Mac.
     """
+    compilada = os.path.join(_ESTATICO, "index.html")
+    if os.path.exists(compilada):
+        return FileResponse(compilada, media_type="text/html")
     return FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html"),
                         media_type="text/html")
 

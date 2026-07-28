@@ -336,40 +336,67 @@ if not manifiesto or os.environ.get("LLMINBOX_DEMO"):
     demo_path = os.path.join(demo_dir, "LEDGER.md")
 
     AGENTES_DEMO = ["alice-backend", "alice-frontend", "bob-reviewer", "bob-research"]
-    TIPOS_DEMO = ["PRODUCED", "FYI", "REQUEST", "ACK", "HEARTBEAT"]
-    CUERPOS = [
-        "Contexto: esto es una entrada de EJEMPLO generada por `llmi init` para que\n"
-        "veas el formato y la UI tenga algo real que enseñar. Con un ledger de verdad\n"
-        "en tu disco, `llmi init` monta ESE en vez de esto.",
-        "Nota corta de coordinación: prueba `llmi inbox <agente>` con cada uno de los\n"
-        "cuatro nombres de arriba y compara cuántas entradas trae contra un `tail` del\n"
-        "fichero entero — esa diferencia es el filtro por destinatario.",
-        "Avance: nada que hacer aquí, es relleno de ejemplo. El punto es que estas\n"
-        "entradas están DIRIGIDAS a agentes concretos, así que la bandeja de cada uno\n"
-        "no es igual a la de los demás.",
+
+    # Un hilo de coordinación PLAUSIBLE, en inglés (el producto es público). Antes
+    # decía "entrada de ejemplo #48" repetido: enseñaba la mecánica y nada del valor.
+    # Esto es lo primero que ve quien instala esto, y también lo que sale en la
+    # captura del README — tiene que parecerse a un ledger de verdad.
+    GUION = [
+        ("alice-backend", "alice-frontend", "PRODUCED",
+         "Auth endpoints are live on staging",
+         "POST /v1/sessions and DELETE /v1/sessions are deployed. Contract matches the\n"
+         "spec except one thing: expired tokens return 401 with an empty body, not the\n"
+         "error envelope. I left it that way on purpose — the envelope leaked whether\n"
+         "the account exists. Flagging it because your error handling assumes a body."),
+        ("alice-frontend", "alice-backend", "ACK",
+         "Adjusted — but the empty 401 breaks the retry banner",
+         "Handled. One consequence you may not want: with no body I cannot tell an\n"
+         "expired session from a revoked one, so both show the generic 'signed out'\n"
+         "message. If that distinction matters to the user, we need a header."),
+        ("bob-reviewer", "alice-backend", "REQUEST",
+         "Need the rate limit on /v1/sessions before I sign off",
+         "The endpoint is unauthenticated by definition, so it is the cheapest place to\n"
+         "brute-force. I do not see a limiter in the diff. Is it upstream in the proxy?\n"
+         "If so, point me at the config and I will verify it rather than assume it."),
+        ("alice-backend", "bob-reviewer", "RESP",
+         "It is in the proxy — and you were right to ask, it was wrong",
+         "Config is at infra/proxy/limits.conf. 100 req/min per IP, which is useless\n"
+         "against a distributed attempt. Tightened to 10/min per IP AND 5/min per\n"
+         "account. Measured on the staging traffic: zero legitimate requests hit either."),
+        ("bob-research", "equipo", "FYI",
+         "Three auth libraries compared — none of them fit",
+         "Looked at the usual three. All of them assume a session store we do not have,\n"
+         "and adopting one means either running Redis or rewriting the token model.\n"
+         "Recommendation: keep the current 40 lines. Written up with the numbers."),
+        ("bob-reviewer", "equipo", "DONE",
+         "Auth review closed — two findings, both fixed",
+         "The rate limit above, and a timing difference between 'unknown account' and\n"
+         "'wrong password' that made account enumeration possible. Both verified fixed\n"
+         "against staging, not just in the diff."),
+        ("alice-frontend", "bob-reviewer", "REQUEST",
+         "Can you look at the session-expiry banner before it ships?",
+         "It is the one piece of auth UI a user sees when things go wrong, and I have\n"
+         "no way to test the revoked-session path locally. Branch is up."),
+        ("alice-backend", "equipo", "HEARTBEAT",
+         "still on the migration, nothing blocking",
+         "Backfill is at 60%. No action needed from anyone."),
     ]
-    # Determinista por aritmética (índices, no random): mismo demo en cada
-    # máquina, sin depender de una semilla que nadie vuelve a mirar.
+
+    # Determinista por aritmética (índices, no random): mismo demo en cada máquina,
+    # sin depender de una semilla que nadie vuelve a mirar.
     ahora = datetime.now(timezone.utc)
     lineas = []
     n_entradas = 48
     for i in range(n_entradas):
-        actor = AGENTES_DEMO[i % len(AGENTES_DEMO)]
-        # Cada 4ª entrada va a todo el equipo; el resto, a un agente concreto
-        # distinto del actor — así cada bandeja recibe una mezcla real.
-        if i % 4 == 3:
-            dest = "equipo"
-        else:
-            # offset en {1,2,3}: nunca 0 mod 4, así que dest nunca coincide con
-            # actor (una entrada dirigida a uno mismo no enseña nada del filtro).
-            offset = 1 + ((i // 4) % 3)
-            dest = AGENTES_DEMO[(i + offset) % len(AGENTES_DEMO)]
-        tipo = TIPOS_DEMO[i % len(TIPOS_DEMO)]
+        actor, dest, tipo, titular, cuerpo = GUION[i % len(GUION)]
+        vuelta = i // len(GUION)
         ts = ahora - timedelta(hours=(n_entradas - i) * 3, minutes=(i * 7) % 60)
         ts_s = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
-        cuerpo = CUERPOS[i % len(CUERPOS)]
+        # El guion se repite en vueltas; se numera para que las entradas no salgan
+        # byte a byte idénticas — con identidad por CONTENIDO, dos iguales son UNA.
+        suf = "" if vuelta == 0 else f" (round {vuelta + 1})"
         lineas.append(
-            f"### [{actor} → {dest} · {tipo}] {ts_s} — entrada de ejemplo #{i + 1}\n"
+            f"### [{actor} → {dest} · {tipo}] {ts_s} — {titular}{suf}\n"
             f"{cuerpo}\n\n"
         )
     with open(demo_path, "w", encoding="utf-8") as fh:
