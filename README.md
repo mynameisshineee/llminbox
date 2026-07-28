@@ -15,6 +15,11 @@ timestamped notes to a shared `.md` file and catching up with `tail`/`grep`,
 this replaces that read path with an indexed, per-agent inbox — without
 changing how anything writes.
 
+**Who this is not for:** if you're picking a workspace from scratch, you want
+a platform, not this. [block/buzz](https://github.com/block/buzz) is the good
+answer there and has 65 people on it. This is for logs that already exist and
+would be expensive to move — see [the comparison below](#an-inbox-is-no-longer-the-differentiator-re-checked-2026-07-28).
+
 ![The inbox for one agent: who wrote it, who it is addressed to, the headline, and
 the body preview — long entries collapse behind "show more".](docs/screenshot.jpg)
 
@@ -99,11 +104,36 @@ scale:
 no specific claim is made about them beyond sharing the same markdown
 substrate.)
 
-So the honest comparison for this project isn't a chat tool — it's
-`maxEntriesToLoad: 20`. Every project we've found in this space currently
-answers "how do I catch up" with "load the last N." This project measured
-what that costs and gave each agent a cursor instead:
-`GET /inbox/<agent>` + `POST /inbox/<agent>/leido`.
+### An inbox is no longer the differentiator (re-checked 2026-07-28)
+
+An earlier draft of this section claimed every project in this space answers
+"how do I catch up" with "load the last N." **That is no longer true**, and
+saying so would now be the kind of claim that survives only because nobody
+re-measured it.
+
+[block/buzz](https://github.com/block/buzz) (14.7k stars, 65 contributors)
+merged an Inbox refactor on 2026-07-27 — PR #2045, 43 files, +3,533/−660 —
+with one row per conversation, an unread boundary, and resuming at the oldest
+unread message. Its stated scope is *"intentionally not a mirror of every
+unread event in every channel."* That is the same idea, shipped by a much
+bigger team.
+
+So the honest position isn't "we invented the inbox." It's **where the inbox
+sits**:
+
+| | Buzz | llminbox |
+|---|---|---|
+| substrate | a Nostr relay you run | the `.md` files you already have |
+| scoped to | the human user (plus *"agents the user owns or controls"*) | each agent, one cursor per (agent, log) |
+| to adopt | move the conversation onto the relay | point it at a file path |
+| if it stops | the workspace stops | `tail` and `>>` keep working (falsifier T5) |
+
+If you're choosing a place for humans and agents to work together, Buzz is a
+far larger and better-staffed answer, and this project is not competing with
+it. This one exists for the case where **the log already exists** and moving
+it is the expensive part — a repo's `LEDGER.md`, a spoke's `AGENT_LEDGER.md`,
+four header conventions nobody agreed on in advance. The read path changes;
+nothing about writing does.
 
 ## When does this actually help? (the honest threshold)
 
@@ -141,6 +171,25 @@ what happens to an entry that doesn't parse) is documented in
 - `GET /entries`, `GET /lint`, `GET /chain/verify`, `GET /stat` — search,
   a per-field typing-debt census, an append-only integrity check, and a
   mount-drift detector.
+- `GET /canon/pendientes` + `llmi canon` — **the distillation queue**: of the
+  entries addressed to you, which ones haven't yet become a wiki page. Ordered
+  oldest-first, because a queue is worked from what has waited longest — the
+  opposite of the inbox, which is read newest-first because it answers "what
+  did I miss."
+
+  Closing an item is a line appended **to the ledger**, not a row in this
+  database: `[destilado: <eid> → <kb>:<path>]`, or `[destilado: <eid> → NO:
+  reason]` for what was judged and rejected. Without that second form a routine
+  ack can never leave the queue, and a queue that can't be emptied becomes a red
+  light people learn to ignore. Keeping the record in the ledger means it
+  inherits git's hash chain and per-person signing, and stays the one thing here
+  that isn't reconstructible from markdown — so it isn't kept somewhere
+  disposable.
+
+  Who the distiller is comes from `LLMINBOX_DESTILADOR` (default `destilador`),
+  and it reads other agents' mail via `escucha` in the roster — with **its own
+  cursor**, so reading a stream never consumes it for whoever owns it. See
+  [PROTOCOL.md §6.1](PROTOCOL.md).
 - **`POST /append` (experimental).** A validated write path — it exists and
   is tested, but mounts are `:ro` by default and this is *not* the primary
   way to write: in this project's own deployment, raw `>>` still outnumbers
@@ -245,6 +294,22 @@ surfaced under adversarial review, which is why the falsifiers exist as a
 table, not a claim: twelve currently run clean, and the one that matters
 most is the one that can go red — change one word inside a sealed entry and
 the integrity check names the entry, its line, and its header.
+
+Two more, added while wiring the distillation queue:
+
+- **A name in a roster is a namespace, not a label.** The distiller was first
+  registered as `canon`. That word appears 3,906 times in the prose of these
+  logs, so the first index pass attributed 46 entries to an agent nobody had
+  ever written to. `llmi lint` now flags roster names whose mention-to-use
+  ratio is lopsided — *"is this a name or a word?"* — with no dictionary, so it
+  works in any language.
+- **A broken report is quieter than a missing one.** `GET /lint` returned HTTP
+  500 for days: it joined on a column that content-addressed identity had
+  removed. Nobody noticed because the caller filtered its output by line
+  prefix, and an error doesn't match the filter — so the gap read as "no
+  findings." The smoke test now asserts that every read-only report answers
+  with a status code and a recognizable shape, not merely that it returns
+  something.
 
 The full account — every measurement, both false starts on the hash chain,
 and the three team-coordination assumptions that broke under a second

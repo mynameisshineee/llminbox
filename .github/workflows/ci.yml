@@ -12,7 +12,7 @@ on:
 
 jobs:
   humo:
-    name: Prueba de humo (13 propiedades, cada una con su falsador)
+    name: Prueba de humo (cada propiedad con su falsador)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

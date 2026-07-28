@@ -556,34 +556,48 @@ def inbox(agent: str, limit: int = Query(30, le=200)):
     verdad: quien consume decide cuándo consumió, y si se cae a mitad no pierde nada.
     """
     con = db()
+    # Los nombres cuyo correo cae aquí: el suyo y los que escuche por censo. El cursor
+    # sigue siendo de `agent` — escuchar un flujo no es consumirlo para su dueño.
+    nombres = lp.escuchados(agent)
+    marcas = ",".join("?" * len(nombres))
     out, tope = [], {}
     for name in LEDGERS:
         c = con.execute("SELECT last_arrival FROM cursors WHERE agent=? AND ledger=?",
                         (agent, name)).fetchone()
         last = c["last_arrival"] if c else -1
         rows = con.execute(
-            "SELECT e.arrival,e.ts,e.actor,e.tipo,e.line_no,e.head FROM entries e "
-            "JOIN recipients r ON r.ledger=e.ledger AND r.eid=e.eid "
-            "WHERE e.ledger=? AND r.who=? AND e.arrival>? AND e.ausente IS NULL "
+            "SELECT e.arrival,e.eid,e.ts,e.actor,e.tipo,e.line_no,e.head FROM entries e "
+            # EXISTS, no JOIN: con dos nombres escuchados, una entrada dirigida a los
+            # dos sale DUPLICADA por el JOIN. El EXISTS la cuenta una vez y sigue
+            # usando el índice `i_who`.
+            f"WHERE e.ledger=? AND EXISTS (SELECT 1 FROM recipients r WHERE "
+            f"r.ledger=e.ledger AND r.eid=e.eid AND r.who IN ({marcas})) "
+            "AND e.arrival>? AND e.ausente IS NULL "
             # Lo MÁS RECIENTE primero, y se le da la vuelta abajo para leer en orden.
             # Con `ORDER BY arrival` a secas, un agente que estrena cursor recibe sus
             # 30 entradas MÁS VIEJAS —vi la bandeja de un humano con 30.246 mensajes
             # empezando por junio—. La bandeja es "lo que me he perdido", y lo que uno
             # se ha perdido se lee del final hacia atrás, no del principio.
             "ORDER BY e.arrival DESC LIMIT ?",
-            (name, agent, last, limit)).fetchall()
+            (name, *nombres, last, limit)).fetchall()
         if not rows:
             continue
         rows = list(reversed(rows))       # cronológico dentro del bloque
         atras = con.execute(
-            "SELECT COUNT(*) n FROM entries e JOIN recipients r "
-            "ON r.ledger=e.ledger AND r.eid=e.eid "
-            "WHERE e.ledger=? AND r.who=? AND e.arrival>? AND e.ausente IS NULL",
-            (name, agent, last)).fetchone()["n"]
+            "SELECT COUNT(*) n FROM entries e "
+            f"WHERE e.ledger=? AND EXISTS (SELECT 1 FROM recipients r WHERE "
+            f"r.ledger=e.ledger AND r.eid=e.eid AND r.who IN ({marcas})) "
+            "AND e.arrival>? AND e.ausente IS NULL",
+            (name, *nombres, last)).fetchone()["n"]
         cola = f" · {atras - len(rows)} más atrás" if atras > len(rows) else ""
-        out.append(f"── {name} · {len(rows)} de {atras} para ti (lo más reciente{cola}) ──")
+        escucha = (" · escuchando " + ", ".join(nombres[1:])) if len(nombres) > 1 else ""
+        out.append(f"── {name} · {len(rows)} de {atras} para ti "
+                   f"(lo más reciente{cola}){escucha} ──")
         for r in rows:
-            out.append(f"  #{r['arrival']} L{r['line_no']} {r['ts'] or '·'} "
+            # El `eid` va delante del número de línea a propósito: la línea se mueve
+            # con cada apéndice de otro y el `eid` no. Es la coordenada que se puede
+            # citar en una página de wiki y seguir resolviendo dentro de un año.
+            out.append(f"  {r['eid'][:12]} #{r['arrival']} L{r['line_no']} {r['ts'] or '·'} "
                        f"{r['actor'] or '?'} {('['+r['tipo']+']') if r['tipo'] else ''}")
             out.append(f"    {r['head'][:150]}")
         tope[name] = rows[-1]["arrival"]
@@ -612,6 +626,117 @@ def cursor(agent: str):
         out[name] = c["last_arrival"] if c else -1
     con.close()
     return out
+
+
+# ── El destilador ────────────────────────────────────────────────────────────
+# `canon` es un agente del censo con bandeja propia (`escucha: ["wiki-vault"]`), no
+# un modo del servicio. Lo que aquí se añade es lo único que la bandeja NO contesta:
+# de lo que me llegó, ¿qué se convirtió ya en página y qué sigue pendiente?
+#
+# El registro de lo destilado NO vive en esta base de datos. Vive en el propio
+# ledger, como una entrada más:
+#
+#   ### [canon → wiki-vault · INGESTED] 2026-07-28T…Z — destilada la topología a11y
+#   [destilado: a1b2c3d4e5f6 → 64biseus:/wiki/patterns/a11y-contraste.md]
+#
+# Tres razones, y la tercera es la que decide:
+#  1. Todo lo demás de esta base se reconstruye del markdown en 2,2 s. Una tabla de
+#     destilados sería el ÚNICO dato no reconstruible, o sea el único que se pierde
+#     de verdad si alguien tira el volumen de Docker.
+#  2. El ledger ya va en git: la procedencia hereda la cadena de hashes de git y la
+#     firma por persona, sin que este servicio tenga que custodiar nada.
+#  3. Es la tesis del producto aplicada a sí mismo. Si el destilador necesitara una
+#     base de datos aparte para dejar constancia de su trabajo, la tesis —«el
+#     markdown que ya escribís es el canon»— sería falsa justo donde más se mira.
+MARCA_DESTILADO = re.compile(r"\[destilado:\s*([0-9a-f]{8,64})\s*(?:→|->)\s*([^\]]+)\]")
+
+# Quién es el destilador se CONFIGURA; no va cableado. Un producto público no puede
+# dar por hecho el censo de nadie, y el nombre concreto importa más de lo que parece:
+# se dio de alta como `canon` y la primera indexación le atribuyó 46 entradas de
+# prosa —la palabra sale 3.906 veces en estos ledgers— sin que nadie le hubiera
+# escrito nunca. `llmi lint` delata ahora esa clase de nombre.
+DESTILADOR = os.environ.get("LLMINBOX_DESTILADOR", "destilador")
+
+
+@app.get("/canon/pendientes", dependencies=GATE)
+def pendientes(limite: int = Query(40, le=300), ledger: str | None = None):
+    """Lo dirigido al destilador que todavía no es página.
+
+    Orden INVERSO al de `/inbox`, y la diferencia no es cosmética: una bandeja
+    contesta «qué me he perdido» y se lee del final hacia atrás; una cola de trabajo
+    contesta «qué me falta por hacer» y se ataca por lo más viejo, que es lo que
+    lleva más tiempo esperando. La misma tabla, dos preguntas, dos órdenes.
+    """
+    con = db()
+    nombres = lp.escuchados(DESTILADOR)
+    marcas = ",".join("?" * len(nombres))
+    # Las marcas se leen del cuerpo de las entradas del propio ledger. Se recorren
+    # sólo las que llevan la marca: un LIKE sobre 37.000 cuerpos, una vez.
+    hechos, libreta = {}, set()
+    for r in con.execute("SELECT eid, body FROM entries WHERE body LIKE '%[destilado:%' "
+                         "AND ausente IS NULL"):
+        m = MARCA_DESTILADO.findall(r["body"])
+        if not m:
+            continue
+        # La entrada que REGISTRA un destilado no es, ella misma, material a
+        # destilar. Sin esta línea la cola se alimenta sola: el apunte de canon va
+        # dirigido a wiki-vault —tiene que ir, es el acuse— así que vuelve a entrar
+        # como pendiente y la cola nunca baja de uno. Salió en la primera pasada del
+        # falsador P3, con la cuenta de destiladas ya en 1: la marca se leía bien y
+        # aun así el pendiente no bajaba.
+        # El criterio es LLEVAR LA MARCA, no llamarse canon: quien firme el apunte da
+        # igual, y así el mismo patrón decide las dos caras sin inventar un segundo
+        # concepto que se pueda desincronizar del primero.
+        libreta.add(r["eid"])
+        for eid, destino in m:
+            hechos.setdefault(eid, []).append(destino.strip())
+    w = ["e.ausente IS NULL",
+         f"EXISTS (SELECT 1 FROM recipients r WHERE r.ledger=e.ledger AND "
+         f"r.eid=e.eid AND r.who IN ({marcas}))"]
+    p = list(nombres)
+    if ledger:
+        w.append("e.ledger=?"); p.append(ledger)
+    filas = con.execute(
+        f"SELECT e.ledger,e.eid,e.arrival,e.ts,e.actor,e.tipo,e.line_no,e.head "
+        f"FROM entries e WHERE {' AND '.join(w)} ORDER BY e.arrival ASC", p).fetchall()
+    con.close()
+    # El emparejado va por PREFIJO: quien cita puede escribir 12 caracteres del eid
+    # y no los 64. Cotejar por igualdad exacta habría dado «pendiente» a lo ya hecho,
+    # que es el fallo caro — trabajo repetido y una segunda página del mismo hecho.
+    pend, listo, apuntes, fuera = [], 0, 0, 0
+    composicion: dict[str, int] = {}
+    for f in filas:
+        if f["eid"] in libreta:
+            apuntes += 1
+            continue
+        destino = next((d for e, ds in hechos.items() if f["eid"].startswith(e)
+                        for d in ds), None)
+        if destino:
+            # Destino NO = «visto y NO es canon». Sin esta forma, un ACK de rutina no
+            # tiene manera de salir de la cola: quedaría pendiente para siempre y la
+            # cola se volvería una luz roja permanente, que se aprende a ignorar. El
+            # juicio «esto no va a la wiki» es un resultado del trabajo, no su ausencia,
+            # y merece quedar escrito igual que el otro.
+            # Se exige `NO` exacto o seguido de `:`/espacio, no `startswith("NO")`, o
+            # una ruta como `notas/x.md` se descartaría sola.
+            if destino == "NO" or destino[:3] in ("NO:", "NO "):
+                fuera += 1
+            else:
+                listo += 1
+            continue
+        composicion[f["tipo"] or "sin tipo"] = composicion.get(f["tipo"] or "sin tipo", 0) + 1
+        pend.append({"ledger": f["ledger"], "eid": f["eid"], "cita": f["eid"][:12],
+                     "arrival": f["arrival"], "ts": f["ts"], "actor": f["actor"],
+                     "tipo": f["tipo"], "linea": f["line_no"], "head": f["head"][:220]})
+    return {"escuchando": nombres, "dirigidas": len(filas), "destiladas": listo,
+            "descartadas": fuera, "apuntes": apuntes, "pendientes": len(pend),
+            "mostradas": min(limite, len(pend)),
+            # La composición va en la respuesta porque «790 pendientes» invita a leer
+            # 790 hechos durables, y no lo son: la mayoría son acuses y peticiones. Un
+            # número sin su población parece completo y no lo está.
+            "composicion": dict(sorted(composicion.items(), key=lambda kv: -kv[1])),
+            "marca": "[destilado: <eid> → <kb>:<ruta>]  ó  [destilado: <eid> → NO: motivo]",
+            "cola": pend[:limite]}
 
 
 class Leido(BaseModel):
@@ -706,10 +831,15 @@ def lint(ledger: str | None = None, limit: int = Query(10, le=100)):
             # NOT EXISTS, no `seq NOT IN (SELECT …)`: el NOT IN correlacionado
             # materializaba la lista entera de destinatarios por CADA fila —
             # 39 s de los 42 que tardaba `/lint` sobre el ledger mayor, medido. El NOT
-            # EXISTS entra por el prefijo (ledger, seq) de la clave primaria de
+            # EXISTS entra por el prefijo (ledger, eid) de la clave primaria de
             # `recipients` y baja a milisegundos.
+            # Emparejaba por `r.seq`, columna que dejó de existir al pasar a identidad
+            # por contenido: `/lint` devolvía 500 desde entonces. No lo cazó nadie
+            # porque quien lo llamaba filtraba la salida por prefijo de línea, y un
+            # error no casa el filtro — así que la comprobación desaparecía en
+            # silencio y el hueco se leía como «sin hallazgos».
             "sin destinatario": ("NOT EXISTS (SELECT 1 FROM recipients r "
-                                 "WHERE r.ledger=entries.ledger AND r.seq=entries.seq)"),
+                                 "WHERE r.ledger=entries.ledger AND r.eid=entries.eid)"),
         }
         out.append(f"── {name} · {n} entradas ──")
         for etiqueta, cond in faltas.items():
@@ -721,6 +851,59 @@ def lint(ledger: str | None = None, limit: int = Query(10, le=100)):
                          "ORDER BY seq DESC LIMIT ?", (name, limit)).fetchall()
         for r in ej[:3]:
             out.append(f"      ej. #{r['seq']} L{r['line_no']}: {r['head'][:110]}")
+
+    # ── Nombres del censo que colisionan con vocabulario corriente ──────────────
+    # Un censo es un ESPACIO DE NOMBRES. Dar de alta una palabra que la flota usa a
+    # diario en prosa no crea una identidad: crea destinatarios fantasma, y una
+    # atribución equivocada es peor que ninguna.
+    #
+    # Vivido aquí mismo: se dio de alta al destilador como `canon` y la primera
+    # indexación le atribuyó 46 entradas — todas prosa («STRING CANON FINAL», «tu
+    # canon de las 12:16»). La palabra sale 3.906 veces en el corpus y nadie le
+    # había escrito nunca.
+    #
+    # La señal es la RAZÓN entre las dos cosas: cuántas veces se nombra dentro del
+    # texto frente a cuántas veces se le dirige algo. Un agente de verdad recibe
+    # correo en proporción a lo que se le menciona; una palabra común se menciona
+    # muchísimo y no recibe nada. No hace falta diccionario, y funciona en
+    # cualquier idioma — que es lo que se necesita en un repo público.
+    if not ledger:
+        sospechosos = []
+        # Se deduplica por minúsculas: el censo lleva variantes de caja del mismo
+        # humano («Albert», «albert») y sin esto la misma persona sale dos veces.
+        for nombre in sorted({a.lower(): a for a in lp.AGENTES}.values(), key=str.lower):
+            if len(nombre) < 4:            # los muy cortos dan ruido en las dos vías
+                continue
+            # Los destinos de DIFUSIÓN («equipo», «FLOTA», «todos») son palabras
+            # corrientes A PROPÓSITO, y el extractor ya los aparta de `to` por su
+            # propia lista, así que no producen destinatarios fantasma. Delatarlos
+            # sería enseñar tres avisos permanentes que nadie puede resolver — y un
+            # aviso que no se puede apagar enseña a apagar el aviso.
+            if nombre.lower() in lp.DIFSET:
+                continue
+            # COLLATE NOCASE, y contando también como ACTOR. Las dos cosas salieron
+            # de que la primera versión de este chequeo delató a «Albert» con «0
+            # entradas dirigidas» siendo el destinatario número uno con 15.174: el
+            # índice guarda el nombre CANÓNICO («ALBERT») y yo comparaba con la caja
+            # del censo. Y sin contar el papel de actor, un agente que escribe mucho
+            # y no recibe nada —los hay— quedaba señalado como si fuese una palabra.
+            usos = con.execute(
+                "SELECT (SELECT COUNT(*) FROM recipients WHERE who=? COLLATE NOCASE) "
+                "     + (SELECT COUNT(*) FROM entries WHERE actor=? COLLATE NOCASE) c",
+                (nombre, nombre)).fetchone()["c"]
+            menciones = con.execute("SELECT COUNT(*) c FROM entries WHERE body LIKE ?",
+                                    (f"%{nombre}%",)).fetchone()["c"]
+            if menciones >= 50 and usos * 20 < menciones:
+                sospechosos.append((nombre, menciones, usos))
+        if sospechosos:
+            out.append(f"── censo: nombres que puede que no sean nombres "
+                       f"({len(lp.DIFSET)} destinos de difusión excluidos) ──")
+            for nombre, m, u in sorted(sospechosos, key=lambda x: -x[1])[:6]:
+                razon = f"{m // max(u, 1)}×" if u else "nunca"
+                out.append(f"  ⚠ «{nombre}»: {m} menciones en el texto y {u} usos como "
+                           f"actor/destinatario ({razon}) — ¿es un nombre o una palabra?")
+        else:
+            out.append("── censo: ningún nombre parece vocabulario corriente ──")
     con.close()
     return "\n".join(out) + "\n"
 

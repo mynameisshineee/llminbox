@@ -11,6 +11,7 @@ import { BannerSalud } from "@/components/BannerSalud";
 import { EstadoVacio } from "@/components/EstadoVacio";
 import { Separador } from "@/components/Separador";
 import { Fila } from "@/components/Fila";
+import { Detalle } from "@/components/Detalle";
 
 export default function App() {
   const [entrado, setEntrado] = useState(Boolean(getToken()));
@@ -21,7 +22,12 @@ export default function App() {
   const [tipo, setTipo] = useState("");
   const [soloMias, setSoloMias] = useState(false);
   const [menuAbierto, setMenuAbierto] = useState(false);
+  // La entrada abierta se guarda por `eid` y no por índice: la lista se refresca
+  // sola cada pocos segundos y con un índice el panel cambiaría de contenido
+  // debajo del que lee en cuanto llega una entrada nueva por delante.
+  const [abiertaEid, setAbiertaEid] = useState<string | null>(null);
   const sidebarRef = useRef<HTMLElement>(null);
+  const listaRef = useRef<HTMLDivElement>(null);
 
   // Búsqueda debounced 260ms — mismo umbral que ui.html, para no disparar una
   // consulta por cada tecla sobre un ledger de miles de entradas.
@@ -56,6 +62,37 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [entrado, menuAbierto]);
 
+  // Teclado: j/k para moverse, Esc para cerrar. Un lector de logs se recorre con
+  // las manos en el teclado; obligar al ratón para bajar una fila es lo que hace
+  // que una lista larga se abandone.
+  const listaFilas = filas.data ?? [];
+  useEffect(() => {
+    if (!entrado) return;
+    const onKey = (ev: KeyboardEvent) => {
+      // Nunca dentro de un campo: 'j' en el buscador tiene que escribir una jota.
+      const t = ev.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+      if (ev.key === "Escape") return setAbiertaEid(null);
+      if (ev.key !== "j" && ev.key !== "k") return;
+      if (listaFilas.length === 0) return;
+      ev.preventDefault();
+      const i = listaFilas.findIndex((x: Entrada) => x.eid === abiertaEid);
+      const siguiente = ev.key === "j" ? Math.min(i + 1, listaFilas.length - 1) : Math.max(i - 1, 0);
+      // Sin selección, 'j' abre la primera y 'k' la última: entrar por el extremo
+      // que corresponde al sentido de la tecla evita el salto raro al primer uso.
+      const destino = i === -1 ? (ev.key === "j" ? 0 : listaFilas.length - 1) : siguiente;
+      const elegida = listaFilas[destino];
+      if (!elegida) return;
+      setAbiertaEid(elegida.eid);
+      listaRef.current
+        ?.querySelector(`[data-eid="${elegida.eid}"]`)
+        ?.scrollIntoView({ block: "nearest" });
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [entrado, listaFilas, abiertaEid]);
+
   if (!entrado) return <Puerta onEntrar={() => setEntrado(true)} />;
 
   const censo = construirCenso(roster.data);
@@ -83,7 +120,7 @@ export default function App() {
   };
 
   return (
-    <div className="grid h-full min-[760px]:grid-cols-[244px_1fr]">
+    <div className="grid h-full min-[760px]:grid-cols-[252px_1fr]">
       {menuAbierto && (
         <button
           type="button"
@@ -102,6 +139,7 @@ export default function App() {
         yo={yo}
         onCambiarYo={cambiarYo}
         abierta={menuAbierto}
+        censo={censo}
       />
       <main className="flex flex-col overflow-hidden">
         <Header
@@ -119,29 +157,50 @@ export default function App() {
           onAbrirMenu={abrirMenu}
         />
         <BannerSalud salud={salud.data} estado={estado.data} />
-        <div className="flex-1 overflow-y-auto">
-          {filas.isLoading ? (
-            <p role="status" className="p-10 text-center text-sm text-apagado">
-              cargando…
-            </p>
-          ) : !filas.data || filas.data.length === 0 ? (
-            <EstadoVacio
-              motivo={motivoVacio({
-                ledgersConfigurados,
-                filtrosActivos,
-                estado: estado.data ?? [],
-                ledgerSeleccionado: ledger,
-              })}
-              onQuitarFiltros={quitarFiltros}
-            />
-          ) : (
-            filas.data.map((e: Entrada, i: number) => (
-              <Fragment key={`${e.ledger}:${e.eid}`}>
-                {(marcas[i] ?? false) && <Separador n={nuevas} />}
-                <Fila e={e} yo={yo} censo={censo} />
-              </Fragment>
-            ))
-          )}
+        {/* Lista + detalle. La lista se queda escaneable y el ensayo entero —el
+            cuerpo mediano de estos ledgers son 2.130 caracteres— tiene su sitio a
+            la derecha. Por debajo de 1.100 px hay una sola columna y el detalle
+            pasa a capa: partir en dos una pantalla estrecha da dos columnas malas
+            en vez de una buena. */}
+        <div className="grid min-h-0 flex-1 min-[1100px]:grid-cols-[minmax(340px,440px)_1fr]">
+          <div ref={listaRef} className="min-w-0 overflow-y-auto">
+            {filas.isLoading ? (
+              <p role="status" className="p-10 text-center text-sm text-apagado">
+                cargando…
+              </p>
+            ) : !filas.data || filas.data.length === 0 ? (
+              <EstadoVacio
+                motivo={motivoVacio({
+                  ledgersConfigurados,
+                  filtrosActivos,
+                  estado: estado.data ?? [],
+                  ledgerSeleccionado: ledger,
+                })}
+                onQuitarFiltros={quitarFiltros}
+              />
+            ) : (
+              filas.data.map((e: Entrada, i: number) => (
+                <Fragment key={`${e.ledger}:${e.eid}`}>
+                  {(marcas[i] ?? false) && <Separador n={nuevas} />}
+                  <div data-eid={e.eid}>
+                    <Fila
+                      e={e}
+                      yo={yo}
+                      censo={censo}
+                      activa={e.eid === abiertaEid}
+                      onAbrir={() => setAbiertaEid(e.eid === abiertaEid ? null : e.eid)}
+                    />
+                  </div>
+                </Fragment>
+              ))
+            )}
+          </div>
+          <Detalle
+            e={listaFilas.find((x: Entrada) => x.eid === abiertaEid) ?? null}
+            yo={yo}
+            censo={censo}
+            onCerrar={() => setAbiertaEid(null)}
+          />
         </div>
       </main>
     </div>

@@ -234,3 +234,100 @@ compromisos se convierten en tareas del PM —que es lo único que aporta lo
 que aquí falta, un estado de cerrado— y los otros 37.177 se quedan donde
 están. No antes de que la disciplina de tipado suba de forma sustancial
 sobre el ~40% actual.
+
+## La cola de destilación: por qué el registro va al ledger
+
+El destilador no es un modo del servicio: es un agente del censo con bandeja
+propia. Los demás le DIRIGEN lo que merece ser canon; nadie clasifica 37.000
+entradas. El mecanismo ya existía entero — sólo faltaba una pieza.
+
+### `escucha`: leer un flujo sin consumirlo
+
+Un agente puede recibir, además de lo suyo, el correo dirigido a otro nombre.
+Parece un alias y no lo es: **el cursor sigue siendo suyo**. El destilador lee
+las 751 entradas dirigidas a `wiki-vault` sin vaciarle la bandeja a la sesión
+que responde como `wiki-vault`.
+
+Sin ese campo sólo quedaban dos salidas, las dos malas: compartir cursor (los
+dos lectores se consumen el correo) o nombrar al destilador explícitamente en
+cada entrada — o sea pedirle a los demás que cambien cómo escriben, que es lo
+único que este proyecto promete no hacer.
+
+No tiene nada de específico de destilar. Cualquier segundo lector de un flujo
+—un auditor, un resumidor, quien sustituye a alguien de vacaciones— es la
+misma forma.
+
+### El registro va al ledger, no a esta base de datos
+
+Cerrar un ítem es una línea apendizada al ledger:
+
+```
+### [destilador → wiki-vault · INGESTED] <sello> — destilada
+[destilado: <eid> → <kb>:<ruta>]
+```
+
+Tres razones, y la tercera es la que decide:
+
+1. Todo lo demás de esta base se reconstruye del markdown en 2,2 s. Una tabla
+   de destilados sería el único dato no reconstruible: el único que se pierde
+   de verdad si alguien tira el volumen de Docker.
+2. El ledger va en git, así que la procedencia hereda su cadena de hashes y la
+   firma por persona, sin que este servicio custodie nada.
+3. Es la tesis del producto aplicada a sí mismo. Si el destilador necesitara
+   una base aparte para dejar constancia de su trabajo, «el markdown que ya
+   escribís es el canon» sería falso justo donde más se mira.
+
+La forma `[destilado: <eid> → NO: motivo]` cierra lo que se juzgó y NO es
+canon. Sin ella un acuse de rutina no puede salir nunca de la cola, la cola no
+baja de cero y se convierte en una luz roja permanente — que se aprende a
+ignorar, como cualquier alarma que no se puede apagar. El juicio «esto no va a
+la wiki» es un resultado del trabajo, no su ausencia.
+
+Se empareja por PREFIJO del `eid`: quien cita escribe 12 caracteres, no 64.
+Con igualdad exacta lo ya hecho volvería a salir como pendiente, que es el
+fallo caro — trabajo repetido y dos páginas del mismo hecho.
+
+### El apunte no puede alimentar su propia cola
+
+La entrada que registra un destilado va dirigida a `wiki-vault` —tiene que ir,
+es el acuse— así que **vuelve a entrar como pendiente**. La cola se alimentaba
+sola y nunca bajaba de uno. Salió en la primera pasada del falsador, con la
+cuenta de destiladas ya en 1: la marca se leía perfectamente y aun así el
+pendiente no bajaba.
+
+El criterio para excluirla es LLEVAR LA MARCA, no llamarse destilador: quien
+firme el apunte da igual, y así el mismo patrón decide las dos caras sin
+inventar un segundo concepto que se pueda desincronizar del primero.
+
+### Un nombre del censo es un espacio de nombres
+
+Se dio de alta al destilador como `canon`. La primera indexación le atribuyó
+**46 entradas** — todas prosa: «STRING CANON FINAL», «tu canon de las 12:16».
+La palabra sale 3.906 veces en el corpus y nadie le había escrito nunca.
+`destilador` sale cero.
+
+`/lint` delata ahora esa clase de nombre por la RAZÓN entre menciones dentro
+del texto y usos como actor o destinatario. Un agente de verdad recibe correo
+en proporción a lo que se le nombra; una palabra corriente se nombra
+muchísimo y no recibe nada. No hace falta diccionario y funciona en cualquier
+idioma — que es lo que se necesita en un repo público.
+
+La primera versión de esa guarda acusó a `Albert` de tener 0 entradas
+dirigidas siendo el destinatario número uno con 15.174: el índice guarda el
+nombre canónico (`ALBERT`) y la comparación usaba la caja del censo. El
+detector tenía el defecto que perseguía. Los destinos de difusión («equipo»,
+«FLOTA») son palabras corrientes A PROPÓSITO y se excluyen — diciendo cuántos.
+
+### Lo que se decidió no indexar, con la medida que lo sostiene
+
+La cola manual de destilación de esta flota (`WIKI-QUEUE.md`) no se indexa.
+Medido con el troceador real sobre sus diez versiones en git: 90,3% de las
+entradas idénticas entre versiones, 6,9% CRECIERON —el cierre se apendiza, así
+que el texto viejo es prefijo del nuevo— y 2,8% son ediciones de verdad.
+Indexarla dispararía la alarma de «entrada desaparecida» en cada cierre, y una
+alarma que salta con el uso normal enseña a ignorar la alarma.
+
+El dato que importa es otro: había 751 entradas dirigidas a `wiki-vault`
+dentro de los ledgers contra 167 ítems abiertos en el fichero de cola. **La
+cola ya existía dentro del ledger.** El fichero aparte es el artefacto
+compensatorio, igual que `tail -N`.

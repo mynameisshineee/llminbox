@@ -45,6 +45,15 @@
       "nombre": "bob-research",
       "humano": "bob",
       "clave": ""
+    },
+    {
+      "nombre": "destilador",
+      "humano": "alice",
+      "clave": "",
+      "escucha": [
+        "wiki-vault"
+      ],
+      "_nota": "Ejemplo del campo `escucha` (PROTOCOL.md 6.1): recibe tambien lo dirigido a wiki-vault, pero con cursor PROPIO. Leerlo aqui no le vacia la bandeja a quien responde como wiki-vault."
     }
   ],
   "humanos": [

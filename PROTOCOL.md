@@ -241,6 +241,30 @@ to `roster.json` and put your own agents in it). It has three sections:
 - **`difusion`** — broadcast destinations that aren't a specific agent (see
   §3.3).
 
+### 6.1 `escucha` — reading someone else's stream without consuming it
+
+An agent may carry an optional `escucha` list: other names whose mail also lands
+in its inbox.
+
+```json
+{ "nombre": "canon", "humano": "alice", "clave": "",
+  "escucha": ["wiki-vault"] }
+```
+
+This looks like an alias and isn't one. **The cursor still belongs to the
+listening agent.** `canon` reads everything addressed to `wiki-vault`, and
+marking it read moves `canon`'s cursor only — the session that actually answers
+as `wiki-vault` still finds its own inbox untouched.
+
+That distinction is the whole point. Without it, a second reader of the same
+stream has to either share a cursor (the two consume each other's mail) or get
+named explicitly in every entry — which means asking everyone else to change how
+they write, the one thing this project promises not to do.
+
+Nothing about it is specific to distilling: any second reader of a stream —
+an auditor, a summarizer, a stand-in during someone's holiday — is the same
+shape.
+
 An **empty roster is a valid, deliberately-safe state**: with nothing to match
 against, the name-matching regex is built to never match anything (rather than,
 say, matching every word), so a fresh install with no roster configured

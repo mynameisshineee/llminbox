@@ -82,6 +82,24 @@ p='$TMP/l.md'; L=open(p).read().split(chr(10)); open(p,'w').write(chr(10).join(L
 [ "$(curl -s "${A[@]}" "$U/chain/verify" | grep -c '✗')" -ge 1 ] \
   && ok "borrar SÍ alarma" || fallo "borrar SÍ alarma" "≥1 línea con ✗" "0"
 
+echo "── los informes de sólo-lectura CONTESTAN ──"
+# Falsador: `/lint` estuvo devolviendo 500 sin que nadie se enterara —emparejaba por
+# una columna que la migración a identidad-por-contenido había retirado— y quien lo
+# llamaba filtraba su salida por prefijo de línea, así que un error no casaba el
+# filtro y el hueco se leía como «sin hallazgos». Aquí se comprueba el CÓDIGO y que
+# la respuesta lleve la cabecera de un ledger, no que devuelva algo.
+for ruta in lint canon/pendientes chain/verify stat; do
+  cod="$(curl -s -o /tmp/humo-r.$$ -w '%{http_code}' -m 90 "${A[@]}" "$U/$ruta")"
+  cuerpo="$(head -c 400 /tmp/humo-r.$$ 2>/dev/null)"; rm -f /tmp/humo-r.$$
+  case "$ruta:$cod" in
+    lint:200)             grep -q '──' <<<"$cuerpo" && ok "/lint contesta y trae ledgers" || fallo "/lint" "líneas ──" "$cuerpo" ;;
+    canon/pendientes:200) grep -q 'escuchando' <<<"$cuerpo" && ok "/canon/pendientes contesta" || fallo "/canon/pendientes" "escuchando" "$cuerpo" ;;
+    chain/verify:200)     ok "/chain/verify contesta" ;;
+    stat:200)             ok "/stat contesta" ;;
+    *) fallo "$ruta" "200" "$cod" ;;
+  esac
+done
+
 echo "── nadie se bloquea si el servicio muere ──"
 docker stop "$NOMBRE" >/dev/null 2>&1
 tail -2 "$TMP/l.md" >/dev/null 2>&1 && ok "tail sigue funcionando con el servicio parado" \

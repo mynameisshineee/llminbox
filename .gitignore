@@ -19,3 +19,4 @@ __pycache__/
 # la interfaz compilada la genera el Dockerfile, no se commitea
 web/node_modules/
 static/
+web/tsconfig.tsbuildinfo

@@ -93,16 +93,26 @@ def _censo():
             d = json.load(fh)
     except Exception as e:                    # sin censo se sigue, pero se DICE
         print(f"[censo] no pude leer {ruta}: {e} — el extractor no reconocerá a nadie")
-        return [], {}, []
+        return [], {}, [], {}
     nombres = [a["nombre"] for a in d.get("agentes", [])]
     for h in d.get("humanos", []):
         nombres.append(h["nombre"])
         nombres.extend(h.get("alias", []))
     dueno = {a["nombre"].lower(): a.get("humano") for a in d.get("agentes", [])}
-    return nombres, dueno, d.get("difusion", [])
+    # ESCUCHA — un agente puede recibir, además de lo suyo, el flujo dirigido a OTRO
+    # nombre. Suena a alias y no lo es: el cursor sigue siendo suyo. Esa es toda la
+    # diferencia entre *leer* un flujo y *consumirlo*, y es lo que permite que un
+    # destilador trabaje la cola de la wiki sin vaciarle la bandeja a la sesión que
+    # atiende esa misma wiki. Sin este campo, un segundo lector del mismo flujo
+    # obliga a elegir entre compartir cursor (se pisan) o duplicar el destinatario
+    # en cada entrada (obliga a cambiar cómo escriben los demás, que es justo lo que
+    # este producto promete no hacer).
+    escucha = {a["nombre"].lower(): list(a.get("escucha", []))
+               for a in d.get("agentes", []) if a.get("escucha")}
+    return nombres, dueno, d.get("difusion", []), escucha
 
 
-AGENTES, DUENO, DIFUSION = _censo()
+AGENTES, DUENO, DIFUSION, ESCUCHA = _censo()
 # Conjunto en minúsculas para separar, al leer destinatarios, quién es un agente
 # concreto de quién es un destino de difusión (equipo/FLOTA/todos) — ver DIFSET
 # más abajo, usado en `_campos` para no mezclarlos en `to`.
@@ -118,6 +128,22 @@ CANON = {a.lower(): a for a in AGENTES}
 
 def canonico(nombre):
     return CANON.get(nombre.lower(), nombre) if nombre else nombre
+
+
+def escuchados(agent: str) -> list[str]:
+    """Los nombres cuyo correo cae en la bandeja de `agent`: el suyo y los que escuche.
+
+    Canónicos y sin repetir, con el propio SIEMPRE primero. Un nombre que el censo no
+    conoce se devuelve tal cual: alguien puede tener bandeja antes de estar dado de
+    alta, y negársela por eso sería esconder correo que existe.
+    """
+    fuera, vistos = [], set()
+    for n in [agent] + list(ESCUCHA.get(agent.lower(), [])):
+        c = canonico(n)
+        if c.lower() not in vistos:
+            vistos.add(c.lower())
+            fuera.append(c)
+    return fuera
 # Se ordenan de más largo a más corto para que `alice-backend` gane a `cto`.
 AGENTES.sort(key=len, reverse=True)
 # IGNORECASE: la convención histórica `## <fecha> [BE→CTO]` va en mayúsculas y sin
