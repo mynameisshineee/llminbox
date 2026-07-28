@@ -15,7 +15,8 @@ TMP="$(mktemp -d)"; FALLOS=0
 # se lee. Cazado por el CI en la primera corrida real, que es exactamente para lo
 # que existe un gate que corre en la máquina de otro.
 chmod 755 "$TMP"
-limpiar() { docker rm -f "$NOMBRE" >/dev/null 2>&1; rm -rf "$TMP"; }
+DATOS="$(mktemp -d)"; chmod 777 "$DATOS"   # BD FUERA del contenedor: tiene que sobrevivir a un reinicio
+limpiar() { docker rm -f "$NOMBRE" >/dev/null 2>&1; rm -rf "$TMP" "$DATOS"; }
 trap limpiar EXIT
 
 ok()   { printf "  ✓ %s\n" "$1"; }
@@ -27,8 +28,8 @@ printf '\n### [bob-reviewer → alice-backend · ACK] segunda\ncuerpo dos\n' >> 
 
 docker run -d --name "$NOMBRE" -p "127.0.0.1:$PUERTO:8077" \
   -e LLMINBOX_LEDGERS="t=/l/l.md" -e LLMINBOX_TOKEN="$TOK" \
-  -e LLMINBOX_DB=/tmp/h.sqlite -e LLMINBOX_POLL=1 -e LLMINBOX_ROSTER=/censo.json \
-  -v "$TMP:/l:ro" -v "$PWD/roster.example.json:/censo.json:ro" \
+  -e LLMINBOX_DB=/datos/h.sqlite -e LLMINBOX_POLL=1 -e LLMINBOX_ROSTER=/censo.json \
+  -v "$TMP:/l:ro" -v "$DATOS:/datos" -v "$PWD/roster.example.json:/censo.json:ro" \
   "${IMAGEN:-llminbox:test}" >/dev/null || { echo "no arrancó el contenedor"; exit 1; }
 
 for _ in $(seq 1 40); do curl -sf -m 2 "http://127.0.0.1:$PUERTO/health" >/dev/null 2>&1 && break; sleep 1; done
@@ -81,6 +82,40 @@ p='$TMP/l.md'; L=open(p).read().split(chr(10)); open(p,'w').write(chr(10).join(L
 # falsador: si no detectara borrados, esto seguiría en 0 y la promesa del producto es falsa
 [ "$(curl -s "${A[@]}" "$U/chain/verify" | grep -c '✗')" -ge 1 ] \
   && ok "borrar SÍ alarma" || fallo "borrar SÍ alarma" "≥1 línea con ✗" "0"
+
+echo "── dar de alta a un agente NO le vacía la bandeja al equipo ──"
+# Falsador: el cursor se planta a 99, se añade un agente al censo y se reinicia. Si
+# vuelve a -1, dar de alta a un compañero le borra el estado de lectura a todos —
+# que es lo que hacía hasta el 2026-07-28 (reproducido: 5 → -1), porque la huella
+# del esquema y la del censo eran la misma y el censo tiraba la tabla `cursors`.
+python3 -c "
+import json,sys
+d=json.load(open('$PWD/roster.example.json',encoding='utf-8'))
+d['agentes'].append({'nombre':'zz-alta-tardia','humano':'alice','clave':''})
+json.dump(d,open('$TMP/censo2.json','w',encoding='utf-8'),ensure_ascii=False)"
+ANTES=$(curl -s "${A[@]}" "$U/cursor/alice-backend" | python3 -c 'import json,sys;print(json.load(sys.stdin)["t"])')
+docker rm -f "$NOMBRE" >/dev/null 2>&1
+docker run -d --name "$NOMBRE" -p "127.0.0.1:$PUERTO:8077" \
+  -e LLMINBOX_LEDGERS="t=/l/l.md" -e LLMINBOX_TOKEN="$TOK" \
+  -e LLMINBOX_DB=/datos/h.sqlite -e LLMINBOX_POLL=1 -e LLMINBOX_ROSTER=/censo.json \
+  -v "$TMP:/l:ro" -v "$DATOS:/datos" -v "$TMP/censo2.json:/censo.json:ro" \
+  "${IMAGEN:-llminbox:test}" >/dev/null
+for _ in $(seq 1 40); do curl -sf -m 2 "http://127.0.0.1:$PUERTO/health" >/dev/null 2>&1 && break; sleep 1; done
+sleep 3
+DESPUES=$(curl -s "${A[@]}" "$U/cursor/alice-backend" | python3 -c 'import json,sys;print(json.load(sys.stdin)["t"])')
+comp "el cursor sobrevive al alta de un agente" "$ANTES" "$DESPUES"
+# EL OTRO BRAZO, y es el que de verdad falsa el arreglo: al cambiar el censo se
+# BORRAN los destinatarios para re-derivarlos. Si la re-derivación no ocurriera, el
+# cursor sobreviviría igual —«no toco nada» también lo conserva— pero las entradas
+# se quedarían SIN destinatarios y la bandeja de todos saldría vacía: un arreglo
+# peor que el defecto, y verde en el primer brazo. Se comprueba que vuelven.
+# Se espera SÓLO bob-reviewer: la prueba de borrado de arriba dejó el ledger con una
+# entrada viva (`alice-backend → bob-reviewer`), y las desaparecidas no se sirven. La
+# expectativa era del estado ANTERIOR al borrado — el falsador cazó mi despiste, que
+# es exactamente para lo que está. Lo que falsa el arreglo sigue en pie: si la
+# re-derivación no ocurriera, esto saldría VACÍO.
+comp "y los destinatarios se RE-DERIVAN (no se quedan borrados)" "bob-reviewer" \
+  "$(curl -s "${A[@]}" "$U/entries?ledger=t" | python3 -c 'import sys,json;print(",".join(sorted({w for x in json.load(sys.stdin) for w in (x.get("to") or [])})))')"
 
 echo "── los informes de sólo-lectura CONTESTAN ──"
 # Falsador: `/lint` estuvo devolviendo 500 sin que nadie se enterara —emparejaba por

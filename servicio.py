@@ -105,7 +105,7 @@ def db():
     return c
 
 
-SCHEMA_V = 5          # súbela con CUALQUIER cambio de tabla o de índice
+SCHEMA_V = 6          # súbela con CUALQUIER cambio de tabla o de índice
 SCHEMA = """
 -- IDENTIDAD POR CONTENIDO, no por posición. `eid` = sha256 del texto de la entrada.
 --
@@ -154,6 +154,12 @@ CREATE TABLE IF NOT EXISTS cursors (
 """
 
 
+# Ledgers cuyo actor/destinatarios hay que RE-DERIVAR porque cambió el censo. Se
+# vacía a medida que cada uno se reindexa. Ver `lifespan`: cambiar el censo ya no
+# tira los cursores, sólo obliga a recalcular lo que el censo decide.
+REDERIVAR: set = set()
+
+
 def reindex(ledger: str, path: str, con) -> dict:
     """Reindexa un ledger identificando cada entrada por su CONTENIDO.
 
@@ -181,6 +187,10 @@ def reindex(ledger: str, path: str, con) -> dict:
     prox = (con.execute("SELECT COALESCE(MAX(arrival), -1) + 1 m FROM entries "
                         "WHERE ledger=?", (ledger,)).fetchone()["m"])
 
+    # ¿Hay que recalcular actor/destinatarios de las entradas YA conocidas? Sólo
+    # cuando cambia el censo: es lo único que cambia el resultado de leer un texto
+    # que no ha cambiado.
+    rederivar = ledger in REDERIVAR
     filas, dest, nuevas = [], [], 0
     for pos, e in enumerate(ents):
         if e.sha in previos:
@@ -190,6 +200,15 @@ def reindex(ledger: str, path: str, con) -> dict:
                         "provisional=? WHERE ledger=? AND eid=?",
                         (pos, e.line_no, e.byte_off, 1 if pos == len(ents) - 1 else 0,
                          ledger, e.sha))
+            if rederivar:
+                # El texto es el mismo —su `eid` lo demuestra— pero el censo nuevo
+                # puede reconocer a alguien que antes no existía. Se recalcula lo
+                # DERIVADO y se conserva el `arrival`, que es lo que sostiene el
+                # cursor de cada agente.
+                con.execute("UPDATE entries SET actor=?, tipo=? WHERE ledger=? AND eid=?",
+                            (e.actor, e.tipo, ledger, e.sha))
+                for w in e.to:
+                    dest.append((ledger, e.sha, w))
             continue
         # La ÚLTIMA entrada del fichero es PROVISIONAL: nadie ha escrito todavía la
         # cabecera siguiente, así que su cuerpo puede estar a medias. Se indexa igual
@@ -237,6 +256,8 @@ def reindex(ledger: str, path: str, con) -> dict:
     con.execute("INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?)",
                 (ledger, path, os.path.getsize(path), n, os.path.getmtime(path), time.time()))
     con.commit()
+    # La re-derivación se consume: se pide una vez por cambio de censo, no cada 2 s.
+    REDERIVAR.discard(ledger)
     return {"ledger": ledger, "entries": n, "nuevas": nuevas, "idas": len(idas)}
 
 
@@ -341,18 +362,46 @@ async def lifespan(app: FastAPI):
     # Cazado el día uno: `init` añadía los agentes del demo al censo, y la bandeja
     # seguía vacía porque el índice recordaba que no existían.
     import hashlib as _h
-    huella = _h.sha256((str(SCHEMA_V) + "|" + ",".join(sorted(lp.AGENTES))).encode()).hexdigest()[:16]
+    # DOS huellas, no una. Estaban fundidas en la misma, y por eso dar de alta a un
+    # agente TIRABA la tabla de cursores: le vaciaba la bandeja a todo el equipo por
+    # incorporar a alguien. Reproducido antes de tocarlo (2026-07-28): cursor a 5,
+    # un agente nuevo en el censo, reinicio, cursor a -1. Inaceptable en un producto
+    # cuya tesis ES el cursor por agente.
+    #
+    # El comentario viejo justificaba tirarlos diciendo que `arrival` cambiaría de
+    # significado. Eso era cierto con identidad POSICIONAL y dejó de serlo al pasar a
+    # identidad por contenido: si `entries` sobrevive, cada `eid` conserva su
+    # `arrival`, y un cursor «he leído hasta la #400» sigue apuntando a lo mismo.
+    # La justificación se quedó puesta después de que el motivo desapareciera.
+    h_esq = _h.sha256(str(SCHEMA_V).encode()).hexdigest()[:16]
+    h_censo = _h.sha256(",".join(sorted(lp.AGENTES)).encode()).hexdigest()[:16]
     fila = con.execute("SELECT v FROM meta WHERE k='schema_v'").fetchone()
-    if not fila or fila["v"] != huella:
-        print(f"[arranque] esquema/censo cambiado ({fila['v'] if fila else 'sin índice'} → {huella}) — "
+    if not fila or fila["v"] != h_esq:
+        print(f"[arranque] ESQUEMA cambiado ({fila['v'] if fila else 'sin índice'} → {h_esq}) — "
               f"tiro las tablas derivadas y reconstruyo del markdown", flush=True)
         for t in ("entries", "recipients", "files", "cursors"):
             con.execute(f"DROP TABLE IF EXISTS {t}")
-        con.execute("INSERT OR REPLACE INTO meta VALUES ('schema_v', ?)", (huella,))
-        # Los cursores se van con ellas: `arrival` no significa lo mismo que el `seq`
-        # de antes, así que conservarlos sería peor que perderlos — cada agente vuelve
-        # a ver su bandeja entera una vez, que es el fallo seguro.
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('schema_v', ?)", (h_esq,))
+        # Aquí sí se van los cursores, y es correcto: cambió la FORMA de las tablas.
     con.executescript(SCHEMA)
+
+    # CENSO cambiado: lo derivado se recalcula, los cursores NO se tocan. Sin esto,
+    # arreglar `roster.json` no servía de nada por el otro lado: el fichero de ledger
+    # no ha cambiado, así que nadie reindexa y el actor/destinatarios seguirían
+    # extraídos con el censo viejo (cazado el día uno — `init` daba de alta a los
+    # agentes del demo y la bandeja seguía vacía).
+    f_censo = con.execute("SELECT v FROM meta WHERE k='roster_v'").fetchone()
+    if not f_censo or f_censo["v"] != h_censo:
+        if f_censo:
+            print(f"[arranque] CENSO cambiado ({f_censo['v']} → {h_censo}) — recalculo "
+                  f"actor y destinatarios; los cursores se quedan", flush=True)
+        # Se borran los destinatarios (se re-derivan enteros) y el registro de
+        # ficheros, para que el barrido vuelva a mirar todos los ledgers aunque no
+        # hayan cambiado de tamaño ni de fecha.
+        con.execute("DELETE FROM recipients")
+        con.execute("DELETE FROM files")
+        REDERIVAR.update(LEDGERS)
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('roster_v', ?)", (h_censo,))
     con.execute("INSERT OR REPLACE INTO meta VALUES ('parser_v', ?)", (str(lp.PARSER_V),))
     con.commit()
     con.close()
