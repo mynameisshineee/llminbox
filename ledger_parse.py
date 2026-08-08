@@ -35,6 +35,7 @@ la medida de cuánto trabajo queda para tipar el ledger — no un detalle de imp
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -113,6 +114,41 @@ def _censo():
 
 
 AGENTES, DUENO, DIFUSION, ESCUCHA = _censo()
+
+
+def _roles():
+    """nombre → ROL, leído del censo. Sin heurística de sufijos: es DATO.
+
+    El mismo rol vive en el censo bajo varios nombres (`qa` y `qa-biklabs`,
+    `cto-A` y `cto-biklabs`: 13 de 27 roles tienen más de uno). Para el reparto de
+    trabajo eso es una fuga real — el tope triadversarial de 3 contaría 3 NOMBRES y
+    dejaría que un mismo rol ocupe dos plazas de revisión.
+
+    Se resuelve con un campo `rol` OPCIONAL en `roster.json`. Si no está, el nombre
+    ES su rol y el comportamiento no cambia: nadie se encuentra una conducta nueva
+    por actualizar. Deliberadamente NO se agrupa por parecido de nombre — la
+    identidad se declara, no se adivina; adivinarla es cómo `cto-cfo-cockpit` acaba
+    contando como `cto` el día que sean dos personas distintas.
+    """
+    import json as _json
+    import os as _os
+    ruta = _os.environ.get("LLMINBOX_ROSTER") or _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)), "roster.json")
+    try:
+        with open(ruta, encoding="utf-8") as fh:
+            d = _json.load(fh)
+    except Exception:
+        return {}
+    return {a["nombre"].lower(): (a.get("rol") or a["nombre"])
+            for a in d.get("agentes", []) if a.get("nombre")}
+
+
+ROL_DE = _roles()
+
+
+def rol_de(nombre: str) -> str:
+    """El rol de un agente. Si el censo no lo declara, su rol es él mismo."""
+    return ROL_DE.get((nombre or "").lower(), canonico(nombre))
 # Conjunto en minúsculas para separar, al leer destinatarios, quién es un agente
 # concreto de quién es un destino de difusión (equipo/FLOTA/todos) — ver DIFSET
 # más abajo, usado en `_campos` para no mezclarlos en `to`.
@@ -124,6 +160,27 @@ AGENTES = AGENTES + DIFUSION
 # actores distintos y un filtro por uno perdía a los otros dos. Salió al ver el
 # desplegable de la interfaz lleno de parejas.
 CANON = {a.lower(): a for a in AGENTES}
+
+
+# ── Direccionamiento por `@nombre` en cabeceras SIN flecha ────────────────────
+#
+# Sin flecha, `to` se quedaba vacío. Y eso NO significaba «no iba a nadie»: medido
+# sobre 64bis en agosto, de 1.350 cabeceras sin flecha **995 nombraban con `@` a un
+# agente DEL CENSO** y llminbox no se lo entregaba a ninguno. El mensaje dirigido no
+# llegaba dirigido ⇒ todos leían el canal entero ⇒ cualquiera cogía el trabajo. La
+# duplicación que el operador nos reprocha la fabricaba este hueco, no la disciplina.
+#
+# Va con CORTE POR FECHA y apagado por defecto, y el motivo está medido: aplicarlo
+# retroactivo haría aparecer **12.442 entradas de golpe** repartidas en 25 agentes
+# —`qa` se despertaría con 1.977 sin leer—, y una bandeja de dos mil devuelve a
+# cualquiera a leer el canal entero, que es justo lo que esto viene a quitar.
+# `LLMINBOX_ARROBA_DESDE=YYYY-MM-DD` ⇒ sólo las entradas con sello IGUAL O POSTERIOR.
+# Vacío ⇒ desactivado: quien clone esto no se encuentra un cambio de conducta.
+ARROBA_DESDE = os.environ.get("LLMINBOX_ARROBA_DESDE", "").strip()
+# El sigilo `@` ES la señal, y por eso no se leen los nombres a secas: mencionar a un
+# agente («como midió backend…») es cita, no destino. Confundirlas convertiría cada
+# cita en una entrega y multiplicaría el correo en vez de dirigirlo.
+RE_ARROBA = re.compile(r"@([A-Za-z][A-Za-z0-9_-]{1,24})")
 
 
 def canonico(nombre):
@@ -287,6 +344,19 @@ def _campos(head: str, cola: str) -> tuple[str | None, str | None, list[str], li
     else:
         ma = RE_AGENTE.search(PARENT.sub(" ", inner))
         actor = canonico(ma.group(1)) if ma else None
+        # Sin flecha no hay lista de destino que leer… salvo los `@` (ver arriba).
+        if ARROBA_DESDE and ts and ts >= ARROBA_DESDE:
+            vistos = {actor.lower()} if actor else set()
+            for m in RE_ARROBA.finditer(inner):
+                bruto = m.group(1)
+                # La pertenencia al censo se comprueba AQUÍ y no se delega en
+                # `canonico`, que devuelve tal cual lo que no conoce: sin esta línea
+                # un `@deploy` o un `@media` de CSS entraría como destinatario.
+                if bruto.lower() not in CANON or bruto.lower() in vistos:
+                    continue
+                vistos.add(bruto.lower())
+                n = canonico(bruto)
+                (difusion if n.lower() in DIFSET else to).append(n)
 
     tipo = next((t for t in TIPOS if t in head), None)
     if tipo is None and etiqueta:

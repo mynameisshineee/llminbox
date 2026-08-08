@@ -60,6 +60,10 @@ llmi — consulta la red de ledgers de la flota sin quemarte la ventana
   llmi lint  [ledger]       deuda de tipado (qué entradas no declaran nada)
   llmi verify               integridad del canon (¿ha desaparecido alguna entrada?)
   llmi canon [n]            cola de destilación: lo dirigido que aún no es página
+  llmi adopcion             quién LEE su bandeja y quién la consume (no es lo mismo)
+  llmi wiki [q]             las páginas de tu wiki, con sus citas al ledger
+  llmi wiki citas           ¿cada cita apunta a una entrada que existe? (el gate)
+  llmi wiki <ruta.md>       una página entera, con sus citas YA resueltas
   llmi canon marca <eid> <kb:ruta>   imprime el apunte que cierra una entrada
 
 Salidas: 0 ok · 1 hallazgo (entrada desaparecida / deriva) · 2 uso · 3 servicio ausente
@@ -588,6 +592,30 @@ case "$cmd" in
           curl -sf -m 20 "${H[@]}" --get --data-urlencode "q=$1" "$API/entries?limit=${2:-20}" | python3 -m json.tool ;;
   lint)   vivo || { sin_servicio; exit 3; }
           curl -sf -m 20 "${H[@]}" "$API/lint${1:+?ledger=$1}" ;;
+  adopcion|adopción)
+          vivo || { sin_servicio; exit 3; }
+          curl -sf -m 20 "${H[@]}" "$API/adopcion" ;;
+  wiki)   vivo || { sin_servicio; exit 3; }
+          # `citas` es el gate; una ruta que acaba en .md es una página; lo demás
+          # es búsqueda. Sin argumento, la lista entera.
+          if [ "${1:-}" = "citas" ]; then
+            out="$(curl -sf -m 60 "${H[@]}" "$API/wiki/citas?solo_rotas=${2:-true}")"; echo "$out"
+            grep -q '✗' <<<"$out" && exit 1 || exit 0
+          fi
+          case "${1:-}" in
+            *.md) curl -sf -m 30 "${H[@]}" --get --data-urlencode "path=$1" "$API/wiki/pagina" ;;
+            *)    curl -sf -m 30 "${H[@]}" --get ${1:+--data-urlencode "q=$1"} "$API/wiki" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+if not d[\"wiki\"]:
+    print(\"no hay wiki montada. Añade LLMINBOX_WIKI=/ruta a docker-compose.override.yml\"); raise SystemExit
+print(f\"── wiki · {d['paginas']} páginas ──\")
+for p in d[\"lista\"]:
+    marca = f\"  {p['citas']} citas\" + (f\" · {p['rotas']} ROTAS\" if p[\"rotas\"] else \"\")
+    print(f\"  {p['path']:<52}{marca}\")
+    print(f\"    {p['titulo'][:96]}\")
+" ;;
+          esac ;;
   canon)  vivo || { sin_servicio; exit 3; }
           # `marca` no escribe nada: IMPRIME la línea para que la apendice quien
           # destila, con su nombre y en el ledger que toque. Escribirla desde aquí
