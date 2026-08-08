@@ -693,7 +693,7 @@ def reindex(ledger: str, path: str, con) -> dict:
             #
             # PERO SÓLO SI ALGO CAMBIÓ. Antes se escribía siempre, y en un fichero de
             # sólo-apéndice eso son N escrituras no-op por pasada: para meter UNA
-            # entrada nueva en `64bis-wiki` se reescribían sus 32.761 filas con los
+            # entrada nueva en un ledger grande se reescribían sus 32.761 filas con
             # mismos valores. El coste no era la CPU: la transacción de escritura se
             # abre en la primera UPDATE y no se cierra hasta el `commit` del final, o
             # sea el cerrojo quedaba tomado la pasada entera —medido 39,04 s el
@@ -1826,7 +1826,7 @@ def marcar_leido(agent: str, l: Leido):
     # ⇒ no encontraba fila, leía desde -1 y devolvía una **bandeja sombra** que nadie
     # drenaba nunca; y el `POST …/leido` con esa grafía contestaba `ok:true` mientras
     # escribía el cursor de un agente que no existe. Medido 2026-08-08:
-    # `/inbox/wiki-vault` daba 6 secciones y `/inbox/WIKI-VAULT` daba 7.
+    # `/inbox/un-agente` daba 6 secciones y `/inbox/UN-AGENTE` daba 7.
     # La migración es un no-op verificado: las 27 filas de `cursors` ya usaban el
     # nombre canónico, así que canonizar no mueve ninguna clave ni inunda a nadie.
     canon = lp.canonico(agent)
@@ -1901,7 +1901,7 @@ def coger(c_in: ClaimIn):
         return {"ok": False, "motivo": "tema vacío tras normalizar"}
     rol = c_in.rol if c_in.rol in ("ejecuta", "revisa") else "ejecuta"
     # El agente se guarda por su ROL, no por el nombre con que firma. El censo tiene
-    # 51 nombres para 27 roles —`qa` y `qa-biklabs`, `cto-A` y `cto-biklabs`: 13 roles
+    # 51 nombres para 27 roles —`qa` y `qa-2`, `cto` y `cto-b`: 13 roles
     # con más de un nombre—, así que contar nombres deja que UN MISMO ROL ocupe dos de
     # las tres plazas de revisión. El tope triadversarial es de roles, no de firmas.
     # Mientras el censo no declare `rol`, cada nombre es su propio rol y esto no

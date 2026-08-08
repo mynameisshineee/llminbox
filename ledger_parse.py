@@ -119,8 +119,8 @@ AGENTES, DUENO, DIFUSION, ESCUCHA = _censo()
 def _roles():
     """nombre → ROL, leído del censo. Sin heurística de sufijos: es DATO.
 
-    El mismo rol vive en el censo bajo varios nombres (`qa` y `qa-biklabs`,
-    `cto-A` y `cto-biklabs`: 13 de 27 roles tienen más de uno). Para el reparto de
+    El mismo rol vive en el censo bajo varios nombres (`qa` y `qa-2`, `cto` y
+    `cto-b`: en el censo que motivó esto, 13 de 27 roles tenían más de uno). Para el reparto de
     trabajo eso es una fuga real — el tope triadversarial de 3 contaría 3 NOMBRES y
     dejaría que un mismo rol ocupe dos plazas de revisión.
 
