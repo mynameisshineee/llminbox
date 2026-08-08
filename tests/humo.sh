@@ -196,7 +196,10 @@ docker run -d --name "$NOM2" -p "127.0.0.1:$P2:8077" \
   "${IMAGEN:-llminbox:test}" >/dev/null
 for _ in $(seq 1 60); do curl -sf -m 2 "http://127.0.0.1:$P2/health" >/dev/null 2>&1 && break; sleep 1; done
 B=(-H "X-Llminbox-Token: $TOK"); V="http://127.0.0.1:$P2"
-for _ in $(seq 1 60); do
+# Mismo motivo que abajo: el runner de CI es más lento que este Mac y 60 s no
+# bastaban para indexar 30.000 entradas. Un techo corto convierte una prueba de
+# corrección en una prueba de velocidad de la máquina.
+for _ in $(seq 1 240); do
   [ "$(curl -s "${B[@]}" "$V/stat" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["entradas"])' 2>/dev/null)" = "30000" ] && break
   sleep 1
 done
@@ -270,10 +273,24 @@ python3 -c "
 p='$TMP2/g.md'; txt=open(p).read(); i=txt.index(chr(10)+'###')
 nuevas=''.join(chr(10)+f'### [bob-reviewer → alice-backend · FYI] llegada por merge {k}'+chr(10)+f'cuerpo merge {k}'+chr(10) for k in range(50))
 open(p,'w').write(txt[:i]+nuevas+txt[i:])"
-for _ in $(seq 1 60); do
-  [ "$(curl -s "${B[@]}" "$V/stat" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["entradas"])' 2>/dev/null)" = "30050" ] && break
+# ESPERA CON TECHO GENEROSO Y FALLO HONESTO. Insertar 50 entradas POR DELANTE mueve
+# la posición de las 30.000, así que la pasada siguiente reescribe el ledger entero:
+# en el runner de CI eso no cabía en 60 s. Y el efecto era peor que la lentitud — los
+# tests de corrupción seguían corriendo sobre un índice a medio hacer y reportaban
+# «la reconstrucción devolvió 30.000 de 30.050», culpando a la reconstrucción de un
+# fallo que era del MONTAJE. Un test que atribuye mal es peor que uno que falla:
+# manda a arreglar donde no está roto. Medido el 2026-08-08: verde en macOS, 6 rojos
+# en Linux, y ninguno de los 6 era el defecto que nombraban.
+LISTO=""
+for _ in $(seq 1 240); do
+  N_AHORA="$(curl -s "${B[@]}" "$V/stat" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["entradas"])' 2>/dev/null)"
+  [ "$N_AHORA" = "30050" ] && { LISTO="sí"; break; }
   sleep 1
 done
+[ -n "$LISTO" ] \
+  && ok "el reordenado (50 entradas por delante) queda indexado: 30.050" \
+  || fallo "PRECONDICIÓN: sin el reordenado indexado, lo que sigue mide otra cosa" \
+           "30050 entradas" "${N_AHORA:-sin respuesta} tras 240 s"
 lee_eid() {   # a qué entrada apunta un cursor, en la base que haya ahora mismo
   python3 -c "
 import sqlite3
