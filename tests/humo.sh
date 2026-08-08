@@ -118,6 +118,18 @@ printf '\n### [alice-backend → bob-reviewer · FYI] tercera a medias\n' >> "$T
 printf 'el cuerpo llega tarde\n' >> "$TMP/l.md"; sleep 3
 # falsador: antes esto gritaba «entrada que ESTUVO y ya no está» por escribir en 2 pasos
 comp "escribir a trozos NO alarma" "0" "$(curl -s "${A[@]}" "$U/chain/verify" | grep -c '✗')"
+# Y NO BASTA CON QUE NO ALARME: hay que contar FILAS. Si la limpieza de provisionales
+# se rompe, la versión a medias sobrevive junto a la completa y deja una fila
+# fantasma — medido con un mutante el 2026-08-08: 3 filas donde el fichero tenía 2
+# entradas, y NINGUNA de las 64 comprobaciones se enteraba, porque las dos que
+# vigilan esta zona miran la ALARMA y esa fila queda con `ausente = NULL`, o sea
+# indistinguible de una viva. En producción: conteos inflados y titulares viejos
+# servidos en bandeja, en silencio. La suite comprobaba que la limpieza no alarmara
+# de más; no que la limpieza OCURRA.
+# falsador: con la limpieza rota, esto da 4 en vez de 3.
+comp "y el índice tiene UNA fila por entrada (sin fantasma de la escritura a trozos)" "3" \
+  "$(curl -s "${A[@]}" "$U/stat" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["entradas"])' 2>/dev/null)"
+
 python3 -c "
 p='$TMP/l.md'; L=open(p).read().split(chr(10)); open(p,'w').write(chr(10).join(L[:4]))"; sleep 4
 # falsador: si no detectara borrados, esto seguiría en 0 y la promesa del producto es falsa
@@ -640,6 +652,40 @@ printf '%s' "$ADOP" | grep -qE 'GET /inbox/\{agent\}\s+[1-9]' \
 printf '%s' "$ADOP" | grep -E 'GET /inbox/\{agent\}' | awk '{print $4+0}' | grep -qvE '^0$' \
   && ok "y los BYTES servidos no son cero (la columna de coste mide algo)" \
   || fallo "una columna de coste a cero parece medida y no lo está" ">0 bytes" "0"
+
+echo "── pedir cuerpos no puede vaciar el canal ──"
+# `/entries?cuerpo=true` no capaba `limit`: medido el 2026-08-08, las 500 entradas
+# más grandes de un índice real suman 6,2 MB ≈ 1.546.628 tokens EN UNA RESPUESTA, y
+# la ruta acumulaba 14,1 M de tokens contra 0,45 M de toda la bandeja junta — 32×.
+# ⚠️ Ledger de 25 entradas A PROPÓSITO: la primera versión de esta comprobación vivía
+# en el contenedor de 4 y pedía `limit=500`, así que devolvía 4 con el tope y 4 sin
+# él. Verde en los dos casos: no podía fallar. Un gate que no discrimina es teatro,
+# y éste lo era hasta que se le dio un ledger más grande que su propio tope.
+T7=$(mktemp -d); chmod 755 "$T7"; NOM7="humo7-$$"; P7=$((PUERTO+6))
+limpiar7() { docker rm -f "$NOM7" >/dev/null 2>&1; rm -rf "$T7"; }
+python3 -c "
+p='$T7/g.md'
+open(p,'w').write('# g' + ''.join(chr(10)*2 + f'### [alice-backend → bob-reviewer · FYI] entrada {i}' + chr(10) + 'cuerpo ' + 'x'*400 for i in range(25)) + chr(10))"
+docker run -d --name "$NOM7" -p "127.0.0.1:$P7:8077" \
+  -e LLMINBOX_LEDGERS="g=/l/g.md" -e LLMINBOX_TOKEN="$TOK" \
+  -e LLMINBOX_DB=/tmp/h.sqlite -e LLMINBOX_POLL=1 -e LLMINBOX_ROSTER=/censo.json \
+  -v "$T7:/l:ro" -v "$PWD/roster.example.json:/censo.json:ro" \
+  "${IMAGEN:-llminbox:test}" >/dev/null || { echo "no arrancó $NOM7"; FALLOS=$((FALLOS+1)); }
+for _ in $(seq 1 40); do curl -sf -m 2 "http://127.0.0.1:$P7/health" >/dev/null 2>&1 && break; sleep 1; done
+sleep 3
+V7="http://127.0.0.1:$P7"
+# CONTROL primero: sin cuerpos el limit alto SÍ se respeta. Sin esto, un endpoint
+# que devolviera poco por cualquier motivo daría verde abajo.
+NS=$(curl -s -m 20 "${A[@]}" "$V7/entries?ledger=g&limit=500" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))' 2>/dev/null)
+[ "${NS:-0}" -ge 20 ] \
+  && ok "sin cuerpos, limit=500 devuelve las $NS que hay (hay qué capar)" \
+  || fallo "el control tiene que traer más de 10 filas" "≥20" "${NS:-sin dato}"
+# falsador: sin el min(), esto devuelve 25.
+NF=$(curl -s -m 20 "${A[@]}" "$V7/entries?ledger=g&limit=500&cuerpo=true" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))' 2>/dev/null)
+[ "${NF:-99}" -le 10 ] \
+  && ok "y pidiendo cuerpos se capa a 10 (pediste 500, te dan $NF)" \
+  || fallo "cuerpo=true tiene que capar el limit" "≤10 filas" "${NF:-sin dato}"
+limpiar7
 
 echo "── un ledger de ARCHIVO no se cobra en cada lectura ──"
 # Un archivo guarda historia cerrada, pero sus entradas siguen dirigidas a gente: la

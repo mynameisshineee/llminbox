@@ -1537,6 +1537,24 @@ def roster():
 def entries(respuesta: Response,ledger: str | None = None, to: str | None = None, actor: str | None = None,
             tipo: str | None = None, since: str | None = None, q: str | None = None,
             limit: int = Query(50, le=500), cuerpo: bool = False):
+    # PEDIR CUERPOS ACOTA LA CONSULTA. `cuerpo=true` no capaba `limit`, así que una
+    # llamada legítima con los parámetros que la propia API ofrece devolvía cientos
+    # de cuerpos enteros. Medido el 2026-08-08 sobre este índice: las 500 entradas
+    # más grandes suman 6,2 MB ≈ **1.546.628 tokens en UNA respuesta**, y la ruta ya
+    # acumulaba 14,1 M contra 0,45 M de toda la bandeja junta — 32×.
+    #
+    # Dos topes, y el segundo es el que de verdad acota:
+    #  · FILAS: `min(limit, 10)`. Es el tope que propuso cto-A y es correcto, pero
+    #    sólo reduce el peor caso 4× — las 10 entradas más grandes ya suman 1,6 MB.
+    #    Un tope por filas no acota bytes cuando la distribución tiene esa cola.
+    #  · BYTES: presupuesto duro. Se sirven cuerpos hasta agotarlo y se dice cuántos
+    #    se recortaron. Es lo que convierte un techo teórico en uno real.
+    #
+    # `min()` y no un 422 —también de cto-A, y la razón es buena—: un error obliga a
+    # reintentar, y el reintento cuesta otra llamada. Se sirve menos, no se falla.
+    truncado = 0
+    if cuerpo:
+        limit = min(limit, CUERPO_MAX_FILAS)
     w, p = [], []
     if ledger:
         w.append("e.ledger=?"); p.append(ledger)
@@ -1574,6 +1592,21 @@ def entries(respuesta: Response,ledger: str | None = None, to: str | None = None
             dest.setdefault(r["eid"], []).append(r["who"])
         for r in rows:
             r["to"] = dest.get(r["eid"], [])
+    # El presupuesto de bytes se aplica DESPUÉS de leer, sobre lo servido: es donde
+    # se conoce el tamaño real. Recortar el cuerpo NO borra la entrada — se devuelve
+    # sin `body` y con `cuerpo_recortado`, para que quien lo necesite lo pida solo.
+    if cuerpo:
+        gastado = 0
+        for r in rows:
+            b = r.get("body") or ""
+            if gastado + len(b) > CUERPO_MAX_BYTES:
+                r["body"] = None
+                r["cuerpo_recortado"] = True
+                truncado += 1
+            else:
+                gastado += len(b)
+        if truncado:
+            respuesta.headers["X-Cuerpos-Recortados"] = str(truncado)
     con.close()
     return rows
 
@@ -2032,6 +2065,11 @@ def marcar_leido(agent: str, l: Leido):
 # NO se excluye en silencio: si algo queda fuera, la bandeja lo dice al pie. Ocultar
 # correo sin avisar sería peor que el coste que se ahorra.
 INBOX_EXCLUIR = {x.strip() for x in os.environ.get("LLMINBOX_INBOX_EXCLUIR", "").split(",") if x.strip()}
+# Topes de `/entries?cuerpo=true`. Ver el comentario largo en el endpoint: la ruta
+# acumulaba 14,1 M de tokens contra 0,45 M de toda la bandeja, y su techo por llamada
+# era de 1,5 M. El de filas lo propuso cto-A; el de bytes es el que acota de verdad.
+CUERPO_MAX_FILAS = int(os.environ.get("LLMINBOX_CUERPO_MAX_FILAS", "10"))
+CUERPO_MAX_BYTES = int(os.environ.get("LLMINBOX_CUERPO_MAX_BYTES", "200000"))
 TOPE_REVISORES = int(os.environ.get("LLMINBOX_TOPE_REVISORES", "3"))
 # Un agente que coge trabajo y se muere dejaría el tema tomado PARA SIEMPRE, y el
 # reparto se convertiría en un candado. Pasado el plazo, el claim se puede tomar —
