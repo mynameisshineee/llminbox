@@ -200,6 +200,11 @@ SCHEMA_V = 6          # súbela SÓLO si cambia la FORMA de una tabla existente
 # Ojo con esa palabra: «forma». Un cambio ADITIVO —tablas o índices nuevos— NO
 # necesita subirla, porque `executescript(SCHEMA)` corre en cada arranque y todo
 # lleva `IF NOT EXISTS`: las tablas nuevas nacen solas y las viejas siguen en pie.
+# ⚠️ PERO ESO NO VALE PARA UNA COLUMNA NUEVA EN UNA TABLA QUE YA EXISTE: el
+# `CREATE TABLE IF NOT EXISTS` se salta la sentencia entera y la columna nunca
+# aparece. Eso necesita un `ALTER TABLE` idempotente (hay uno en el arranque), no
+# subir esta bandera — subirla vaciaría los cursores de todo el equipo por añadir
+# una columna. Comprobado en vivo el 2026-08-08 con `coste.maximo`.
 # Subirla por añadir algo TIRA la tabla de cursores, o sea le vacía la bandeja a
 # todo el equipo para crear dos tablas que se habrían creado igual. Estuve a punto
 # al añadir la wiki, y es el mismo defecto que arreglé el 28 por el otro lado: el
@@ -227,6 +232,7 @@ CREATE TABLE IF NOT EXISTS coste (
   ruta TEXT PRIMARY KEY,     -- plantilla de ruta, no la URL concreta
   llamadas INTEGER DEFAULT 0,
   bytes INTEGER DEFAULT 0,
+  maximo INTEGER DEFAULT 0,  -- la respuesta más grande servida por esta ruta
   ultima TEXT);
 
 -- REPARTO DE TRABAJO: quién COGE y quién REVISA. Tabla aditiva ⇒ NO sube SCHEMA_V
@@ -1117,10 +1123,11 @@ def anota_coste(ruta: str, n_bytes: int) -> None:
     with COSTE_LOCK:
         v = COSTE.get(ruta)
         if v is None:
-            COSTE[ruta] = [1, n_bytes]
+            COSTE[ruta] = [1, n_bytes, n_bytes]
         else:
             v[0] += 1
             v[1] += n_bytes
+            v[2] = max(v[2], n_bytes)
 
 
 def vuelca_coste(con) -> None:
@@ -1132,21 +1139,23 @@ def vuelca_coste(con) -> None:
     ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
         con.executemany(
-            "INSERT INTO coste (ruta, llamadas, bytes, ultima) VALUES (?,?,?,?) "
+            "INSERT INTO coste (ruta, llamadas, bytes, maximo, ultima) VALUES (?,?,?,?,?) "
             "ON CONFLICT(ruta) DO UPDATE SET llamadas=llamadas+excluded.llamadas, "
-            "bytes=bytes+excluded.bytes, ultima=excluded.ultima",
-            [(r, n, b, ahora) for r, (n, b) in pend])
+            "bytes=bytes+excluded.bytes, maximo=MAX(maximo, excluded.maximo), "
+            "ultima=excluded.ultima",
+            [(r, n, b, mx, ahora) for r, (n, b, mx) in pend])
         con.commit()
     except sqlite3.OperationalError as exc:
         con.rollback()
         with COSTE_LOCK:                       # devuelve lo no volcado, no se pierde
-            for r, (n, b) in pend:
+            for r, (n, b, mx) in pend:
                 v = COSTE.get(r)
                 if v is None:
-                    COSTE[r] = [n, b]
+                    COSTE[r] = [n, b, mx]
                 else:
                     v[0] += n
                     v[1] += b
+                    v[2] = max(v[2], mx)
         print(f"[coste] volcado aplazado: {exc}", flush=True)
 
 
@@ -1274,6 +1283,21 @@ async def lifespan(app: FastAPI):
     # identidad por contenido: si `entries` sobrevive, cada `eid` conserva su
     # `arrival`, y un cursor «he leído hasta la #400» sigue apuntando a lo mismo.
     # La justificación se quedó puesta después de que el motivo desapareciera.
+    # COLUMNAS AÑADIDAS A UNA TABLA QUE YA EXISTE. `executescript(SCHEMA)` con
+    # `IF NOT EXISTS` cubre tablas e índices nuevos, pero NO añade una columna a una
+    # tabla ya creada: la sentencia se salta entera y la columna nunca aparece.
+    # Me pasó el 2026-08-08 con `coste.maximo`: el volcado fallaba en cada barrido y
+    # la sección de coste desaparecía de `/adopcion` sin decir por qué. El comentario
+    # de SCHEMA_V decía «un cambio aditivo no necesita subirla» — cierto para tablas,
+    # FALSO para columnas, y esa media verdad es la que me costó el rato.
+    for tabla, col, tipo in (("coste", "maximo", "INTEGER DEFAULT 0"),):
+        try:
+            hay = {r[1] for r in con.execute(f"PRAGMA table_info({tabla})")}
+            if hay and col not in hay:
+                con.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {tipo}")
+                print(f"[arranque] {tabla}: columna {col} añadida", flush=True)
+        except sqlite3.OperationalError as e:
+            print(f"[arranque] no pude añadir {tabla}.{col}: {e}", flush=True)
     h_esq = huella_esquema()
     h_censo = huella_censo()
     fila = con.execute("SELECT v FROM meta WHERE k='schema_v'").fetchone()
@@ -1831,20 +1855,28 @@ def adopcion():
     con2 = db()
     try:
         filas = list(con2.execute(
-            "SELECT ruta, llamadas, bytes FROM coste ORDER BY bytes DESC LIMIT 12"))
-    except sqlite3.OperationalError:
+            "SELECT ruta, llamadas, bytes, maximo FROM coste ORDER BY bytes DESC LIMIT 12"))
+    except sqlite3.OperationalError as exc:
+        # Antes esto vaciaba la lista y la sección desaparecía sin más: un fallo que
+        # se manifiesta como AUSENCIA es el más difícil de ver. Ahora se dice.
         filas = []
+        out.append(f"\n── coste por endpoint: NO DISPONIBLE ({exc}) ──")
     finally:
         con2.close()
     if filas:
         out.append("")
         out.append("── coste por endpoint (bytes servidos ÷ 4 ≈ tokens) ──")
-        out.append("  %-28s %8s %12s %10s" % ("ruta", "llamadas", "bytes", "≈tok/llam"))
+        out.append("  %-26s %7s %10s %9s %9s" % ("ruta", "llam", "≈tok/med", "≈tok/máx", "×"))
         for r in filas:
-            n, b = r["llamadas"] or 0, r["bytes"] or 0
-            out.append("  %-28s %8d %12d %10d" % (r["ruta"][:28], n, b, (b / max(n, 1)) / 4))
-        out.append("  (acumulado desde el primer arranque con esta tabla; el volcado")
-        out.append("   lo hace el barrido, así que la última lectura puede faltar)")
+            n, b, mx = r["llamadas"] or 0, r["bytes"] or 0, r["maximo"] or 0
+            med = (b / max(n, 1)) / 4
+            out.append("  %-26s %7d %10d %9d %8.0f×" % (
+                r["ruta"][:26], n, med, mx / 4, (mx / 4) / max(med, 1)))
+        out.append("  ⚠️ la MEDIA mezcla poblaciones: `/entries` acepta `limit` hasta 500 y")
+        out.append("     `cuerpo=true`, así que una llamada puede pesar mil veces otra. Por eso")
+        out.append("     va el MÁXIMO al lado — el 2026-08-08 dos lecturas de esta misma tabla")
+        out.append("     dieron 552 y 20.058 tok/llamada, y las dos eran ciertas.")
+        out.append("  (acumulado desde el primer arranque con esta tabla; vuelca el barrido)")
     return "\n".join(out) + "\n"
 
 
