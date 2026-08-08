@@ -1558,9 +1558,15 @@ def inbox(agent: str, limit: int = Query(30, le=200)):
     con.close()
     if not out:
         return f"(nada nuevo para {agent})\n"
-    marcar = " ".join(f"{k}:{v}" for k, v in tope.items())
+    # EL CUERPO EXACTO, LISTO PARA PEGAR — no una taquigrafía que haya que traducir.
+    # Antes esta línea decía `ledger:seq ledger:seq`, y el endpoint espera
+    # `{"hasta": {...}}`: quien drenaba tenía que convertirlo a mano, y ahí es donde
+    # se rompía. Medido el 2026-08-08: 24.723 llamadas a `/leido` con 74.525 entradas
+    # todavía sin drenar. La conversión manual no era una molestia, era el defecto.
+    cuerpo = json.dumps({"hasta": tope}, separators=(",", ":"), ensure_ascii=False)
     return (AVISO + "\n" + "\n".join(out)
-            + f"\n\nmarcar leído:  POST /inbox/{agent}/leido  → {marcar}\n")
+            + f"\n\nmarcar leído — pega esto tal cual:\n"
+              f"  POST /inbox/{lp.canonico(agent)}/leido\n  {cuerpo}\n")
 
 
 @app.get("/cursor/{agent}", dependencies=GATE)
@@ -1829,19 +1835,45 @@ def marcar_leido(agent: str, l: Leido):
     # `/inbox/un-agente` daba 6 secciones y `/inbox/UN-AGENTE` daba 7.
     # La migración es un no-op verificado: las 27 filas de `cursors` ya usaban el
     # nombre canónico, así que canonizar no mueve ninguna clave ni inunda a nadie.
+    # LA RESPUESTA DICE LO QUE PASÓ, NO LO QUE PEDISTE. Antes devolvía
+    # `{"ok": true, "cursores": <tu propia entrada>}` pasara lo que pasara: un ledger
+    # con el nombre mal escrito se saltaba con un `continue` mudo y quien llamaba se
+    # iba convencido de haber drenado. Medido el 2026-08-08 sobre los transcripts de
+    # la flota: **24.723 llamadas a este endpoint y 74.525 entradas seguían sin
+    # drenar**. No era desidia de nadie — era esto. Un campo que refleja tu entrada
+    # no es una verificación; para distinguir «funcionó» de «te lo tragaste» hace
+    # falta que la respuesta traiga el ANTES y el DESPUÉS, y que nombre lo ignorado.
     canon = lp.canonico(agent)
+    ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
     con = db()
-    for name, seq in l.hasta.items():
-        if name not in LEDGERS:
-            continue
-        con.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?)",
-                    (canon, name, int(seq),
-                     datetime.now(timezone.utc).isoformat(timespec="seconds")))
-    con.commit()
-    con.close()
-    # Se devuelve el nombre CON EL QUE SE HA ESCRITO, no el que mandaron: si difieren,
-    # quien llama lo ve. Un `ok:true` que refleja tu entrada no te dice nada.
-    return {"ok": True, "agent": canon, "pediste": agent, "cursores": l.hasta}
+    aplicados, ignorados, sin_efecto = {}, [], []
+    try:
+        for name, seq in l.hasta.items():
+            if name not in LEDGERS:
+                ignorados.append(name)
+                continue
+            fila = con.execute("SELECT last_arrival FROM cursors WHERE agent=? AND ledger=?",
+                               (canon, name)).fetchone()
+            antes = fila["last_arrival"] if fila else -1
+            nuevo = int(seq)
+            con.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?)",
+                        (canon, name, nuevo, ahora))
+            aplicados[name] = {"antes": antes, "ahora": nuevo}
+            # No avanzar NO es un error —volver a marcar lo mismo es idempotente— pero
+            # tiene que verse: «he drenado y no se movió nada» es justo el fallo mudo
+            # que este endpoint producía.
+            if nuevo <= antes:
+                sin_efecto.append(name)
+        con.commit()
+    finally:
+        con.close()
+    if ignorados:
+        print(f"[leido] {canon}: ledgers desconocidos ignorados: {ignorados}", flush=True)
+    return {"ok": bool(aplicados), "agent": canon, "pediste": agent,
+            "aplicados": aplicados,
+            "ignorados": ignorados,          # nombres que este servicio no conoce
+            "sin_efecto": sin_efecto,        # se escribieron pero no adelantan nada
+            "conocidos": sorted(LEDGERS) if ignorados else None}
 
 
 # ── REPARTO DE TRABAJO ────────────────────────────────────────────────────────

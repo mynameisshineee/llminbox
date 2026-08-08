@@ -88,6 +88,31 @@ comp "y un POST en MAYÚSCULAS mueve el cursor del canónico" "5" \
   "$(curl -s "${A[@]}" "$U/cursor/alice-backend" | python3 -c 'import sys,json;print(json.load(sys.stdin)["t"])')"
 curl -s "${A[@]}" -H 'Content-Type: application/json' -d '{"hasta":{"t":99}}' -o /dev/null "$U/inbox/alice-backend/leido"
 
+# DRENAR TIENE QUE PODER FALLAR A LA VISTA. Este endpoint devolvía
+# `{"ok":true,"cursores":<tu propia entrada>}` pasara lo que pasara: un ledger mal
+# escrito se saltaba con un `continue` mudo. Medido sobre los transcripts de la flota
+# el 2026-08-08: 24.723 llamadas a /leido y 74.525 entradas aún sin drenar. No era
+# desidia — era esta respuesta.
+# falsador: con el eco de vuelta, un ledger inexistente devuelve ok:true y esto pasa.
+R=$(curl -s "${A[@]}" -H 'Content-Type: application/json' -d '{"hasta":{"no-existe":5}}' "$U/inbox/alice-backend/leido")
+comp "un ledger DESCONOCIDO no puede dar ok:true" "False" \
+  "$(printf '%s' "$R" | python3 -c 'import sys,json;print(json.load(sys.stdin)["ok"])' 2>/dev/null)"
+comp "y la respuesta lo NOMBRA en ignorados" "no-existe" \
+  "$(printf '%s' "$R" | python3 -c 'import sys,json;print(",".join(json.load(sys.stdin)["ignorados"]))' 2>/dev/null)"
+# CONTROL POSITIVO: uno REAL sí tiene que aplicarse, o lo de arriba pasaría con el
+# endpoint roto del todo.
+R2=$(curl -s "${A[@]}" -H 'Content-Type: application/json' -d '{"hasta":{"t":7}}' "$U/inbox/alice-backend/leido")
+comp "un ledger REAL sí se aplica (el gate no está mudo)" "True" \
+  "$(printf '%s' "$R2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["ok"])' 2>/dev/null)"
+comp "y trae el ANTES y el AHORA, no un eco" "7" \
+  "$(printf '%s' "$R2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["aplicados"]["t"]["ahora"])' 2>/dev/null)"
+# Y el cuerpo que sugiere la bandeja tiene que ser PEGABLE, no una taquigrafía: es
+# donde se rompían los 24.723 intentos.
+SUG=$(curl -s "${A[@]}" "$U/inbox/bob-reviewer" | grep -oE '\{"hasta":\{.*\}\}' | tail -1)
+comp "la bandeja sugiere un cuerpo JSON válido" "ok" \
+  "$(printf '%s' "${SUG:-x}" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("ok" if "hasta" in d else "no")' 2>/dev/null || echo "no-json")"
+curl -s "${A[@]}" -H 'Content-Type: application/json' -d '{"hasta":{"t":99}}' -o /dev/null "$U/inbox/alice-backend/leido"
+
 echo "── integridad: distinguir escribir de borrar ──"
 printf '\n### [alice-backend → bob-reviewer · FYI] tercera a medias\n' >> "$TMP/l.md"; sleep 3
 printf 'el cuerpo llega tarde\n' >> "$TMP/l.md"; sleep 3
@@ -464,7 +489,8 @@ echo "── el cerrojo de escritura: pasada corta y lectura que no depende de e
 # integridad de más arriba: pasaban IGUAL con el código roto —las corrí contra una
 # imagen rota a propósito y salieron verdes— porque leían una línea de log que no
 # era la del apéndice. Un gate que hereda estado ajeno mide el estado ajeno.
-T4=$(mktemp -d); NOM4="humo4-$$"; P4=$((PUERTO+3))
+T4=$(mktemp -d); chmod 755 "$T4"   # 700 + uid 1000 = el contenedor no lee (ver cabecera)
+NOM4="humo4-$$"; P4=$((PUERTO+3))
 limpiar4() { docker rm -f "$NOM4" >/dev/null 2>&1; rm -rf "$T4"; }
 # La base va DENTRO del contenedor (`/tmp`), no en un bind-mount del host, y esto es
 # la diferencia entre medir y no medir: sobre el montaje de macOS los locks POSIX no
@@ -578,7 +604,8 @@ echo "── una cabecera SIN flecha que nombra a @alguien SÍ se le entrega ─
 # llminbox no se las entregaba a NADIE: el mensaje dirigido no llegaba dirigido, y por
 # eso todos leían el canal entero y cualquiera cogía el trabajo. Contenedor propio y
 # corte de fecha propio, para medir las DOS mitades: que entregue, y que el corte corte.
-T5=$(mktemp -d); NOM5="humo5-$$"; P5=$((PUERTO+4))
+T5=$(mktemp -d); chmod 755 "$T5"   # idem: sin esto el CI de Linux indexa CERO
+NOM5="humo5-$$"; P5=$((PUERTO+4))
 limpiar5() { docker rm -f "$NOM5" >/dev/null 2>&1; rm -rf "$T5"; }
 printf '# t\n\n### [alice-backend habla del tema y avisa a @bob-reviewer] 2026-08-09T10:00:00Z — nueva\ncuerpo nuevo\n' > "$T5/l.md"
 printf '\n### [alice-backend habla de lo viejo y avisa a @bob-reviewer] 2026-08-01T10:00:00Z — vieja\ncuerpo viejo\n' >> "$T5/l.md"
