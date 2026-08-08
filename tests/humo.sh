@@ -106,6 +106,16 @@ comp "un ledger REAL sí se aplica (el gate no está mudo)" "True" \
   "$(printf '%s' "$R2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["ok"])' 2>/dev/null)"
 comp "y trae el ANTES y el AHORA, no un eco" "7" \
   "$(printf '%s' "$R2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["aplicados"]["t"]["ahora"])' 2>/dev/null)"
+# RETROCEDER NO ES «SIN EFECTO». Restaurar un cursor —de 99999999 a un valor real,
+# que es lo que se hace cuando alguien se lo deja al tope— vuelve a hacer visible
+# correo. La primera versión lo etiquetaba `sin_efecto`, o sea mentía justo en el
+# recibo que se lee al RECUPERAR. Reportado por cto-A el 2026-08-09.
+# falsador: con la etiqueta vieja, `retrocedidos` no existe y esto sale 0.
+curl -s "${A[@]}" -H 'Content-Type: application/json' -d '{"hasta":{"t":9}}' -o /dev/null "$U/inbox/alice-backend/leido"
+RET=$(curl -s "${A[@]}" -H 'Content-Type: application/json' -d '{"hasta":{"t":4}}' "$U/inbox/alice-backend/leido" \
+      | python3 -c 'import sys,json;print(json.load(sys.stdin).get("retrocedidos",{}).get("t",{}).get("vuelven_a_verse",0))' 2>/dev/null)
+comp "retroceder el cursor se reporta como retroceso, con cuánto vuelve a verse" "5" "${RET:-0}"
+curl -s "${A[@]}" -H 'Content-Type: application/json' -d '{"hasta":{"t":99}}' -o /dev/null "$U/inbox/alice-backend/leido"
 # Y el cuerpo que sugiere la bandeja tiene que ser PEGABLE, no una taquigrafía: es
 # donde se rompían los 24.723 intentos.
 SUG=$(curl -s "${A[@]}" "$U/inbox/bob-reviewer" | grep -oE '\{"hasta":\{.*\}\}' | tail -1)
@@ -262,6 +272,49 @@ python3 -c "import sys; sys.exit(0 if float('$DUR') > float('$TECHO_VIEJO') else
   && ok "y el barrido duró $DUR s > $TECHO_VIEJO s (POLL*6, el techo viejo) — la prueba muerde" \
   || fallo "el barrido tiene que costar más que el techo VIEJO o esto no prueba nada" \
            ">$TECHO_VIEJO" "$DUR"
+
+# ══ FRONTERA: DOS PREGUNTAS DISTINTAS, Y MEZCLARLAS DABA SEIS ROJOS FALSOS ══════
+#
+# Arriba se pregunta «¿aguanta el barrido lento sin ponerse rojo?», y para eso hace
+# falta el poll patológico: POLL=0.02 con sonda de integridad cada 2 s. Abajo se
+# pregunta «¿se reconstruye bien el índice y sobrevive el cursor?», y eso AFIRMA
+# CONTEOS EXACTOS — que es justo lo que el poll de arriba impide.
+#
+# Medido el 2026-08-08: bajo esos ajustes la sonda dispara reconstrucciones MIENTRAS
+# el indexador reescribe las 30.000 posiciones del reordenado, y el índice se queda
+# en 29.999 sin converger nunca. Los seis rojos de CI decían «la reconstrucción
+# devolvió 29.999 de 30.050» y no describían ningún defecto del producto: describían
+# este montaje. Verificado por separado — el mismo ledger de 19 MB, con ajustes
+# normales, indexa el reordenado en 1,29 s y converge a 30.050 en ~6 s.
+#
+# Así que el contenedor se reinicia aquí con POLL realista, CONSERVANDO LA BASE
+# (mismo volumen `$D2`): lo de abajo mide corrección, no velocidad de la máquina.
+# Esto NO baja el listón — separa dos preguntas que no caben en el mismo montaje.
+#
+# ⚠️ Lo que se cambia es SÓLO el poll. La sonda de integridad se queda en 2 s porque
+# ES EL MECANISMO BAJO PRUEBA: mi primer intento la puso en 3600 «para que no
+# interfiriera» y con eso deshabilité justo lo que el test de corrupción verifica —
+# cinco rojos nuevos, y ninguno del producto. Al acotar un test hay que saber cuál
+# de los ajustes es el ruido y cuál es el sujeto.
+#
+# ⚠️ Queda un hallazgo REAL sin gate, y se anota para no perderlo: bajo sonda
+# agresiva el índice puede no converger nunca. Eso merece su propia comprobación —
+# de CONVERGENCIA, no de conteo — y hoy no existe.
+docker rm -f "$NOM2" >/dev/null 2>&1
+docker run -d --name "$NOM2" -p "127.0.0.1:$P2:8077" \
+  -e LLMINBOX_LEDGERS="g=/l/g.md" -e LLMINBOX_TOKEN="$TOK" \
+  -e LLMINBOX_DB=/datos/h.sqlite -e LLMINBOX_POLL=1 -e LLMINBOX_ROSTER=/censo.json \
+  -e LLMINBOX_CHEQUEO=2 -e LLMINBOX_SUELO_RECONSTRUCCION=5 \
+  -v "$TMP2:/l" -v "$D2:/datos" -v "$PWD/roster.example.json:/censo.json:ro" \
+  "${IMAGEN:-llminbox:test}" >/dev/null
+for _ in $(seq 1 60); do curl -sf -m 2 "http://127.0.0.1:$P2/health" >/dev/null 2>&1 && break; sleep 1; done
+sleep 3
+# CONTROL de la frontera: si el reinicio no conservó la base, lo de abajo mediría
+# una reconstrucción desde cero y daría verde por el motivo equivocado.
+NB=$(curl -s "${B[@]}" "$V/stat" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["entradas"])' 2>/dev/null)
+[ "${NB:-0}" -ge 29000 ] \
+  && ok "el reinicio con ajustes realistas conserva el índice ($NB entradas)" \
+  || fallo "sin la base conservada, lo que sigue mide otra cosa" "≥29000" "${NB:-sin dato}"
 
 # ── ① la corrupción que nadie curaba ───────────────────────────────────────────
 # El 2026-08-01 el B-tree de `entries` se corrompió: el servicio lo DETECTÓ, lo

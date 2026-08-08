@@ -2022,7 +2022,7 @@ def marcar_leido(agent: str, l: Leido):
     canon = lp.canonico(agent)
     ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
     con = db()
-    aplicados, ignorados, sin_efecto = {}, [], []
+    aplicados, ignorados, retrocedidos, sin_cambio = {}, [], {}, []
     try:
         for name, seq in l.hasta.items():
             if name not in LEDGERS:
@@ -2035,11 +2035,17 @@ def marcar_leido(agent: str, l: Leido):
             con.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?)",
                         (canon, name, nuevo, ahora))
             aplicados[name] = {"antes": antes, "ahora": nuevo}
-            # No avanzar NO es un error —volver a marcar lo mismo es idempotente— pero
-            # tiene que verse: «he drenado y no se movió nada» es justo el fallo mudo
-            # que este endpoint producía.
-            if nuevo <= antes:
-                sin_efecto.append(name)
+            # RETROCEDER NO ES «SIN EFECTO» — es el efecto más grande que tiene este
+            # endpoint. La primera versión metía en `sin_efecto` todo lo que no
+            # avanzara, así que restaurar un cursor de 476 a 400 —que vuelve a hacer
+            # visibles 76 entradas— salía etiquetado «sin efecto». Y ése es justo el
+            # recibo que alguien lee cuando está RECUPERANDO un cursor mal puesto:
+            # la única vez que de verdad necesita creerse lo que pone. Reportado por
+            # cto-A el 2026-08-09 tras dejarse un cursor en 99999999.
+            if nuevo < antes:
+                retrocedidos[name] = {"vuelven_a_verse": antes - nuevo}
+            elif nuevo == antes:
+                sin_cambio.append(name)
         con.commit()
     finally:
         con.close()
@@ -2048,7 +2054,8 @@ def marcar_leido(agent: str, l: Leido):
     return {"ok": bool(aplicados), "agent": canon, "pediste": agent,
             "aplicados": aplicados,
             "ignorados": ignorados,          # nombres que este servicio no conoce
-            "sin_efecto": sin_efecto,        # se escribieron pero no adelantan nada
+            "retrocedidos": retrocedidos,    # el cursor VOLVIÓ ATRÁS: más correo visible
+            "sin_cambio": sin_cambio,        # se escribió el mismo valor que ya había
             "conocidos": sorted(LEDGERS) if ignorados else None}
 
 
