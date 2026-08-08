@@ -45,6 +45,8 @@ import json
 import os
 import re
 import sqlite3
+import threading
+import unicodedata
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -76,7 +78,26 @@ POLL = float(os.environ.get("LLMINBOX_POLL", "2.0"))
 TOKEN = os.environ.get("LLMINBOX_TOKEN", "")
 
 # Estado del indexador. Existe porque `/health` decía ok con el indexador muerto.
-SALUD: dict = {"ultimo_ok": 0.0, "error": None, "fallos": 0}
+#
+# `inicio` y `duracion` se añadieron el 2026-08-01 y arreglan un rojo FALSO. El
+# umbral de salud era `edad < POLL*6` —12 s con el POLL por defecto— contra el
+# tiempo transcurrido desde el último barrido COMPLETO. Eso sólo se sostiene si un
+# barrido dura ~0. Medido sobre el corpus real (82 MB, con un `LEDGER.md` de 75 MB):
+# el ciclo tarda ~17,6 s, así que `hace_s` sube 0,6 → 17,0 y reinicia, y `/health`
+# decía `ok:false` en 3 de cada 8 muestras con TODO sano. El hook de arranque de un
+# agente leía justo eso y anunciaba «llminbox no responde» sobre un servicio sano.
+# Un rojo que aparece solo enseña a ignorar el rojo — la misma lección que este
+# fichero ya documenta con las citas rotas y con la guarda de rotación.
+#
+# `duracion_max` es un MÁXIMO QUE DECAE, y no es adorno: con la última duración a
+# secas el arreglo seguía dando rojos —10 de 40 muestras en la prueba de humo, que
+# es quien lo cazó—. Los barridos alternan caros (re-parseo) y baratos (vía rápida
+# cuando el fichero no ha cambiado): si el techo se calcula justo después de uno
+# barato, el siguiente caro lo desborda y el rojo vuelve. El máximo que decae
+# recuerda lo que de verdad cuesta este corpus y baja solo si deja de costar.
+SALUD: dict = {"ultimo_ok": 0.0, "error": None, "fallos": 0,
+               "inicio": None, "duracion": None, "duracion_max": 0.0,
+               "reconstruido": 0.0, "sin_estado": False}
 
 # Ledgers que están fallando AHORA, con su motivo. Vive fuera de SALUD porque un
 # ledger roto no es un servicio roto: los demás siguen indexándose y sirviéndose.
@@ -96,16 +117,93 @@ LEDGERS = {
     )
 }
 
+# ── LA WIKI ───────────────────────────────────────────────────────────────────
+# El ledger es lo que se DIJO; la wiki es lo que quedó DECIDIDO. Son dos mitades
+# de la misma historia y aquí viven juntas, no en dos productos cosidos por una
+# API. Antes esto iba a apoyarse en una wiki externa por MCP; se descartó por
+# tres razones medidas: su base del proyecto llevaba un mes sin tocarse, su MCP
+# se cae y hay que reconectarlo a mano, y obligaba a custodiar un tercer secreto
+# dentro del contenedor.
+#
+# Y por lo que se GANA al tenerla dentro, que es lo que decide: **una cita que se
+# resuelve**. Cualquier wiki puede pintar una cita como insignia; ésta es la
+# única que tiene, en el mismo índice, la entrada de ledger que la respalda. Una
+# cita deja de ser texto y pasa a ser una clave foránea: se puede seguir, y se
+# puede detectar rota sin escribir un verificador aparte.
+#
+# Mismo trato que un ledger: markdown en disco, montado, indexado y DERIVADO. Si
+# el índice se borra, se reconstruye del markdown. La wiki no vive aquí dentro.
+WIKI = os.environ.get("LLMINBOX_WIKI", "")
+
+# CITAS AL LEDGER. Se reconocen las TRES formas vivas, no sólo la que este producto
+# propone. Medido sobre una wiki real de 115 páginas: 536 citas al ledger, y **cero**
+# en el formato por `eid` que yo había supuesto —243 por MARK, 194 sin ancla, 99 por
+# sello ISO—. Un resolvedor que sólo entiende su propio formato habría informado «0
+# citas» sobre una wiki que cita constantemente, y ese cero se lee como «no cita
+# nada» en vez de como «no sé leerlo».
+#
+# Es la misma lección que el troceador ya aprendió con las cabeceras: la herramienta
+# se adapta a cómo escribe la gente, no al revés. Que me haya vuelto a pasar en el
+# mismo repo, un día después, es el argumento de por qué está escrito aquí.
+#
+#   1. `[source: <ledger>:<eid|prefijo>]`      ← el formato de este producto
+#   2. `[source: <ledger>/LEDGER.md MARK:x]`   ← ancla nombrada en la cabecera
+#   3. `[source: <ledger>/LEDGER.md <sello>]`  ← sello ISO de la cabecera
+CITA_EID = re.compile(r"\[source:\s*([\w.-]+):([0-9a-f]{8,64})\s*\]")
+# El grupo 1 captura repo Y FICHERO. Capturando sólo el repo, las 160 citas a la
+# cola aterrizaban en el ledger de al lado —mismo prefijo, fichero distinto— y
+# salían rotas: un regex que descarta justo lo que distingue dos destinos.
+# `[\w./:-]+` cubre las dos formas vivas del destino —`repo/FICHERO.md` y
+# `repo:FICHERO`— sin partirlas, porque las dos existen en el corpus.
+_DEST = r"([\w./:-]+)"
+CITA_MARK = re.compile(r"\[source:\s*" + _DEST + r"\s+(MARK:[\w.-]+)")
+CITA_TS = re.compile(r"\[source:\s*" + _DEST + r"\s+(\d{4}-\d\d-\d\dT[\d:]+)")
+
+
+def _citas_de(txt: str):
+    """(ledger, ancla, clase) de cada cita. La clase decide CÓMO se resuelve."""
+    for ledger, ref in CITA_EID.findall(txt):
+        yield ledger, ref, "eid"
+    for ledger, ref in CITA_MARK.findall(txt):
+        yield ledger, ref, "mark"
+    for ledger, ref in CITA_TS.findall(txt):
+        yield ledger, ref, "sello"
+
+
+# Cerrojo del CAMBIO DE BASE. Sólo se coge en dos sitios: aquí, para crear una
+# conexión, y en el instante en que la reconstrucción pone la base nueva en su
+# sitio. No serializa las consultas —se suelta en cuanto la conexión existe—, así
+# que el coste normal es el de un lock sin contención.
+#
+# Existe por una carrera reproducida byte a byte (2026-08-01): en WAL, los ficheros
+# `-wal`/`-shm` viven al LADO de la base y no se mueven con ella. Una conexión que
+# nazca en el instante del reemplazo puede encontrarse la base NUEVA junto al `-wal`
+# de la VIEJA y aplicarlo encima: SQLite valida ese WAL por sus propias sumas, no
+# por pertenencia al fichero que tiene al lado, así que lo adopta — y las páginas
+# viejas quedan escritas de forma PERMANENTE en la base recién reconstruida. O sea
+# la cura reimportando la enfermedad. Con el cerrojo, toda conexión viva nació ANTES
+# del cambio y ya tiene atado su propio `-wal` (lo abre el `PRAGMA journal_mode` de
+# dos líneas más abajo, dentro del cerrojo), y ninguna nace DURANTE.
+CAMBIO_DE_BASE = threading.Lock()
+
 
 def db():
-    c = sqlite3.connect(DB, timeout=30)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA synchronous=NORMAL")
+    with CAMBIO_DE_BASE:
+        c = sqlite3.connect(DB, timeout=30)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
     return c
 
 
-SCHEMA_V = 6          # súbela con CUALQUIER cambio de tabla o de índice
+SCHEMA_V = 6          # súbela SÓLO si cambia la FORMA de una tabla existente
+# Ojo con esa palabra: «forma». Un cambio ADITIVO —tablas o índices nuevos— NO
+# necesita subirla, porque `executescript(SCHEMA)` corre en cada arranque y todo
+# lleva `IF NOT EXISTS`: las tablas nuevas nacen solas y las viejas siguen en pie.
+# Subirla por añadir algo TIRA la tabla de cursores, o sea le vacía la bandeja a
+# todo el equipo para crear dos tablas que se habrían creado igual. Estuve a punto
+# al añadir la wiki, y es el mismo defecto que arreglé el 28 por el otro lado: el
+# coste de esta bandera no es evidente desde donde se escribe.
 SCHEMA = """
 -- IDENTIDAD POR CONTENIDO, no por posición. `eid` = sha256 del texto de la entrada.
 --
@@ -121,6 +219,33 @@ SCHEMA = """
 -- local y monótono por construcción, así que sirve de cursor aunque el fichero se
 -- reordene por debajo: una entrada mezclada en medio recibe un `arrival` nuevo y
 -- aparece en la bandeja de quien no la había visto.
+-- REPARTO DE TRABAJO: quién COGE y quién REVISA. Tabla aditiva ⇒ NO sube SCHEMA_V
+-- (subirla vaciaría la tabla de cursores, o sea la bandeja de todo el equipo).
+--
+-- Existe por una queja medida del operador: «que uno lo coja es ok, que dos revisen
+-- es ok, pero que dos o más COJAN el mismo trabajo no es óptimo en tokens». Medido
+-- sobre agosto, un símbolo técnico lo tocaban entre 12 y 21 agentes, contra un techo
+-- de 4 (1 ejecuta + 3 revisan, que es la metodología triadversarial de la casa).
+--
+-- El índice parcial ES el cerrojo: UNA fila con rol='ejecuta' y sin cerrar por tema.
+-- No hay lectura-y-luego-escritura que se pueda colar entre medias — el segundo que
+-- llega choca contra el índice y recibe su NO. Probado con 20 procesos a la vez:
+-- exactamente 1 ganador en 2,7 ms, y sigue siendo 1 con la base ocupada por otro
+-- escritor (ahí sólo sube la latencia, no se rompe la exclusión).
+CREATE TABLE IF NOT EXISTS claims (
+  tema TEXT NOT NULL,              -- normalizado: ver `tema_norm()`
+  rol TEXT NOT NULL,               -- 'ejecuta' | 'revisa'
+  agent TEXT NOT NULL,
+  agent_bruto TEXT,                -- el nombre tal cual vino (agent guarda su ROL)
+  abierto TEXT NOT NULL,
+  cerrado TEXT,
+  bruto TEXT);                     -- el tema tal cual vino, para auditar
+CREATE UNIQUE INDEX IF NOT EXISTS claims_uno_ejecuta
+  ON claims(tema) WHERE rol='ejecuta' AND cerrado IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS claims_un_revisor_por_tema
+  ON claims(tema, agent) WHERE rol='revisa' AND cerrado IS NULL;
+CREATE INDEX IF NOT EXISTS i_claims ON claims(tema, cerrado);
+
 CREATE TABLE IF NOT EXISTS entries (
   ledger TEXT NOT NULL, eid TEXT NOT NULL,
   arrival INTEGER, seq INTEGER, line_no INTEGER, byte_off INTEGER,
@@ -151,6 +276,33 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS cursors (
   agent TEXT NOT NULL, ledger TEXT NOT NULL, last_arrival INTEGER, updated TEXT,
   PRIMARY KEY (agent, ledger));
+-- LECTURAS. Quién MIRA su bandeja, aunque no la consuma.
+--
+-- Existe porque el indicador de adopción estaba midiendo otra cosa. Sólo se creaba
+-- fila en `cursors` al CONSUMIR, y la forma correcta de leer al arrancar —`peek`,
+-- o el GET— no consume: seis agentes con esto cableado seguían contando como cero.
+-- Un indicador que no distingue «nadie lo usa» de «todos lo usan bien» no informa
+-- de nada, y el falsador que este producto publicó (¿encogen las cabeceras?) no se
+-- puede interpretar sin saber quién lee.
+--
+-- Es TELEMETRÍA, no estado del protocolo: nadie decide nada con esto y borrarla no
+-- cambia lo que ningún agente ve. Por eso puede escribirla un GET, y el cursor no.
+CREATE TABLE IF NOT EXISTS lecturas (
+  agent TEXT PRIMARY KEY, primera TEXT, ultima TEXT, veces INTEGER DEFAULT 0);
+-- LA WIKI. Igual que `entries`: derivada del markdown, reconstruible, no canon.
+CREATE TABLE IF NOT EXISTS pages (
+  path TEXT PRIMARY KEY,          -- relativa a la raíz de la wiki
+  titulo TEXT, cuerpo TEXT, bytes INTEGER, mtime REAL, visto TEXT);
+-- Cada cita de una página a una entrada de ledger. ESTA tabla es el producto:
+-- es la unión que ninguna wiki puede hacer sola porque no tiene el ledger, y
+-- que ningún ledger puede hacer solo porque no tiene la wiki.
+CREATE TABLE IF NOT EXISTS citas (
+  path TEXT NOT NULL,             -- página que cita
+  ledger TEXT NOT NULL,           -- ledger citado
+  eid_ref TEXT NOT NULL,          -- eid o PREFIJO tal y como se escribió
+  eid TEXT,                       -- eid completo resuelto, NULL si no resuelve
+  PRIMARY KEY (path, ledger, eid_ref));
+CREATE INDEX IF NOT EXISTS i_cita_eid ON citas(eid);
 """
 
 
@@ -158,6 +310,341 @@ CREATE TABLE IF NOT EXISTS cursors (
 # vacía a medida que cada uno se reindexa. Ver `lifespan`: cambiar el censo ya no
 # tira los cursores, sólo obliga a recalcular lo que el censo decide.
 REDERIVAR: set = set()
+
+
+# Las dos huellas que deciden qué se tira al arrancar. Estaban calculadas EN LÍNEA
+# dentro de `lifespan` y salen aquí porque ahora hay un segundo sitio que tiene que
+# escribirlas: la reconstrucción por corrupción. Con la fórmula duplicada, ese
+# segundo sitio escribía la huella RESCATADA de la base rota —o ninguna, si el
+# rescate no llegaba a `meta`— y el arranque siguiente veía «esquema cambiado» y
+# hacía `DROP TABLE cursors`: rescatar el estado de lectura del equipo para que se
+# lo llevara el reinicio de después. Es el mismo daño que el arreglo del 2026-07-28,
+# entrando por la puerta de al lado.
+def huella_esquema() -> str:
+    return hashlib.sha256(str(SCHEMA_V).encode()).hexdigest()[:16]
+
+
+def huella_censo() -> str:
+    return hashlib.sha256(",".join(sorted(lp.AGENTES)).encode()).hexdigest()[:16]
+
+
+# ── CORRUPCIÓN DEL ÍNDICE ─────────────────────────────────────────────────────
+# Vivido el 2026-08-01, y el servicio estuvo días así sin que nada escalara: el
+# B-tree de `entries` se corrompió y este producto lo DETECTÓ, lo anotó y se
+# RINDIÓ. Había recuperación para dos cosas —cambio de esquema y montaje ausente—
+# y ninguna para lo único que de verdad no se puede servir.
+#
+# Tres defectos encadenados, y el tercero es el que lo hizo invisible:
+#  1. La corrupción entraba por el `except` POR LEDGER de `barrido`, donde se
+#     anotaba como «este ledger está roto». No lo está: el fichero de markdown
+#     estaba intacto —los 8, verificados— y lo roto era el índice, o sea el
+#     servicio entero. Clasificado en el sitio equivocado, se trató como un daño
+#     acotado que no lo era.
+#  2. Nadie reconstruía. `entries` es DERIVADA del markdown y se re-deriva en 15 s
+#     (medido en el rescate: 44.055 entradas, 8 ledgers, 82 MB). Rendirse ante un
+#     dato reconstruible es rendirse ante nada.
+#  3. Un ledger cuyo fichero no cambia sale por la vía rápida de `barrido` y hace
+#     `ROTOS.pop(name)`. Como sólo se descubre la corrupción al RE-INDEXAR, los 7
+#     ledgers tranquilos se declaraban SANOS mientras sus filas eran ilegibles:
+#     `/health` señalaba uno solo —el que más crece— y parecía un daño de un
+#     ledger. Por eso ahora se sondea el índice por su cuenta y no de rebote.
+#
+# `file is not a database` está en la lista por medición, no por completitud: es
+# EL mensaje que dio la base corrupta de este incidente al abrirla. Filtrar sólo
+# por «malformed» —lo que dice al leer una fila— habría dejado pasar el caso que
+# motivó esto.
+CORRUPCION = ("malformed", "file is not a database", "database corruption",
+              "encrypted or is not a database", "no such table: entries")
+
+# Suelo entre reconstrucciones. Sin él, un disco que devuelve basura convierte la
+# cura en el daño: reconstruir cada 2 s re-derivaría 82 MB en bucle. Al segundo
+# intento dentro de la ventana se deja de curar y se pone ROJO, que es lo honesto
+# cuando el problema no es el índice.
+RECONSTRUCCION_SUELO_S = float(os.environ.get("LLMINBOX_SUELO_RECONSTRUCCION", "300"))
+
+# Cada cuánto se sonda el índice por su cuenta. `PRAGMA quick_check(1)` cuesta
+# 0,05 s sobre los 171 MB reales (medido), así que la elección no es entre barato
+# y caro sino entre enterarse y no enterarse. A 60 s el coste es 0,08 % del tiempo
+# del vigilante y una corrupción en un corpus tranquilo tarda un minuto en salir,
+# no días.
+#
+# Sale al entorno para que el humo pueda falsarlo en segundos en vez de en minutos:
+# una propiedad que sólo se puede comprobar esperando un minuto no se comprueba.
+CHEQUEO_S = float(os.environ.get("LLMINBOX_CHEQUEO", "60"))
+
+
+def es_corrupcion(e: BaseException) -> bool:
+    """¿Este fallo dice que el ÍNDICE no se puede leer (no que el ledger esté mal)?"""
+    if not isinstance(e, sqlite3.DatabaseError):
+        return False
+    m = str(e).lower()
+    return any(s in m for s in CORRUPCION)
+
+
+def _rescatar(ruta: str) -> dict:
+    """Lo que NO sale del markdown, tabla a tabla y cada una en su propio try.
+
+    `cursors` es estado de protocolo —dónde va leyendo cada agente— y `lecturas`
+    es la telemetría de adopción. Todo lo demás de esta base se re-deriva. En el
+    incidente real las dos se leyeron enteras de la base corrupta (5 y 13 filas):
+    la corrupción vivía en las páginas grandes de `entries`, y rendirse con ellas
+    habría costado un estado perfectamente legible. Por eso se intenta SIEMPRE, y
+    por eso cada una va aparte: que una no se deje leer no puede llevarse la otra.
+
+    Además de la FILA del cursor se rescata su ANCLA: el `eid` de la entrada a la
+    que apunta. La fila sola no basta, y es el defecto más caro que tuvo esta
+    función: `arrival` es «el orden en que ESTA instancia vio la entrada», y una
+    base reconstruida de cero las ve todas a la vez, o sea EN ORDEN DE FICHERO. En
+    un ledger que ha pasado por un merge de git —el caso que el esquema de este
+    repo documenta como normal— los dos órdenes no coinciden, así que restaurar el
+    número tal cual mueve el cursor a otra entrada: en una dirección el agente
+    RELEE, y en la otra SE SALTA correo dirigido a él sin que nada lo diga. El
+    `eid` es identidad por contenido y sobrevive a la renumeración.
+    """
+    out: dict = {"cursors": [], "lecturas": [], "meta": [], "anclas": {},
+                 "entradas": {}, "leido": []}
+    try:
+        con = sqlite3.connect(f"file:{ruta}?mode=ro", uri=True, timeout=15)
+        con.row_factory = sqlite3.Row
+    except Exception as e:
+        print(f"[índice] la base vieja no se deja abrir ({type(e).__name__}: {e}) — "
+              f"se reconstruye SIN rescatar estado", flush=True)
+        return out
+    try:
+        for t, cols in (("cursors", "agent,ledger,last_arrival,updated"),
+                        ("lecturas", "agent,primera,ultima,veces"),
+                        ("meta", "k,v")):
+            try:
+                out[t] = [tuple(r) for r in con.execute(f"SELECT {cols} FROM {t}")]
+                out["leido"].append(t)
+            except Exception as e:
+                print(f"[índice] no pude rescatar `{t}`: {type(e).__name__}: {e}", flush=True)
+        for agente, ledger, hasta, _upd in out["cursors"]:
+            try:
+                r = con.execute("SELECT eid FROM entries WHERE ledger=? AND arrival<=? "
+                                "ORDER BY arrival DESC LIMIT 1", (ledger, hasta)).fetchone()
+                if r:
+                    out["anclas"][(agente, ledger)] = r["eid"]
+            except Exception:
+                pass          # sin ancla: se cae al número, y se dice en voz alta
+        for name in LEDGERS:
+            try:
+                out["entradas"][name] = con.execute(
+                    "SELECT COUNT(*) c FROM entries WHERE ledger=?", (name,)).fetchone()["c"]
+            except Exception:
+                out["entradas"][name] = None
+    finally:
+        con.close()
+    return out
+
+
+def _borrar(*rutas: str) -> None:
+    for r in rutas:
+        try:
+            os.unlink(r)
+        except FileNotFoundError:
+            pass
+
+
+def reconstruir_indice(motivo: str) -> bool:
+    """Tira el índice corrupto y lo re-deriva del markdown. Devuelve si lo hizo.
+
+    La base nueva se construye APARTE y ENTERA —incluidas las entradas, llamando al
+    mismo `reindex` de siempre— y sólo entonces se pone en su sitio con `os.replace`,
+    que es atómico. La primera versión dejaba `entries` vacía para que la rellenara
+    el barrido siguiente, y eso abría una ventana de ~20 s en la que el servicio
+    servía un índice VACÍO: bandejas a cero y `verify` diciendo «0 entradas» sobre
+    un canon intacto. Un servicio que contesta «no tienes correo» es peor que uno
+    que contesta 500, porque al 500 se le hace caso.
+
+    No se re-implementa el indexado: se llama al que ya existe y ya está probado.
+    Una segunda forma de indexar que sólo corre el peor día del servicio es la que
+    nunca se prueba.
+    """
+    ahora = time.time()
+    if ahora - SALUD["reconstruido"] < RECONSTRUCCION_SUELO_S:
+        print(f"[índice] 🔴 corrupto OTRA VEZ {int(ahora-SALUD['reconstruido'])}s después "
+              f"de reconstruirlo: no es el índice. NO reconstruyo — {motivo}", flush=True)
+        return False
+    # El suelo se marca ANTES de trabajar, no al terminar. Marcándolo al final, una
+    # reconstrucción que falla a mitad —disco lleno— no lo tocaba nunca y se
+    # reintentaba a cada sonda, sin freno: el suelo sólo frenaba a las que salían
+    # bien, que son justo las que no hace falta frenar.
+    SALUD["reconstruido"] = ahora
+    print(f"[índice] 🛠 CORRUPTO ({motivo}) — reconstruyo del markdown, que es el canon",
+          flush=True)
+
+    nueva_ruta = DB + ".nueva"
+    _borrar(nueva_ruta, nueva_ruta + "-wal", nueva_ruta + "-shm")
+    # Bandera propia en vez de preguntar `CAMBIO_DE_BASE.locked()`: eso es cierto si
+    # lo tiene CUALQUIER hilo —una petición cualquiera pasando por `db()`— y soltarlo
+    # entonces sería liberar un cerrojo ajeno, o sea abrir la ventana justo mientras
+    # se cambia la base. Un candado sólo lo suelta quien lo cerró.
+    tengo_cerrojo = False
+    try:
+        rescatado = _rescatar(DB)
+        sin_estado = "cursors" not in rescatado["leido"]
+        nueva = sqlite3.connect(nueva_ruta, timeout=30)
+        try:
+            nueva.row_factory = sqlite3.Row
+            nueva.executescript(SCHEMA)
+            nueva.executemany("INSERT OR REPLACE INTO lecturas VALUES (?,?,?,?)",
+                              rescatado["lecturas"])
+            # Las huellas NO se rescatan: se escriben las de AHORA. La base nueva se
+            # acaba de crear con el SCHEMA de este proceso, así que su huella de
+            # esquema es la de este proceso por definición; copiar la de la base rota
+            # —o dejarla en blanco si el rescate no llegó— haría que el arranque
+            # siguiente creyera que el esquema cambió y tirase `cursors`, deshaciendo
+            # el rescate que se acaba de hacer.
+            nueva.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                              [(k, v) for k, v in rescatado["meta"]
+                               if k not in ("schema_v", "roster_v", "parser_v")])
+            nueva.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                              [("schema_v", huella_esquema()), ("roster_v", huella_censo()),
+                               ("parser_v", str(lp.PARSER_V))])
+            REDERIVAR.update(LEDGERS)
+            for name, path in LEDGERS.items():
+                try:
+                    reindex(name, path, nueva)
+                except Exception as e:
+                    print(f"[índice] {name} no se pudo re-derivar: "
+                          f"{type(e).__name__}: {e}", flush=True)
+            # A PARTIR DE AQUÍ, BAJO CERROJO. Lo de arriba (re-derivar 82 MB) tarda
+            # segundos y no puede bloquear a nadie; lo de abajo son milisegundos y
+            # TIENE que ser indivisible frente a la creación de conexiones, porque
+            # incluye el instante en que la base cambia de sitio.
+            #
+            # SEGUNDA FOTO, a última hora. Entre la primera y este punto han pasado
+            # los segundos que cuesta re-derivar el markdown, y en ese tramo el
+            # servicio sigue vivo: un `POST .../leido` que aterrice ahí se perdería
+            # al reemplazar la base. Se vuelve a mirar y se queda el cursor MÁS
+            # AVANZADO de los dos, que es la dirección segura de perder un empate.
+            CAMBIO_DE_BASE.acquire()
+            tengo_cerrojo = True
+            tarde = _rescatar(DB)
+            if "cursors" in tarde["leido"]:
+                sin_estado = False
+            cursores, anclas = {}, dict(rescatado["anclas"])
+            anclas.update(tarde["anclas"])
+            for agente, ledger, hasta, upd in rescatado["cursors"] + tarde["cursors"]:
+                k = (agente, ledger)
+                if k not in cursores or (hasta or -1) > (cursores[k][0] or -1):
+                    cursores[k] = (hasta, upd)
+            sin_ancla = []
+            for (agente, ledger), (hasta, upd) in cursores.items():
+                eid = anclas.get((agente, ledger))
+                destino = None
+                if eid:
+                    r = nueva.execute("SELECT arrival FROM entries WHERE ledger=? AND eid=?",
+                                      (ledger, eid)).fetchone()
+                    destino = r["arrival"] if r else None
+                if destino is None:
+                    # Sin ancla resoluble se cae al número viejo, que es lo único que
+                    # queda — pero NO en silencio: puede haberse movido de entrada.
+                    destino = hasta
+                    sin_ancla.append(f"{agente}@{ledger}")
+                nueva.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?)",
+                              (agente, ledger, destino, upd))
+            # Queda registrado POR LEDGER, que es como lo lee `verify`: una ventana
+            # que se reconstruyó es una ventana que este servicio no vigiló, y quien
+            # pregunte por la integridad del canon tiene que verlo aunque el servicio
+            # esté verde. Si el estado NO se pudo rescatar, eso va DENTRO del motivo:
+            # es un evento de flota —a todo el mundo se le mueve la bandeja— y
+            # declararlo un éxito silencioso sería la peor salida posible.
+            sello = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            detalle = motivo
+            if sin_estado:
+                detalle += " · ⚠ SIN RESCATE de cursores: la bandeja de todos se reinicia"
+            if sin_ancla:
+                detalle += (f" · ⚠ {len(sin_ancla)} cursor(es) sin ancla de contenido "
+                            f"({', '.join(sorted(sin_ancla)[:6])}): pueden haberse movido")
+            nueva.executemany(
+                "INSERT INTO incidencias (ledger, ts, motivo, entradas_antes,"
+                " entradas_despues, ultimo_sellado) VALUES (?,?,?,?,?,NULL)",
+                [(n, sello, detalle, rescatado["entradas"].get(n),
+                  (nueva.execute("SELECT COUNT(*) c FROM entries WHERE ledger=?",
+                                 (n,)).fetchone()["c"]))
+                 for n in LEDGERS])
+            nueva.commit()
+            nueva.close()
+
+            # EL WAL VIEJO SE VA ANTES DEL REEMPLAZO. Al revés —reemplazar y luego
+            # borrar— hay un instante en que el fichero nuevo convive con el `-wal`
+            # de la base VIEJA (la corrupta), y una conexión que llegue ahí lo aplica
+            # encima: la cura reimportando la enfermedad, y de forma permanente.
+            _borrar(DB + "-wal", DB + "-shm")
+            os.replace(nueva_ruta, DB)
+            _borrar(nueva_ruta + "-wal", nueva_ruta + "-shm")
+        finally:
+            try:
+                nueva.close()
+            except Exception:
+                pass
+            if tengo_cerrojo:
+                CAMBIO_DE_BASE.release()
+    except Exception as e:
+        # No se deja basura ni se deja el fallo mudo. Devolver False deja que quien
+        # llama lo suba a `/health`: un índice que no se puede reconstruir SÍ es el
+        # servicio roto, y ahí el rojo es la respuesta correcta.
+        print(f"[índice] 🔴 la reconstrucción FALLÓ ({type(e).__name__}: {e}) — "
+              f"el índice sigue como estaba", flush=True)
+        _borrar(nueva_ruta, nueva_ruta + "-wal", nueva_ruta + "-shm")
+        return False
+
+    # NO SE CANTA ÉXITO SIN MIRAR. Reconstruir y NO comprobar el resultado es la
+    # misma clase de fallo que motivó todo esto: dar por bueno lo que no se ha leído.
+    # Si la base nueva tampoco se deja leer, el servicio se pone ROJO con su motivo
+    # en vez de quedarse verde sirviendo basura — y el suelo hace que se reintente
+    # dentro de RECONSTRUCCION_SUELO_S, no cada dos segundos.
+    mal = indice_ilegible()
+    if mal:
+        print(f"[índice] 🔴 reconstruí y la base nueva TAMPOCO se lee ({mal}) — "
+              f"esto ya no es el índice", flush=True)
+        return False
+
+    ROTOS.clear()
+    # Que a los 12 agentes se les haya reiniciado la bandeja es un evento de FLOTA:
+    # sale por `/health` además de por `verify`. No pone `ok` en rojo —es un hecho
+    # pasado, y un rojo que no se puede apagar enseña a apagar la alarma— pero deja
+    # de ser invisible, que era el reproche justo: «declara éxito aunque el rescate
+    # venga vacío».
+    SALUD["sin_estado"] = sin_estado
+    print(f"[índice] ✅ base nueva en su sitio · {len(rescatado['cursors'])} cursores y "
+          f"{len(rescatado['lecturas'])} lecturas rescatados"
+          f"{' · ⚠ SIN estado rescatado' if sin_estado else ''}", flush=True)
+    return True
+
+
+def indice_ilegible() -> str:
+    """Sonda barata del índice. Devuelve el motivo, o cadena vacía si está sano.
+
+    Existe porque la corrupción sólo se descubría al RE-INDEXAR un ledger, y un
+    ledger que no cambia no se re-indexa: siete de los ocho estaban ilegibles y
+    contados como sanos. Se lee además una fila de verdad con su cuerpo, porque
+    `quick_check` mira la estructura y lo que reventaba en el incidente era el
+    B-tree de la tabla al pedir el `body` — un `PRAGMA` a secas se lo perdía.
+
+    SÓLO cuentan los fallos de CORRUPCIÓN. La primera versión devolvía cualquier
+    excepción, y eso convierte un `database is locked` de un momento de carga —o un
+    permiso, o un fichero que aún no existe— en una reconstrucción completa: la
+    sonda que existe para no perder datos, provocando el trabajo que se quería
+    evitar. Lo que no es corrupción se calla aquí y sale por su propio camino.
+    """
+    try:
+        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=10)
+        try:
+            r = con.execute("PRAGMA quick_check(1)").fetchone()[0]
+            if r != "ok":
+                return f"quick_check: {r}"
+            con.execute("SELECT eid, body FROM entries LIMIT 1").fetchall()
+        finally:
+            con.close()
+    except Exception as e:
+        if es_corrupcion(e):
+            return f"{type(e).__name__}: {e}"
+        print(f"[índice] la sonda no pudo mirar (NO es corrupción, no toco nada): "
+              f"{type(e).__name__}: {e}", flush=True)
+    return ""
 
 
 def reindex(ledger: str, path: str, con) -> dict:
@@ -182,7 +669,8 @@ def reindex(ledger: str, path: str, con) -> dict:
         vivos.setdefault(e.sha, e)          # duplicado exacto = la misma entrada
 
     previos = {r["eid"]: r for r in con.execute(
-        "SELECT eid, ausente, provisional FROM entries WHERE ledger=?", (ledger,))}
+        "SELECT eid, ausente, provisional, seq, line_no, byte_off FROM entries "
+        "WHERE ledger=?", (ledger,))}
     ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
     prox = (con.execute("SELECT COALESCE(MAX(arrival), -1) + 1 m FROM entries "
                         "WHERE ledger=?", (ledger,)).fetchone()["m"])
@@ -192,14 +680,44 @@ def reindex(ledger: str, path: str, con) -> dict:
     # que no ha cambiado.
     rederivar = ledger in REDERIVAR
     filas, dest, nuevas = [], [], 0
+    # Filas YA CONOCIDAS que de verdad han cambiado de sitio. Se cuenta y se imprime
+    # a propósito: sin este número, «reescribo todas las filas en cada pasada» es
+    # invisible desde fuera —el log decía «1 nuevas» tanto si tocaba 1 fila como si
+    # tocaba 32.761— y no hay forma de gatear la propiedad en la prueba de humo. Un
+    # apéndice puro tiene que dar `refrescadas=1` (la que deja de ser la última) o 0.
+    refrescadas = 0
     for pos, e in enumerate(ents):
         if e.sha in previos:
             # ya conocida: se refresca su posición, se conserva su arrival y, si
             # había desaparecido, se anota que ha vuelto.
-            con.execute("UPDATE entries SET seq=?, line_no=?, byte_off=?, ausente=NULL, "
-                        "provisional=? WHERE ledger=? AND eid=?",
-                        (pos, e.line_no, e.byte_off, 1 if pos == len(ents) - 1 else 0,
-                         ledger, e.sha))
+            #
+            # PERO SÓLO SI ALGO CAMBIÓ. Antes se escribía siempre, y en un fichero de
+            # sólo-apéndice eso son N escrituras no-op por pasada: para meter UNA
+            # entrada nueva en un ledger grande se reescribían sus 32.761 filas con
+            # mismos valores. El coste no era la CPU: la transacción de escritura se
+            # abre en la primera UPDATE y no se cierra hasta el `commit` del final, o
+            # sea el cerrojo quedaba tomado la pasada entera —medido 39,04 s el
+            # 2026-08-08T08:17:46Z—, y cualquier otro escritor (el contador de
+            # `/inbox`, el cursor de `/leido`) agotaba sus 30 s de espera y moría con
+            # «database is locked»: 212 fallos entre las 04:18 y las 08:27 de ese día.
+            # Comparando antes de escribir, una pasada de apéndice puro toca UNA fila
+            # —la que dejó de ser la última— y la transacción dura milisegundos.
+            #
+            # Ojo: esto NO es una optimización con criterio propio. Escribe exactamente
+            # cuando el valor almacenado difiere del calculado, así que una reescritura
+            # del fichero —que mueve `seq`/`line_no`/`byte_off` de todo el mundo— sigue
+            # actualizando todo, y una entrada que vuelve (`ausente` no nula) también.
+            # Si algún día un campo de estos empieza a derivarse de otra cosa, hay que
+            # añadirlo a la comparación o se quedará fosilizado en silencio.
+            prev = previos[e.sha]
+            prov = 1 if pos == len(ents) - 1 else 0
+            if (prev["seq"] != pos or prev["line_no"] != e.line_no
+                    or prev["byte_off"] != e.byte_off
+                    or prev["provisional"] != prov or prev["ausente"] is not None):
+                con.execute("UPDATE entries SET seq=?, line_no=?, byte_off=?, ausente=NULL, "
+                            "provisional=? WHERE ledger=? AND eid=?",
+                            (pos, e.line_no, e.byte_off, prov, ledger, e.sha))
+                refrescadas += 1
             if rederivar:
                 # El texto es el mismo —su `eid` lo demuestra— pero el censo nuevo
                 # puede reconocer a alguien que antes no existía. Se recalcula lo
@@ -258,7 +776,182 @@ def reindex(ledger: str, path: str, con) -> dict:
     con.commit()
     # La re-derivación se consume: se pide una vez por cambio de censo, no cada 2 s.
     REDERIVAR.discard(ledger)
-    return {"ledger": ledger, "entries": n, "nuevas": nuevas, "idas": len(idas)}
+    return {"ledger": ledger, "entries": n, "nuevas": nuevas, "idas": len(idas),
+            "refrescadas": refrescadas}
+
+
+def _titulo(path: str, txt: str) -> str:
+    """El título de una página: `title:` del frontmatter, o el primer `# `, o el
+    nombre del fichero. En ese orden, porque es el de menos a más suposición."""
+    m = re.search(r'^title:\s*["\']?(.+?)["\']?\s*$', txt[:1200], re.M)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"^#\s+(.+)$", txt, re.M)
+    return m.group(1).strip() if m else os.path.basename(path)
+
+
+def reindex_wiki(con) -> dict:
+    """Indexa la wiki y RESUELVE cada cita contra las entradas ya indexadas.
+
+    Se resuelve por PREFIJO de `eid` porque nadie copia 64 caracteres a mano: el
+    formato citable son 12. Con igualdad exacta, una cita correcta escrita en su
+    forma corta saldría rota — el fallo caro, porque enseña a ignorar el informe.
+
+    Una cita que no resuelve NO se borra: se guarda con `eid=NULL`. Ésa es la que
+    interesa, y borrarla sería el mismo error que borrar la entrada desaparecida
+    en vez de marcarla: el arreglo que se come al detector.
+    """
+    if not WIKI or not os.path.isdir(WIKI):
+        return {"paginas": 0, "citas": 0, "rotas": 0}
+    ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    vivas, filas, cit = set(), [], []
+    for raiz, _, ficheros in os.walk(WIKI):
+        for f in ficheros:
+            if not f.endswith(".md"):
+                continue
+            abso = os.path.join(raiz, f)
+            rel = os.path.relpath(abso, WIKI)
+            vivas.add(rel)
+            try:
+                st = os.stat(abso)
+                txt = open(abso, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            filas.append((rel, _titulo(rel, txt), txt, st.st_size, st.st_mtime, ahora))
+            for ledger, ref, clase in _citas_de(txt):
+                cit.append((rel, ledger, ref, clase))
+
+    con.executemany("INSERT OR REPLACE INTO pages VALUES (?,?,?,?,?,?)", filas)
+    # Las páginas borradas del disco SÍ se van del índice: la wiki es mutable por
+    # diseño (se corrige, se fusiona, se retira), al revés que un ledger de sólo
+    # apéndice. Aquí una desaparición es trabajo normal, no un hallazgo.
+    for (p,) in con.execute("SELECT path FROM pages").fetchall():
+        if p not in vivas:
+            con.execute("DELETE FROM pages WHERE path=?", (p,))
+            con.execute("DELETE FROM citas WHERE path=?", (p,))
+
+    con.execute("DELETE FROM citas")
+    # El nombre lógico del ledger en la cita puede no ser el del montaje: la wiki
+    # escribe `64bis-wiki/LEDGER.md` y aquí el ledger se llama `64bis-wiki`. Se
+    # acepta el prefijo, que es como lo escribe la gente.
+    conocidos = list(LEDGERS)
+    rotas = 0
+    for rel, ledger, ref, clase in cit:
+        # El nombre citado trae el FICHERO, no sólo el repo: `64bis-wiki/LEDGER.md` y
+        # `64bis-wiki/WIKI-QUEUE.md` son dos ledgers distintos con el mismo prefijo.
+        # Resolviendo sólo por prefijo, las 160 citas a la cola aterrizaban en el
+        # ledger equivocado y salían rotas — 39 «rotas» que eran de mi mapeo.
+        # Se prefiere la coincidencia MÁS LARGA, que es la que distingue los dos.
+        real = ledger
+        if ledger not in LEDGERS:
+            # POR LA RUTA, que es un hecho, y sólo después por parecido de nombre.
+            #
+            # El parecido solo volvió a fallar, y en la misma familia que el arreglo
+            # de arriba: `64bis-wiki/WIKI-QUEUE.md` se aplasta a la pista
+            # `64bis-wiki-wiki-queue`, donde `64bis-wiki` SÍ es subcadena y
+            # `64bis-wiki-queue` NO lo es —sobra un `wiki-` de juntar el repo con el
+            # fichero—, así que la cita a la COLA aterrizaba en el ledger de al lado.
+            # Medido: 32 de las 56 citas «rotas» resolvían exactas en la cola, y otras
+            # 7 en `LEDGER.md`; 39 de 56 eran de mi mapeo. Segunda vez que el mismo
+            # atajo produce el mismo error con otra forma — por eso ahora se compara
+            # contra la RUTA REAL del montaje, que no admite parecidos.
+            #
+            # El corte en `/` es lo que impide que `LEDGER.md` case con
+            # `AGENT_LEDGER.md`: se exige que el trozo citado empiece en frontera de
+            # ruta. Y si casan DOS, no se elige: una cita ambigua se deja rota, que es
+            # información, mientras que adivinar es una cita que miente.
+            # Se prueban las dos formas vivas del destino: con extensión y sin ella.
+            # La wiki escribe `[source: LEDGER 2026-…]` a secas —sin repo y sin
+            # `.md`— en 7 citas: nombra el FICHERO del ledger y da por supuesto el
+            # repo. Es una cita pobre, pero no ambigua aquí, y la regla de abajo lo
+            # decide sola: sólo un montaje termina en `/LEDGER.md`. Si algún día hay
+            # dos, `len(porruta) == 1` deja de cumplirse y la cita vuelve a salir
+            # rota, que es lo correcto — el desempate no se adivina.
+            base = "/" + ledger.strip("/")
+            sufs = (base, base + ".md")
+            porruta = [n for n, p in LEDGERS.items()
+                       if p == ledger or any(p.endswith(s) for s in sufs)]
+            if len(porruta) == 1:
+                real = porruta[0]
+            else:
+                pista = ledger.lower().replace("/", "-").replace(".md", "")
+                cands = [n for n in conocidos
+                         if n.lower() in pista or pista.startswith(n.lower())]
+                if cands:
+                    real = max(cands, key=len)
+        if clase == "eid":
+            fila = con.execute(
+                "SELECT eid FROM entries WHERE ledger=? AND eid LIKE ? AND ausente IS NULL "
+                "LIMIT 1", (real, ref + "%")).fetchone()
+            eid = fila["eid"] if fila else None
+        elif clase == "sello":
+            # EL SELLO NO SE BUSCA EN EL TEXTO: el troceador ya lo extrajo a `ts`.
+            #
+            # Buscarlo en el cuerpo y exigir que caiga en la PRIMERA LÍNEA da por
+            # supuesto que la cabecera ocupa una línea, y no siempre: medido, la
+            # entrada `d25f3808` tiene una cabecera de 5.352 caracteres que su autor
+            # partió, con el sello en la SEGUNDA línea. El troceador la entiende —le
+            # sacó el `ts` correcto—; el gate no, así que declaraba rota una cita
+            # perfecta. 17 de las 22 «rotas» que quedaban eran exactamente esto: no
+            # citas malas, cabeceras largas.
+            #
+            # Comparar contra `ts` es además MÁS estricto que buscar en el texto: `ts`
+            # es la hora DE LA ENTRADA, así que una entrada que se limite a mencionar
+            # esa hora en su prosa no puede colarse. El eco de un ancla sigue sin ser
+            # el ancla, que era lo que protegía la regla de la primera línea.
+            fila = con.execute(
+                "SELECT eid FROM entries WHERE ledger=? AND ts=? AND ausente IS NULL "
+                "LIMIT 1", (real, ref)).fetchone()
+            if fila:
+                eid = fila["eid"]
+            else:
+                # Cita truncada (`2026-07-26T09:1`, o el `01:44:xx` que alguien dejó
+                # sin segundos): se acepta por prefijo SÓLO si no hay ambigüedad. Con
+                # dos candidatos se deja rota a propósito — elegir uno sería inventar
+                # a cuál de las dos entradas se refería quien escribió a medias.
+                cands = con.execute(
+                    "SELECT eid FROM entries WHERE ledger=? AND ts LIKE ? AND "
+                    "ausente IS NULL LIMIT 2", (real, ref + "%")).fetchall()
+                eid = cands[0]["eid"] if len(cands) == 1 else None
+            if eid is None:
+                # Y SI NO HAY COLUMNA, SE VUELVE AL TEXTO. Sustituir la búsqueda por
+                # `ts` en vez de anteponerla fue una regresión mía, medida: 22 → 37
+                # rotas. Di por hecho que `ts` está siempre poblado y en la COLA no lo
+                # está —115 sellos parseados para 221 entradas, porque sus cabeceras
+                # no siguen la forma que el troceador fecha—, así que las citas a
+                # minuto que resolvían por texto se quedaron sin nada donde caer.
+                #
+                # Se mira la CABECERA ENTERA (hasta la primera línea en blanco), no su
+                # primera línea: ese era el defecto original —una cabecera de 5.352
+                # caracteres partida en dos dejaba el ancla en la segunda línea—. El
+                # corte en la línea en blanco es lo que conserva la garantía que
+                # importa: el ancla tiene que estar en la CABECERA, no en la prosa.
+                for r in con.execute(
+                        "SELECT eid, body FROM entries WHERE ledger=? AND body LIKE ? "
+                        "AND ausente IS NULL LIMIT 40", (real, f"%{ref}%")):
+                    if ref in r["body"].split("\n\n", 1)[0]:
+                        eid = r["eid"]
+                        break
+        else:
+            # MARK y sello viven en la CABECERA, y `head` se guarda recortado a 600
+            # caracteres: sobre cabeceras de p90=916 el ancla se queda fuera. Buscarla
+            # ahí daba 189 «rotas» sobre una wiki cuyo propio gate las da todas por
+            # buenas — el primer número era del instrumento, como siempre.
+            #
+            # Se busca en `body`, que trae la entrada entera, PERO se exige que el
+            # ancla caiga en su PRIMERA LÍNEA (la cabecera). Sin ese corte, citar un
+            # MARK en la prosa lo validaría solo: el eco de un ancla no es el ancla.
+            eid = None
+            for r in con.execute(
+                    "SELECT eid, body FROM entries WHERE ledger=? AND body LIKE ? "
+                    "AND ausente IS NULL LIMIT 40", (real, f"%{ref}%")):
+                if ref in r["body"].split("\n", 1)[0]:
+                    eid = r["eid"]
+                    break
+        rotas += 0 if eid else 1
+        con.execute("INSERT OR REPLACE INTO citas VALUES (?,?,?,?)", (rel, real, ref, eid))
+    con.commit()
+    return {"paginas": len(filas), "citas": len(cit), "rotas": rotas}
 
 
 # `sellar()` se ha ido. Encadenaba hashes por POSICIÓN, y eso solo tiene sentido con
@@ -283,15 +976,56 @@ async def vigilante():
     canal de ~2 entradas/minuto no hay nada que ganar; (3) no depende de una conducta
     de virtiofs que cambia entre versiones de Docker Desktop.
     """
+    ultimo_chequeo = 0.0
     while True:
         try:
+            # SONDA DEL ÍNDICE, antes del barrido y por su cuenta. Un ledger que no
+            # cambia no se re-indexa, así que su corrupción no la descubría nadie:
+            # el 2026-08-01 siete de los ocho estaban ilegibles y contados como
+            # sanos. Cuesta 0,05 s sobre 171 MB, se corre cada CHEQUEO_S.
+            if time.time() - ultimo_chequeo > CHEQUEO_S:
+                ultimo_chequeo = time.time()
+                mal = await asyncio.to_thread(indice_ilegible)
+                if mal and not await asyncio.to_thread(reconstruir_indice, mal):
+                    SALUD["error"] = f"índice corrupto y no reconstruible: {mal}"
+                    await asyncio.sleep(POLL)
+                    continue
             # El barrido ENTERO va a un hilo, no solo `reindex`: la conexión SQLite se
             # crea dentro (no se puede compartir entre hilos) y así ninguna parte
             # síncrona toca el event loop. Antes bloqueaba 5,09 s en el arranque en
             # frío, durante los cuales el proceso no atendía NADA, ni /health.
+            SALUD["inicio"] = time.time()
             await asyncio.to_thread(barrido)
-            SALUD.update(ultimo_ok=time.time(), error=None, fallos=0)
+            fin = time.time()
+            dur = fin - SALUD["inicio"]
+            SALUD.update(ultimo_ok=fin, duracion=dur, inicio=None, error=None, fallos=0,
+                         duracion_max=max(dur, SALUD["duracion_max"] * 0.95))
         except Exception as e:                       # el vigilante nunca mata el servicio
+            SALUD["inicio"] = None
+            # La corrupción sube hasta aquí desde `barrido` y se CURA, en vez de
+            # anotarse y esperar a nadie. Si la cura no procede —hubo otra hace
+            # menos de RECONSTRUCCION_SUELO_S— cae al `error` de abajo y sale roja.
+            # Va al hilo, como el barrido y por el mismo motivo: abre la base vieja,
+            # crea la nueva y la mueve de sitio. Hacerlo en el bucle de eventos deja
+            # al proceso sin atender NADA —ni `/health`— justo en el momento en que
+            # alguien va a preguntar qué pasa.
+            #
+            # Y va con SU PROPIO try. Esto corre DENTRO de un `except`: una excepción
+            # aquí no la recoge el `try` de arriba —ya se está ejecutando su
+            # manejador—, así que sale del `while` y **mata al vigilante para
+            # siempre**, en silencio y justo en el peor momento. El servicio seguiría
+            # contestando con un índice congelado. Sin esta red, la cura era una forma
+            # nueva de que se muriera el indexador, que es el fallo que este bucle
+            # entero existe para no tener.
+            try:
+                if es_corrupcion(e) and await asyncio.to_thread(
+                        reconstruir_indice, f"{type(e).__name__}: {e}"):
+                    SALUD.update(error=None, fallos=0)
+                    await asyncio.sleep(POLL)
+                    continue
+            except Exception as e2:
+                print(f"[vigilante] la cura reventó: {type(e2).__name__}: {e2}", flush=True)
+                e = e2
             # ...pero TAMPOCO se lo calla. Un `IndexError` mío en la guarda de rotación
             # dejó el indexador muerto en bucle mientras `/health` seguía diciendo ok y
             # los appends nuevos no entraban. Un servicio cuyo indexador está muerto no
@@ -300,6 +1034,65 @@ async def vigilante():
             SALUD["fallos"] = SALUD.get("fallos", 0) + 1
             print(f"[vigilante] ERROR {SALUD['error']}", flush=True)
         await asyncio.sleep(POLL)
+
+
+# ── Telemetría de lecturas: se ACUMULA en memoria y se vuelca UNA vez por barrido ──
+#
+# Antes, cada `GET /inbox` escribía su fila. Con una flota consultando su bandeja eso
+# es una escritura por consulta contra una base que el indexador también escribe, y el
+# resultado medido el 2026-08-08 fue: primero 212 lecturas caídas con 500 («database
+# is locked»), y luego —ya con la escritura protegida y rindiéndose en 250 ms— 51
+# contadores PERDIDOS en 5 minutos. O sea el arreglo salvaba la lectura y dejaba el
+# contador mintiendo, que es la mitad del problema disfrazada de solución.
+#
+# Acumular en memoria quita la escritura del camino de lectura ENTERO: `/inbox` deja
+# de escribir, y el volcado va donde ya había una transacción abierta de todos modos.
+# Lo que se arriesga es perder las cuentas no volcadas si el proceso muere — y eso ya
+# pasaba, sólo que en silencio y a razón de diez por minuto.
+LECTURAS: dict[str, list] = {}          # agent -> [primera_iso, ultima_iso, veces]
+LECTURAS_LOCK = threading.Lock()
+
+
+def anota_lectura(agent: str, ahora_iso: str) -> None:
+    with LECTURAS_LOCK:
+        v = LECTURAS.get(agent)
+        if v is None:
+            LECTURAS[agent] = [ahora_iso, ahora_iso, 1]
+        else:
+            v[1] = ahora_iso
+            v[2] += 1
+
+
+def vuelca_lecturas(con) -> None:
+    """Vuelca lo acumulado. Si la base está ocupada, lo DEVUELVE al acumulador.
+
+    Devolverlo importa: un volcado que se traga el fallo pierde exactamente lo que
+    este cambio existe para no perder, y encima lo pierde justo cuando hay carga —
+    o sea el contador mentiría más cuanto más se usa el servicio.
+    """
+    with LECTURAS_LOCK:
+        if not LECTURAS:
+            return
+        pend = list(LECTURAS.items())
+        LECTURAS.clear()
+    try:
+        con.executemany(
+            "INSERT INTO lecturas (agent, primera, ultima, veces) VALUES (?,?,?,?) "
+            "ON CONFLICT(agent) DO UPDATE SET ultima=excluded.ultima, "
+            "veces=veces+excluded.veces",
+            [(a, p, u, n) for a, (p, u, n) in pend])
+        con.commit()
+    except sqlite3.OperationalError as exc:
+        con.rollback()
+        with LECTURAS_LOCK:
+            for a, (p, u, n) in pend:
+                v = LECTURAS.get(a)
+                if v is None:
+                    LECTURAS[a] = [p, u, n]
+                else:
+                    v[0] = min(v[0], p)
+                    v[2] += n
+        print(f"[lecturas] volcado aplazado ({len(pend)} agentes): {exc}", flush=True)
 
 
 def barrido():
@@ -330,14 +1123,46 @@ def barrido():
                 t0 = time.time()
                 r = reindex(name, path, con)
                 ROTOS.pop(name, None)
-                print(f"[vigilante] {name}: {r['nuevas']} nuevas, total {r['entries']} "
+                print(f"[vigilante] {name}: {r['nuevas']} nuevas, "
+                      f"{r['refrescadas']} refrescadas, total {r['entries']} "
                       f"({time.time()-t0:.2f}s)", flush=True)
             except Exception as e:
+                # La corrupción del ÍNDICE no es «este ledger está roto» y no puede
+                # salir por aquí: el markdown está intacto y lo que no se puede leer
+                # es la base, o sea todos los ledgers a la vez. Anotarlo como daño
+                # de UN ledger fue lo que disfrazó el incidente del 2026-08-01 de
+                # avería acotada. Sube al vigilante, que sabe reconstruir.
+                if es_corrupcion(e):
+                    raise
                 motivo = f"{type(e).__name__}: {e}"
                 if ROTOS.get(name) != motivo:          # no repetir el log cada 2 s
                     print(f"[vigilante] 🔴 {name}: {motivo} — sigo con los demás", flush=True)
                 ROTOS[name] = motivo
                 con.rollback()
+        # La wiki, al final del barrido y a propósito: sus citas resuelven contra
+        # las entradas que se acaban de indexar. Al revés, una página que cita una
+        # entrada recién escrita saldría rota durante un ciclo — un falso rojo por
+        # orden de ejecución, que es la peor clase de rojo: enseña a ignorarlo.
+        if WIKI:
+            try:
+                SALUD["wiki"] = reindex_wiki(con)
+                ROTOS.pop("wiki", None)
+            except Exception as e:
+                if es_corrupcion(e):                   # ver el `raise` de arriba
+                    raise
+                # SÓLO un fallo de INDEXADO entra en `ROTOS` —eso sí es el servicio
+                # roto—. Las citas rotas NO: son un defecto del contenido y viven en
+                # `/wiki/citas`. Meterlas aquí pondría `/health` en rojo permanente
+                # el día que alguien cite mal, y una alarma que no se puede apagar
+                # enseña a apagar la alarma. Es la misma lección que este fichero ya
+                # documenta con la guarda de rotación y con el ledger provisional.
+                ROTOS["wiki"] = f"no pude indexarla: {e}"
+        # Y AL FINAL, con la conexión del barrido que ya existe: las lecturas que la
+        # flota acumuló desde la pasada anterior. Aquí no compite con nadie —el
+        # indexador acaba de soltar—, así que la telemetría deja de pelearse con el
+        # trabajo de verdad en vez de rendirse. Va DENTRO del `try`/`finally` para que
+        # la conexión se cierre igual si el volcado revienta.
+        vuelca_lecturas(con)
     finally:
         con.close()
 
@@ -345,6 +1170,27 @@ def barrido():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(os.path.dirname(DB), exist_ok=True)
+    # ANTES DE TOCAR NADA: si el índice que quedó en disco no se deja leer, se
+    # reconstruye aquí. En el incidente del 2026-08-01 el servicio arrancó sobre una
+    # base ya corrupta y siguió catorce horas sirviendo lo que podía; la sonda que
+    # lo habría cazado cuesta 0,05 s. Va antes de la migración de esquema a
+    # propósito: `executescript` sobre una base corrupta falla, y entonces el
+    # contenedor sale con error en un sitio que no explica nada.
+    if os.path.exists(DB):
+        mal = indice_ilegible()
+        if mal:
+            print(f"[arranque] el índice en disco no se puede leer — {mal}", flush=True)
+            # Con su red: si la cura revienta aquí, el arranque sigue y el fallo de
+            # la base saldrá por donde salía antes (la migración de esquema falla y
+            # el contenedor sale con error, que es la conducta que este fichero ya
+            # eligió). Sin la red, un fallo de la CURA —disco lleno, permisos— tumba
+            # el arranque por un camino nuevo que no explica nada, y la flota se
+            # queda sin servicio por el arreglo, no por la avería.
+            try:
+                reconstruir_indice(mal)
+            except Exception as e:
+                print(f"[arranque] la cura reventó ({type(e).__name__}: {e}) — "
+                      f"sigo y que hable la migración", flush=True)
     con = db()
     # MIGRACIÓN antes que nada. `CREATE TABLE IF NOT EXISTS` no altera una tabla que
     # ya existe: al cambiar el esquema, las tablas viejas sobrevivían intactas y el
@@ -361,7 +1207,6 @@ async def lifespan(app: FastAPI):
     # nadie reindexa y el actor/destinatarios siguen extraídos con el censo viejo.
     # Cazado el día uno: `init` añadía los agentes del demo al censo, y la bandeja
     # seguía vacía porque el índice recordaba que no existían.
-    import hashlib as _h
     # DOS huellas, no una. Estaban fundidas en la misma, y por eso dar de alta a un
     # agente TIRABA la tabla de cursores: le vaciaba la bandeja a todo el equipo por
     # incorporar a alguien. Reproducido antes de tocarlo (2026-07-28): cursor a 5,
@@ -373,8 +1218,8 @@ async def lifespan(app: FastAPI):
     # identidad por contenido: si `entries` sobrevive, cada `eid` conserva su
     # `arrival`, y un cursor «he leído hasta la #400» sigue apuntando a lo mismo.
     # La justificación se quedó puesta después de que el motivo desapareciera.
-    h_esq = _h.sha256(str(SCHEMA_V).encode()).hexdigest()[:16]
-    h_censo = _h.sha256(",".join(sorted(lp.AGENTES)).encode()).hexdigest()[:16]
+    h_esq = huella_esquema()
+    h_censo = huella_censo()
     fila = con.execute("SELECT v FROM meta WHERE k='schema_v'").fetchone()
     if not fila or fila["v"] != h_esq:
         print(f"[arranque] ESQUEMA cambiado ({fila['v'] if fila else 'sin índice'} → {h_esq}) — "
@@ -473,21 +1318,59 @@ def health():
     # congelado de antes, y `/health` dijo `ok` — con `/stat` enseñando seis ledgers
     # y sus cifras. Un verde impecable sobre un servicio ciego. Es exactamente la
     # clase de fallo que este proyecto existe para cazar en otros sitios.
-    sano = (SALUD["error"] is None
-            and (edad is not None and edad < POLL * 6)
-            and bool(LEDGERS))
+    # EL TECHO ESCALA CON LO QUE CUESTA EL BARRIDO, y por eso deja de oscilar.
+    # `POLL*6` daba por supuesto que un barrido dura ~0: con el corpus real dura
+    # ~17,6 s y el rojo entraba solo cada ciclo (medido: 3 de cada 8 muestras).
+    # Se toma 3× la última duración para absorber que un barrido tarde más que el
+    # anterior, y se topa a 600 s para que un indexador que se degrada sin parar
+    # acabe en rojo igualmente en vez de irse moviendo el listón él solo.
+    # DOS ESTADOS DISTINTOS, no uno. Con un solo techo contra «tiempo desde el último
+    # barrido completo», un barrido que de golpe tarda 8× más —la máquina cargada, un
+    # ledger que crece— desbordaba el techo calculado con el máximo anterior y metía
+    # un rojo: medido, 1 de 40 muestras con el barrido saltando de 0,6 s a 5,06 s, y
+    # otro justo después de una reconstrucción. Se estaba preguntando «¿tarda más que
+    # antes?», que no es asunto de la salud. Lo que importa es «¿está ATASCADO?», y
+    # eso se responde distinto según haya barrido corriendo o no:
+    #   · EN VUELO   → sano mientras el que corre no lleve una eternidad. Que tarde
+    #                  más de lo habitual no es un fallo; quedarse colgado sí.
+    #   · PARADO     → sano sólo si acaba de terminar uno. Aquí es donde se caza el
+    #                  indexador muerto, que es el fallo que este campo existe para
+    #                  ver (`/health` decía ok con el indexador muerto en bucle).
+    # Los dos topes acaban en 600 s para que un degradado sin fin salga rojo igual.
+    dur = SALUD["duracion_max"]
+    techo_vuelo = min(max(60.0, dur * 5), 600.0)
+    techo_parado = min(max(POLL * 6, POLL + dur), 600.0)
+    vuelo = SALUD["inicio"]
+    if vuelo is not None:
+        a_tiempo = (time.time() - vuelo) < techo_vuelo
+        techo = techo_vuelo
+    else:
+        a_tiempo = edad is not None and edad < techo_parado
+        techo = techo_parado
+    sano = SALUD["error"] is None and a_tiempo and bool(LEDGERS)
     inc = 0
     try:
         c = db(); inc = c.execute("SELECT COUNT(*) c FROM incidencias").fetchone()["c"]; c.close()
     except Exception:
         pass
-    return {"ok": sano and inc == 0 and not ROTOS, "auth": bool(TOKEN),
+    # `inc` YA NO entra en `ok`, y es un cambio con motivo. Mientras nadie escribía
+    # en `incidencias` la condición era código muerto; al reconstruir solo, cada
+    # cura dejaría el servicio en rojo PARA SIEMPRE — un rojo que no se puede
+    # apagar, sobre un servicio que acaba de arreglarse. `ok` responde «¿se puede
+    # servir el canon AHORA?»; la ventana que la reconstrucción no cubre es una
+    # pregunta de integridad y la contesta `verify`, que la canta ledger a ledger.
+    return {"ok": sano and not ROTOS, "auth": bool(TOKEN),
             "ledgers": len(LEDGERS), "rotos": ROTOS or None,
             "aviso": None if LEDGERS else
                      "CERO ledgers configurados: no estoy mirando nada. Corre `./llmi init`.",
-            "reconstrucciones": inc, "indexador": {
+            "reconstrucciones": inc,
+            "reconstruccion_sin_estado": SALUD.get("sin_estado") or None,
+            "indexador": {
         "error": SALUD["error"], "fallos_seguidos": SALUD["fallos"],
-        "hace_s": round(edad, 1) if edad is not None else None}}
+        "hace_s": round(edad, 1) if edad is not None else None,
+        "barrido_s": round(SALUD["duracion"], 3) if SALUD["duracion"] else None,
+        "barrido_max_s": round(dur, 3) if dur else None,
+        "techo_s": round(techo, 1), "en_vuelo": SALUD["inicio"] is not None}}
 
 
 @app.get("/stat", dependencies=GATE)
@@ -605,6 +1488,28 @@ def inbox(agent: str, limit: int = Query(30, le=200)):
     verdad: quien consume decide cuándo consumió, y si se cae a mitad no pierde nada.
     """
     con = db()
+    # Se apunta que ALGUIEN miró esta bandeja. No cambia lo que nadie ve —el cursor
+    # no se toca— así que un GET puede escribirlo sin ser el GET-que-muta de antes.
+    # Lo que sí hereda es su vector: cualquiera puede marcar a cualquiera como que
+    # ha leído. La consecuencia aquí es una cifra de telemetría equivocada, no correo
+    # perdido; está en `SECURITY.md` junto a lo demás que este token no cubre.
+    #
+    # Y se apunta EN BEST-EFFORT. Es la única escritura de todo el endpoint y es
+    # accesoria: si falla, lo que se pierde es una cifra de telemetría. Sin este
+    # `try` la excepción subía por FastAPI y devolvía **500 en una LECTURA** — o sea
+    # un contador dejaba sin bandeja a quien venía a leerla. No es hipotético: el
+    # 2026-08-08, con el indexador tomando el cerrojo pasadas enteras, esto tumbó
+    # 212 peticiones entre las 04:18 y las 08:27 (`sqlite3.OperationalError:
+    # database is locked`). La causa raíz se arregló arriba, en `reindex`; esto es la
+    # segunda línea: un dato accesorio no puede ser más frágil que el principal.
+    # …y se apunta EN MEMORIA. Esta línea es la única razón por la que este endpoint
+    # escribía, y escribir en el camino de lectura es lo que lo tumbaba: 212 peticiones
+    # con 500 el 2026-08-08 y, tras protegerlas, 51 contadores perdidos en 5 minutos.
+    # Ahora la cuenta se acumula y la vuelca el barrido (ver `vuelca_lecturas`), donde
+    # ya hay una transacción y no compite con nadie. `/inbox` es lectura pura: NINGUNA
+    # escritura suya puede volver a tumbar una bandeja.
+    ahora_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    anota_lectura(agent, ahora_iso)
     # Los nombres cuyo correo cae aquí: el suyo y los que escuche por censo. El cursor
     # sigue siendo de `agent` — escuchar un flujo no es consumirlo para su dueño.
     nombres = lp.escuchados(agent)
@@ -612,7 +1517,7 @@ def inbox(agent: str, limit: int = Query(30, le=200)):
     out, tope = [], {}
     for name in LEDGERS:
         c = con.execute("SELECT last_arrival FROM cursors WHERE agent=? AND ledger=?",
-                        (agent, name)).fetchone()
+                        (lp.canonico(agent), name)).fetchone()
         last = c["last_arrival"] if c else -1
         rows = con.execute(
             "SELECT e.arrival,e.eid,e.ts,e.actor,e.tipo,e.line_no,e.head FROM entries e "
@@ -671,7 +1576,7 @@ def cursor(agent: str):
     out = {}
     for name in LEDGERS:
         c = con.execute("SELECT last_arrival FROM cursors WHERE agent=? AND ledger=?",
-                        (agent, name)).fetchone()
+                        (lp.canonico(agent), name)).fetchone()
         out[name] = c["last_arrival"] if c else -1
     con.close()
     return out
@@ -792,19 +1697,314 @@ class Leido(BaseModel):
     hasta: dict[str, int]              # {ledger: última LLEGADA consumida}
 
 
+@app.get("/adopcion", response_class=PlainTextResponse, dependencies=GATE)
+def adopcion():
+    """¿Quién LEE su bandeja, y quién además la consume?
+
+    Existe porque el indicador anterior contaba cursores, y el cursor sólo nace al
+    CONSUMIR. La forma correcta de leer al arrancar no consume, así que seis agentes
+    con esto ya cableado seguían contando como cero. Un cero que no distingue «nadie
+    lo usa» de «todos lo usan bien» no es una medición: es una pregunta sin hacer.
+
+    Las dos columnas se sirven por separado a propósito. Fundirlas en un «usuarios
+    activos» daría un número más bonito y borraría justo la distinción que costó
+    encontrar.
+    """
+    con = db()
+    lec = {r["agent"]: r for r in con.execute("SELECT * FROM lecturas")}
+    cur = {r["agent"]: r for r in con.execute(
+        "SELECT agent, COUNT(*) n, MAX(updated) u FROM cursors GROUP BY agent")}
+    con.close()
+    quien = sorted(set(lec) | set(cur))
+    out = [f"── adopción · {len(lec)} han LEÍDO · {len(cur)} han CONSUMIDO ──",
+           f"   {'agente':<22}{'lecturas':>9}  {'última lectura':<21}consumo"]
+    for a in quien:
+        l, c = lec.get(a), cur.get(a)
+        out.append(f"   {a:<22}{(l['veces'] if l else 0):>9}  "
+                   f"{(l['ultima'][:19] if l else '—'):<21}"
+                   f"{(str(c['n']) + ' ledger(s)') if c else '—'}")
+    if not quien:
+        out.append("   (nadie ha mirado su bandeja todavía)")
+    out.append("")
+    out.append("   LEER no consume (`llmi peek`, `curl GET /inbox`); CONSUMIR es el POST")
+    out.append("   de `llmi inbox`. Un agente que sólo lee está usando esto bien.")
+    return "\n".join(out) + "\n"
+
+
+@app.get("/wiki", dependencies=GATE)
+def wiki_lista(q: str | None = None, limite: int = Query(100, le=500)):
+    """Las páginas, con cuántas citas tiene cada una y cuántas NO resuelven."""
+    con = db()
+    w, p = [], []
+    if q:
+        w.append("(p.titulo LIKE ? OR p.cuerpo LIKE ?)"); p += [f"%{q}%", f"%{q}%"]
+    sql = ("SELECT p.path, p.titulo, p.bytes, p.visto, "
+           "  (SELECT COUNT(*) FROM citas c WHERE c.path=p.path) citas, "
+           "  (SELECT COUNT(*) FROM citas c WHERE c.path=p.path AND c.eid IS NULL) rotas "
+           f"FROM pages p {'WHERE ' + ' AND '.join(w) if w else ''} ORDER BY p.path LIMIT ?")
+    filas = [dict(r) for r in con.execute(sql, p + [limite])]
+    tot = con.execute("SELECT COUNT(*) c FROM pages").fetchone()["c"]
+    con.close()
+    return {"paginas": tot, "mostradas": len(filas), "wiki": bool(WIKI), "lista": filas}
+
+
+@app.get("/wiki/citas", response_class=PlainTextResponse, dependencies=GATE)
+def wiki_citas(solo_rotas: bool = True):
+    """**El gate que sólo este producto puede correr**: ¿cada cita de la wiki
+    apunta a una entrada de ledger que existe?
+
+    Una wiki sola no puede contestarlo —no tiene el ledger— y un ledger solo
+    tampoco —no tiene la wiki—. Aquí las dos mitades comparten índice, así que la
+    comprobación es una unión, no un script que sale a grepear.
+
+    Se resuelve por PREFIJO: el formato citable son 12 caracteres del `eid`, no 64.
+    """
+    con = db()
+    if not con.execute("SELECT COUNT(*) c FROM pages").fetchone()["c"]:
+        con.close()
+        return ("(no hay wiki montada — arranca con LLMINBOX_WIKI=/ruta, "
+                "o `llmi wiki <carpeta>`)\n")
+    filas = con.execute(
+        "SELECT c.path, c.ledger, c.eid_ref, c.eid, e.head, e.actor, e.ts, e.line_no "
+        "FROM citas c LEFT JOIN entries e ON e.ledger=c.ledger AND e.eid=c.eid "
+        + ("WHERE c.eid IS NULL " if solo_rotas else "") + "ORDER BY c.path").fetchall()
+    tot = con.execute("SELECT COUNT(*) c FROM citas").fetchone()["c"]
+    rotas = con.execute("SELECT COUNT(*) c FROM citas WHERE eid IS NULL").fetchone()["c"]
+    con.close()
+    out = [f"── citas de la wiki · {tot} en total · {rotas} sin respaldo ──"]
+    if not tot:
+        out.append("  (ninguna página cita todavía al ledger)")
+    for r in filas:
+        if r["eid"]:
+            out.append(f"  ✓ {r['path']}  →  {r['ledger']}:{r['eid_ref']}")
+            out.append(f"      {r['actor'] or '?'} · {r['ts'] or '·'} · L{r['line_no']}")
+            out.append(f"      {(r['head'] or '')[:110]}")
+        else:
+            out.append(f"  ✗ {r['path']}  →  {r['ledger']}:{r['eid_ref']}  "
+                       f"NO existe esa entrada (¿ledger mal escrito, o eid inventado?)")
+    if solo_rotas and not rotas:
+        out.append("  ✓ todas resuelven")
+    return "\n".join(out) + "\n"
+
+
+@app.get("/wiki/pagina", response_class=PlainTextResponse, dependencies=GATE)
+def wiki_pagina(path: str):
+    """Una página entera, y al pie sus citas YA RESUELTAS a la entrada real.
+
+    Es lo que convierte una cita en algo que se puede seguir: quien lee la página
+    ve, sin salir de aquí, quién lo dijo, cuándo y en qué línea.
+    """
+    con = db()
+    p = con.execute("SELECT * FROM pages WHERE path=?", (path,)).fetchone()
+    if not p:
+        con.close()
+        raise HTTPException(404, "no existe esa página")
+    cit = con.execute(
+        "SELECT c.eid_ref, c.ledger, c.eid, e.actor, e.ts, e.line_no, e.head "
+        "FROM citas c LEFT JOIN entries e ON e.ledger=c.ledger AND e.eid=c.eid "
+        "WHERE c.path=?", (path,)).fetchall()
+    con.close()
+    out = [p["cuerpo"], "", "── citas resueltas ──"]
+    if not cit:
+        out.append("  (esta página no cita al ledger)")
+    for r in cit:
+        if r["eid"]:
+            out.append(f"  ✓ {r['ledger']}:{r['eid_ref']} → {r['actor'] or '?'} · "
+                       f"{r['ts'] or '·'} · línea {r['line_no']}")
+            out.append(f"      {(r['head'] or '')[:120]}")
+        else:
+            out.append(f"  ✗ {r['ledger']}:{r['eid_ref']} → sin entrada que la respalde")
+    return "\n".join(out) + "\n"
+
+
 @app.post("/inbox/{agent}/leido", dependencies=GATE)
 def marcar_leido(agent: str, l: Leido):
     """Avanza el cursor. Verbo no-safe porque muta, que es lo que hace."""
+    # El cursor se resuelve por el nombre CANÓNICO, igual que el destinatario. Sin
+    # esto, `/inbox/WIKI-VAULT` emparejaba entradas (el destinatario pasa por
+    # `canonico()`, que ignora la caja) pero buscaba su cursor con la cadena literal
+    # ⇒ no encontraba fila, leía desde -1 y devolvía una **bandeja sombra** que nadie
+    # drenaba nunca; y el `POST …/leido` con esa grafía contestaba `ok:true` mientras
+    # escribía el cursor de un agente que no existe. Medido 2026-08-08:
+    # `/inbox/un-agente` daba 6 secciones y `/inbox/UN-AGENTE` daba 7.
+    # La migración es un no-op verificado: las 27 filas de `cursors` ya usaban el
+    # nombre canónico, así que canonizar no mueve ninguna clave ni inunda a nadie.
+    canon = lp.canonico(agent)
     con = db()
     for name, seq in l.hasta.items():
         if name not in LEDGERS:
             continue
         con.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?)",
-                    (agent, name, int(seq),
+                    (canon, name, int(seq),
                      datetime.now(timezone.utc).isoformat(timespec="seconds")))
     con.commit()
     con.close()
-    return {"ok": True, "agent": agent, "cursores": l.hasta}
+    # Se devuelve el nombre CON EL QUE SE HA ESCRITO, no el que mandaron: si difieren,
+    # quien llama lo ve. Un `ok:true` que refleja tu entrada no te dice nada.
+    return {"ok": True, "agent": canon, "pediste": agent, "cursores": l.hasta}
+
+
+# ── REPARTO DE TRABAJO ────────────────────────────────────────────────────────
+# «1 ejecuta · 3 revisan · nadie duplica». El 3 no es un número redondo: es la
+# metodología triadversarial de la casa. El operador lo fijó así — «se puede revisar
+# todo ×3, pero no ×14, ídem para quien se adjudica un trabajo».
+TOPE_REVISORES = int(os.environ.get("LLMINBOX_TOPE_REVISORES", "3"))
+# Un agente que coge trabajo y se muere dejaría el tema tomado PARA SIEMPRE, y el
+# reparto se convertiría en un candado. Pasado el plazo, el claim se puede tomar —
+# pero NUNCA en silencio: la respuesta dice a quién se lo quitaste, porque un relevo
+# invisible es indistinguible de una duplicación.
+CLAIM_TTL_H = float(os.environ.get("LLMINBOX_CLAIM_TTL_H", "4"))
+_TEMA_FUERA = re.compile(r"[^a-z0-9_]+")
+
+
+def tema_norm(t: str) -> str:
+    """El tema, reducido a algo que pueda CHOCAR con el de otro.
+
+    Sin normalizar, `escrow_freeze` y `Escrow Freeze` son dos temas distintos y el
+    cerrojo no cierra nada: cada uno coge el suyo y la exclusión es decorativa.
+
+    ⚠️ LÍMITE DECLARADO, y es el punto flojo de todo esto: esto sólo junta lo que se
+    escribe PARECIDO. Dos agentes que llamen `escrow_freeze` y `el flag de congelar`
+    al mismo trabajo seguirán sin chocar. Este endpoint reduce la duplicación por
+    despiste; no la que nace de nombrar distinto lo mismo. Para eso haría falta
+    resolver el tema contra el símbolo del código, y eso no está hecho.
+    """
+    t = unicodedata.normalize("NFKD", (t or "").lower())
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    return _TEMA_FUERA.sub("_", t).strip("_")[:120]
+
+
+class ClaimIn(BaseModel):
+    tema: str
+    agent: str
+    rol: str = "ejecuta"
+
+
+def _vencido(abierto: str) -> bool:
+    try:
+        t = datetime.fromisoformat(abierto)
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - t).total_seconds() > CLAIM_TTL_H * 3600
+
+
+@app.post("/claim", dependencies=GATE)
+def coger(c_in: ClaimIn):
+    """Coge un trabajo (`ejecuta`) o una plaza de revisor (`revisa`).
+
+    Verbo no-safe porque muta, como `/leido`. Devuelve 200 con `ok:false` en vez de
+    un 4xx cuando el trabajo ya está cogido: para quien llama no es un error —es la
+    respuesta correcta, y la que evita que mida— y un 409 invita a reintentar.
+    """
+    tema = tema_norm(c_in.tema)
+    if not tema:
+        return {"ok": False, "motivo": "tema vacío tras normalizar"}
+    rol = c_in.rol if c_in.rol in ("ejecuta", "revisa") else "ejecuta"
+    # El agente se guarda por su ROL, no por el nombre con que firma. El censo tiene
+    # 51 nombres para 27 roles —`qa` y `qa-2`, `cto` y `cto-b`: 13 roles
+    # con más de un nombre—, así que contar nombres deja que UN MISMO ROL ocupe dos de
+    # las tres plazas de revisión. El tope triadversarial es de roles, no de firmas.
+    # Mientras el censo no declare `rol`, cada nombre es su propio rol y esto no
+    # cambia nada: ver `rol_de()` en ledger_parse.py.
+    if lp.canonico(c_in.agent).lower() not in lp.CANON:
+        # Un nombre fuera del censo no se rechaza por rigidez: es que un dedazo
+        # (`securty`) crearía un claim a nombre de nadie, y la tabla que existe para
+        # AUDITAR el reparto se llenaría de fantasmas que no se pueden reclamar.
+        return {"ok": False, "motivo": f"'{c_in.agent}' no está en el censo — "
+                                      "date de alta en roster.json o revisa el nombre"}
+    agente = lp.rol_de(c_in.agent)
+    ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    con = db()
+    try:
+        if rol == "ejecuta":
+            fila = con.execute("SELECT agent, abierto FROM claims WHERE tema=? AND "
+                               "rol='ejecuta' AND cerrado IS NULL", (tema,)).fetchone()
+            if fila and fila["agent"] == agente:
+                return {"ok": True, "tema": tema, "rol": rol, "nota": "ya era tuyo"}
+            relevado = None
+            if fila:
+                if not _vencido(fila["abierto"]):
+                    return {"ok": False, "tema": tema, "de": fila["agent"],
+                            "desde": fila["abierto"],
+                            "motivo": "ya lo tiene cogido otro — REVISA lo suyo o pregúntale"}
+                # Vencido: se cierra el viejo y se dice de quién era.
+                con.execute("UPDATE claims SET cerrado=? WHERE tema=? AND rol='ejecuta' "
+                            "AND cerrado IS NULL", (ahora, tema))
+                relevado = fila["agent"]
+            con.execute("INSERT INTO claims(tema,rol,agent,agent_bruto,abierto,bruto) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (tema, rol, agente, c_in.agent, ahora, c_in.tema))
+            con.commit()
+            return {"ok": True, "tema": tema, "rol": rol,
+                    **({"relevaste_a": relevado, "vencido_tras_h": CLAIM_TTL_H} if relevado else {})}
+        # rol == 'revisa': el tope se comprueba DENTRO de la sentencia, no antes.
+        # Comprobar y luego insertar en dos pasos deja pasar al 4º y al 5º cuando
+        # llegan a la vez — probado con 20 procesos: así entran exactamente 3.
+        cur = con.execute(
+            "INSERT INTO claims(tema,rol,agent,agent_bruto,abierto,bruto) SELECT ?,?,?,?,?,? WHERE "
+            "(SELECT COUNT(*) FROM claims WHERE tema=? AND rol='revisa' AND cerrado IS NULL) < ?",
+            (tema, rol, agente, c_in.agent, ahora, c_in.tema, tema, TOPE_REVISORES))
+        con.commit()
+        if cur.rowcount:
+            return {"ok": True, "tema": tema, "rol": rol}
+        return {"ok": False, "tema": tema, "tope": TOPE_REVISORES,
+                "motivo": f"la revisión ya está completa ({TOPE_REVISORES}) — lee la suya"}
+    except sqlite3.IntegrityError:
+        # Choque contra el índice parcial: otro llegó primero, o ya estabas dentro.
+        return {"ok": False, "tema": tema, "motivo": "otro llegó antes (o ya estabas)"}
+    finally:
+        con.close()
+
+
+@app.post("/claim/cierro", dependencies=GATE)
+def cerrar(c_in: ClaimIn):
+    """Cierra lo tuyo. Publicar el resultado es lo que cierra un claim."""
+    tema = tema_norm(c_in.tema)
+    ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    con = db()
+    try:
+        n = con.execute("UPDATE claims SET cerrado=? WHERE tema=? AND agent=? AND "
+                        "cerrado IS NULL", (ahora, tema, lp.rol_de(c_in.agent))).rowcount
+        con.commit()
+        return {"ok": n > 0, "tema": tema, "cerrados": n}
+    finally:
+        con.close()
+
+
+@app.get("/claim/{tema}", dependencies=GATE)
+def mirar_claim(tema: str):
+    """PASO 0 antes de medir nada. NO escribe: lo aprendí caro el 2026-08-08, cuando
+    una fila de telemetría en un GET tumbó 212 lecturas con la base ocupada."""
+    t = tema_norm(tema)
+    con = db()
+    try:
+        filas = [dict(r) for r in con.execute(
+            "SELECT rol, agent, abierto, cerrado FROM claims WHERE tema=? ORDER BY abierto", (t,))]
+    finally:
+        con.close()
+    vivos = [f for f in filas if not f["cerrado"]]
+    eje = next((f for f in vivos if f["rol"] == "ejecuta"), None)
+    rev = [f["agent"] for f in vivos if f["rol"] == "revisa"]
+    return {"tema": t, "ejecuta": eje, "revisan": rev,
+            "plazas_de_revision": max(0, TOPE_REVISORES - len(rev)),
+            "puedes_cogerlo": eje is None or _vencido(eje["abierto"]), "historial": filas}
+
+
+@app.get("/claims", dependencies=GATE)
+def claims_vivos():
+    """Lo que hay cogido ahora mismo. Es la tabla que convierte la disciplina en
+    métrica: sin ella, «no dupliquéis» es un deseo que nadie puede auditar."""
+    con = db()
+    try:
+        filas = [dict(r) for r in con.execute(
+            "SELECT tema, rol, agent, abierto, bruto FROM claims WHERE cerrado IS NULL "
+            "ORDER BY abierto DESC")]
+    finally:
+        con.close()
+    for f in filas:
+        f["vencido"] = _vencido(f["abierto"])
+    return {"abiertos": len(filas), "tope_revisores": TOPE_REVISORES,
+            "ttl_horas": CLAIM_TTL_H, "claims": filas}
 
 
 class Post(BaseModel):
@@ -825,6 +2025,11 @@ class Post(BaseModel):
 def append(p: Post):
     """Escritor validador: exige actor + tipo, sella la hora, y escribe bajo cerrojo.
 
+    ⚠️ EN ESTE DESPLIEGUE NO FUNCIONA, y no es un bug suyo: los 13 montajes de ledger
+    van `:ro` a propósito. Medido 2026-08-08: 0 de 13 escribibles ⇒ devuelve 503 con
+    la explicación. `/health` publica `ledgers_escribibles` para que esto se pueda
+    medir sin estrellarse antes.
+
     El cerrojo (`flock`) es lo que hoy no hay: 5.276 appends han ido con `>>` suelto.
     No se ha medido corrupción real en el corpus (0 cabeceras dentro de un bloque de
     código abierto, paridad de vallas par) — así que esto cierra un riesgo teórico,
@@ -835,6 +2040,17 @@ def append(p: Post):
         raise HTTPException(404, f"ledger desconocido: {p.ledger}")
     if not p.to:
         raise HTTPException(422, "'to' vacío: una entrada sin destinatario no la lee nadie")
+    # LOS MONTAJES DE LEDGER VAN EN SÓLO LECTURA, y es deliberado: hoy ni un servicio
+    # con un bug puede corromper 31.207 entradas. Con `:ro`, este endpoint no puede
+    # cumplir lo que promete — y hasta hoy lo descubrías con un 500 y una traza de
+    # `OSError: [Errno 30]`, que es una trampa para el siguiente. Se comprueba ANTES
+    # y se dice qué hacer en su lugar. El día que alguien monte un ledger RW, esto
+    # deja de disparar solo, sin tocar código.
+    if not os.access(path, os.W_OK):
+        raise HTTPException(503, f"'{p.ledger}' está montado en sólo lectura: este "
+                                 "servicio no puede escribirlo. Apendiza con `>>` "
+                                 "(que es como se escriben hoy los ledgers) o monta "
+                                 "ese ledger RW en el compose si de verdad lo quieres.")
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     flechas = " ∧ ".join(p.to)
     texto = f"\n### [{p.actor} → {flechas} · {p.tipo}] {ts} — {p.head}\n{p.body.rstrip()}\n"

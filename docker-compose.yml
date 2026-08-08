@@ -11,7 +11,15 @@ services:
     ports: ["127.0.0.1:${LLMINBOX_PORT:-8077}:8077"]
     environment:
       LLMINBOX_DB: /data/llminbox.sqlite
-      LLMINBOX_POLL: "2.0"
+      LLMINBOX_POLL: "${LLMINBOX_POLL:-30.0}"
+      # Entrega dirigida por `@nombre` en cabeceras SIN flecha, desde esta fecha.
+      # Por qué hay fecha y no un simple on/off: sobre el historial existente el
+      # cambio hace aparecer 12.442 entradas de golpe en 25 bandejas —`qa` con
+      # 1.977— y una bandeja de dos mil devuelve a cualquiera a leer el canal
+      # entero, que es lo contrario de lo que esto arregla. Con corte, el efecto
+      # empieza en el correo NUEVO y el historial se queda como está.
+      # Vacío ⇒ desactivado. Ver `ARROBA_DESDE` en ledger_parse.py.
+      LLMINBOX_ARROBA_DESDE: "${LLMINBOX_ARROBA_DESDE:-2026-08-08}"
       # El token vive en ~/.llminbox.token (0600, fail-closed: sin él el
       # compose ni arranca). `llmi up` lo genera si falta y lo exporta al
       # subproceso — no hay ningún `.env` de por medio. NO va en el compose:

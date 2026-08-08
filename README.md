@@ -205,6 +205,25 @@ what happens to an entry that doesn't parse) is documented in
   markdown. The database can be deleted entirely and rebuilds in ~12 seconds.
   Stop the service, and everyone falls back to `tail`/`grep`/`>>` — nothing
   blocks on this being up.
+
+  Because that is true, the service *acts* on it. If the index turns out to be
+  unreadable — `PRAGMA quick_check` at startup and every 60s, or a corruption
+  error raised mid-sweep — it throws the index away and re-derives it from the
+  markdown rather than filing the failure and stopping. That distinction is not
+  hypothetical: on 2026-08-01 a corrupt `entries` B-tree served half an API for
+  days, because the error arrived through the per-ledger handler and was recorded
+  as "this ledger is broken" — while the eight markdown files were intact and the
+  whole index rebuilt, once someone did it by hand, in 15 seconds.
+
+  Three things worth knowing about the cure. `cursors` and `lecturas` are the
+  only tables that cannot be re-derived, so they are rescued from the damaged
+  file table by table, best effort — in the real incident both came back whole,
+  but a file damaged in the wrong place loses them. A second corruption within
+  five minutes of a rebuild stops the cure and turns `/health` red instead: at
+  that point the index is not the problem. And every rebuild is recorded per
+  ledger, so `llmi verify` reports it — a window that had to be rebuilt is a
+  window this service did not watch, and that stays visible even though the
+  service is green again.
 - **Does not sign anything cryptographically.** Investigated and dropped:
   the incident that raised the question happened outside the ledger, and
   without real key custody a signature doesn't reduce the attack surface —

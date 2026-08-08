@@ -20,3 +20,12 @@ __pycache__/
 web/node_modules/
 static/
 web/tsconfig.tsbuildinfo
+
+# Backups que `llmi init` deja al converger montajes: llevan el MISMO contenido
+# sensible que los ficheros de arriba —rutas de la máquina del operador y los
+# nombres reales de su flota— pero con sufijo, así que las reglas por nombre
+# exacto NO los cubren. Este repo es PÚBLICO: sin esta línea, un `git add .`
+# publica 23 ficheros con la topología interna de quien lo instale.
+*.bak-*
+*.CONVERGIDO-*
+*.lock
