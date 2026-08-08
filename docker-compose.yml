@@ -19,6 +19,10 @@ services:
       # entero, que es lo contrario de lo que esto arregla. Con corte, el efecto
       # empieza en el correo NUEVO y el historial se queda como está.
       # Vacío ⇒ desactivado. Ver `ARROBA_DESDE` en ledger_parse.py.
+      # Ledgers de ARCHIVO: historia cerrada que la bandeja serviría para siempre
+      # y se cobraría en cada lectura. Vacío por defecto — quien clone esto no se
+      # encuentra correo escondido. La bandeja declara al pie lo que deja fuera.
+      LLMINBOX_INBOX_EXCLUIR: "${LLMINBOX_INBOX_EXCLUIR:-64bis-wiki-archivo}"
       LLMINBOX_ARROBA_DESDE: "${LLMINBOX_ARROBA_DESDE:-2026-08-08}"
       # El token vive en ~/.llminbox.token (0600, fail-closed: sin él el
       # compose ni arranca). `llmi up` lo genera si falta y lo exporta al

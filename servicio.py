@@ -219,6 +219,16 @@ SCHEMA = """
 -- local y monótono por construcción, así que sirve de cursor aunque el fichero se
 -- reordene por debajo: una entrada mezclada en medio recibe un `arrival` nuevo y
 -- aparece en la bandeja de quien no la había visto.
+-- COSTE POR ENDPOINT. La métrica de éxito de este servicio no son MB indexados ni
+-- entradas servidas: son TOKENS POR LECTURA. Sin esto, «¿cuánto ahorra?» se contesta
+-- grepeando 26 GB de transcripts —se hizo el 2026-08-08— o con intuiciones.
+-- Tabla aditiva ⇒ NO sube SCHEMA_V.
+CREATE TABLE IF NOT EXISTS coste (
+  ruta TEXT PRIMARY KEY,     -- plantilla de ruta, no la URL concreta
+  llamadas INTEGER DEFAULT 0,
+  bytes INTEGER DEFAULT 0,
+  ultima TEXT);
+
 -- REPARTO DE TRABAJO: quién COGE y quién REVISA. Tabla aditiva ⇒ NO sube SCHEMA_V
 -- (subirla vaciaría la tabla de cursores, o sea la bandeja de todo el equipo).
 --
@@ -1095,6 +1105,51 @@ def vuelca_lecturas(con) -> None:
         print(f"[lecturas] volcado aplazado ({len(pend)} agentes): {exc}", flush=True)
 
 
+# ── COSTE POR ENDPOINT ────────────────────────────────────────────────────────
+# En memoria y volcado por el barrido, igual que la telemetría de lecturas y por el
+# mismo motivo: NINGUNA escritura en el camino de una lectura. Esa regla la aprendí
+# hoy a base de 212 peticiones caídas.
+COSTE: dict[str, list] = {}          # ruta -> [llamadas, bytes]
+COSTE_LOCK = threading.Lock()
+
+
+def anota_coste(ruta: str, n_bytes: int) -> None:
+    with COSTE_LOCK:
+        v = COSTE.get(ruta)
+        if v is None:
+            COSTE[ruta] = [1, n_bytes]
+        else:
+            v[0] += 1
+            v[1] += n_bytes
+
+
+def vuelca_coste(con) -> None:
+    with COSTE_LOCK:
+        if not COSTE:
+            return
+        pend = list(COSTE.items())
+        COSTE.clear()
+    ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        con.executemany(
+            "INSERT INTO coste (ruta, llamadas, bytes, ultima) VALUES (?,?,?,?) "
+            "ON CONFLICT(ruta) DO UPDATE SET llamadas=llamadas+excluded.llamadas, "
+            "bytes=bytes+excluded.bytes, ultima=excluded.ultima",
+            [(r, n, b, ahora) for r, (n, b) in pend])
+        con.commit()
+    except sqlite3.OperationalError as exc:
+        con.rollback()
+        with COSTE_LOCK:                       # devuelve lo no volcado, no se pierde
+            for r, (n, b) in pend:
+                v = COSTE.get(r)
+                if v is None:
+                    COSTE[r] = [n, b]
+                else:
+                    v[0] += n
+                    v[1] += b
+        print(f"[coste] volcado aplazado: {exc}", flush=True)
+
+
 def barrido():
     """Un ledger roto NO puede parar a los demás.
 
@@ -1163,6 +1218,7 @@ def barrido():
         # trabajo de verdad en vez de rendirse. Va DENTRO del `try`/`finally` para que
         # la conexión se cierre igual si el volcado revienta.
         vuelca_lecturas(con)
+        vuelca_coste(con)
     finally:
         con.close()
 
@@ -1269,6 +1325,32 @@ def auth(x_llminbox_token: str = Header(default="")):
 # el índice abierto es la puerta de al lado sin cerrar.
 app = FastAPI(title="llminbox", lifespan=lifespan,
               docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.middleware("http")
+async def contar_coste(request, call_next):
+    """Cuenta llamadas y BYTES SERVIDOS por ruta.
+
+    Por plantilla de ruta (`/inbox/{agent}`), no por URL concreta: agrupar por URL
+    daría una fila por agente y no respondería la pregunta, que es cuánto cuesta CADA
+    CLASE de lectura. No toca la base en el camino de la petición — sólo un contador
+    en memoria que vuelca el barrido.
+    """
+    resp = await call_next(request)
+    try:
+        r = request.scope.get("route")
+        ruta = getattr(r, "path", None) or request.url.path
+        # El tamaño sale de `content-length`, NO de `resp.body`. Con
+        # `BaseHTTPMiddleware` todo lo que llega aquí es una respuesta de streaming
+        # y `.body` no existe: la primera versión lo intentó y registró CERO bytes en
+        # las siete rutas, o sea una tabla de coste con la columna de coste vacía —
+        # que es peor que no medir, porque parece medido. Lo cazó mirar la salida, no
+        # el gate: mi comprobación exigía «≥1 llamada» y las llamadas sí contaban.
+        n = int(resp.headers.get("content-length") or 0)
+        anota_coste(f"{request.method} {ruta}", n)
+    except Exception:
+        pass                      # medir NUNCA puede tumbar lo medido
+    return resp
 GATE = [Depends(auth)]
 
 
@@ -1515,7 +1597,11 @@ def inbox(agent: str, limit: int = Query(30, le=200)):
     nombres = lp.escuchados(agent)
     marcas = ",".join("?" * len(nombres))
     out, tope = [], {}
+    excluidos = []
     for name in LEDGERS:
+        if name in INBOX_EXCLUIR:
+            excluidos.append(name)
+            continue
         c = con.execute("SELECT last_arrival FROM cursors WHERE agent=? AND ledger=?",
                         (lp.canonico(agent), name)).fetchone()
         last = c["last_arrival"] if c else -1
@@ -1563,6 +1649,9 @@ def inbox(agent: str, limit: int = Query(30, le=200)):
     # `{"hasta": {...}}`: quien drenaba tenía que convertirlo a mano, y ahí es donde
     # se rompía. Medido el 2026-08-08: 24.723 llamadas a `/leido` con 74.525 entradas
     # todavía sin drenar. La conversión manual no era una molestia, era el defecto.
+    if excluidos:
+        out.append(f"\n(fuera de la bandeja por archivo: {', '.join(sorted(excluidos))}"
+                   f" — consúltalos con /entries?ledger=…)")
     cuerpo = json.dumps({"hasta": tope}, separators=(",", ":"), ensure_ascii=False)
     return (AVISO + "\n" + "\n".join(out)
             + f"\n\nmarcar leído — pega esto tal cual:\n"
@@ -1734,6 +1823,28 @@ def adopcion():
     out.append("")
     out.append("   LEER no consume (`llmi peek`, `curl GET /inbox`); CONSUMIR es el POST")
     out.append("   de `llmi inbox`. Un agente que sólo lee está usando esto bien.")
+    # EL COSTE, que es la métrica de éxito real de este servicio: no MB indexados
+    # ni entradas servidas, sino cuánto cuesta cada clase de lectura. Sin esto,
+    # «¿cuánto ahorra llminbox?» se contestó el 2026-08-08 grepeando 26 GB de
+    # transcripts, y el número salió mal dos veces por dividir entre el endpoint
+    # equivocado. Aquí está el denominador, servido por quien lo sabe.
+    con2 = db()
+    try:
+        filas = list(con2.execute(
+            "SELECT ruta, llamadas, bytes FROM coste ORDER BY bytes DESC LIMIT 12"))
+    except sqlite3.OperationalError:
+        filas = []
+    finally:
+        con2.close()
+    if filas:
+        out.append("")
+        out.append("── coste por endpoint (bytes servidos ÷ 4 ≈ tokens) ──")
+        out.append("  %-28s %8s %12s %10s" % ("ruta", "llamadas", "bytes", "≈tok/llam"))
+        for r in filas:
+            n, b = r["llamadas"] or 0, r["bytes"] or 0
+            out.append("  %-28s %8d %12d %10d" % (r["ruta"][:28], n, b, (b / max(n, 1)) / 4))
+        out.append("  (acumulado desde el primer arranque con esta tabla; el volcado")
+        out.append("   lo hace el barrido, así que la última lectura puede faltar)")
     return "\n".join(out) + "\n"
 
 
@@ -1880,6 +1991,15 @@ def marcar_leido(agent: str, l: Leido):
 # «1 ejecuta · 3 revisan · nadie duplica». El 3 no es un número redondo: es la
 # metodología triadversarial de la casa. El operador lo fijó así — «se puede revisar
 # todo ×3, pero no ×14, ídem para quien se adjudica un trabajo».
+# Ledgers que NO entran en la bandeja. Existe para los ARCHIVOS: un fichero que
+# guarda historia ya cerrada sigue teniendo entradas dirigidas a mucha gente, así que
+# la bandeja las sirve para siempre y se cobran en cada lectura. Medido 2026-08-08
+# sobre cuatro bandejas reales, el archivo pesaba entre el 0 % y el 33 % del total —
+# el número depende del agente, así que no hay un «−N %» que valga para todos.
+#
+# NO se excluye en silencio: si algo queda fuera, la bandeja lo dice al pie. Ocultar
+# correo sin avisar sería peor que el coste que se ahorra.
+INBOX_EXCLUIR = {x.strip() for x in os.environ.get("LLMINBOX_INBOX_EXCLUIR", "").split(",") if x.strip()}
 TOPE_REVISORES = int(os.environ.get("LLMINBOX_TOPE_REVISORES", "3"))
 # Un agente que coge trabajo y se muere dejaría el tema tomado PARA SIEMPRE, y el
 # reparto se convertiría en un candado. Pasado el plazo, el claim se puede tomar —

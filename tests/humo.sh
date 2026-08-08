@@ -599,6 +599,64 @@ V1=$(veces)
 comp "5 lecturas BAJO CERROJO → el contador sube exactamente 5" "5" "$(( ${V1:-0} - ${V0:-0} ))"
 limpiar4
 
+echo "── el servicio sabe decir lo que cuesta ──"
+# La métrica de éxito no son MB indexados: son tokens por lectura. Sin esto,
+# «¿cuánto ahorra?» se contestó el 2026-08-08 grepeando 26 GB de transcripts, y el
+# número salió mal DOS veces por dividir entre el endpoint equivocado.
+# falsador: sin el middleware, /adopcion no trae la sección y esto sale 0.
+curl -s "${A[@]}" "$U/inbox/alice-backend" >/dev/null
+curl -s "${A[@]}" "$U/inbox/bob-reviewer"  >/dev/null
+sleep 4          # el volcado lo hace el barrido, como la telemetría de lecturas
+ADOP=$(curl -s -m 20 "${A[@]}" "$U/adopcion")
+printf '%s' "$ADOP" | grep -q 'coste por endpoint' \
+  && ok "/adopcion publica el coste por endpoint" \
+  || fallo "el servicio tiene que saber lo que cuesta" "sección de coste" "no está"
+# CONTROL: que la cifra venga de las llamadas de verdad y no de una fila vacía.
+printf '%s' "$ADOP" | grep -qE 'GET /inbox/\{agent\}\s+[1-9]' \
+  && ok "y cuenta las llamadas REALES a la bandeja (no una fila en blanco)" \
+  || fallo "el contador tiene que haber contado" "≥1 llamada a /inbox/{agent}" "0 o ausente"
+# Y LOS BYTES, que es la columna que importa. La primera versión contaba llamadas
+# bien y registraba CERO bytes en las siete rutas —`resp.body` no existe con
+# BaseHTTPMiddleware—, y este gate pasaba igual porque sólo miraba las llamadas.
+# Una tabla de coste con la columna de coste a cero parece medida y no lo está.
+# falsador: con `.body` de vuelta, la columna de bytes sale 0 y esto falla.
+printf '%s' "$ADOP" | grep -E 'GET /inbox/\{agent\}' | awk '{print $4+0}' | grep -qvE '^0$' \
+  && ok "y los BYTES servidos no son cero (la columna de coste mide algo)" \
+  || fallo "una columna de coste a cero parece medida y no lo está" ">0 bytes" "0"
+
+echo "── un ledger de ARCHIVO no se cobra en cada lectura ──"
+# Un archivo guarda historia cerrada, pero sus entradas siguen dirigidas a gente: la
+# bandeja las sirve para siempre. Medido sobre cuatro bandejas reales el 2026-08-08,
+# pesaba entre el 0 % y el 33 % de cada lectura. Contenedor propio con DOS ledgers,
+# uno excluido, para poder ver la diferencia.
+T6=$(mktemp -d); chmod 755 "$T6"; NOM6="humo6-$$"; P6=$((PUERTO+5))
+limpiar6() { docker rm -f "$NOM6" >/dev/null 2>&1; rm -rf "$T6"; }
+printf '# vivo\n\n### [alice-backend → bob-reviewer · REQUEST] del vivo\ncuerpo\n' > "$T6/vivo.md"
+printf '# viejo\n\n### [alice-backend → bob-reviewer · FYI] del archivo\ncuerpo\n' > "$T6/arch.md"
+docker run -d --name "$NOM6" -p "127.0.0.1:$P6:8077" \
+  -e LLMINBOX_LEDGERS="vivo=/l/vivo.md,arch=/l/arch.md" -e LLMINBOX_TOKEN="$TOK" \
+  -e LLMINBOX_INBOX_EXCLUIR="arch" \
+  -e LLMINBOX_DB=/tmp/h.sqlite -e LLMINBOX_POLL=1 -e LLMINBOX_ROSTER=/censo.json \
+  -v "$T6:/l:ro" -v "$PWD/roster.example.json:/censo.json:ro" \
+  "${IMAGEN:-llminbox:test}" >/dev/null || { echo "no arrancó $NOM6"; FALLOS=$((FALLOS+1)); }
+for _ in $(seq 1 40); do curl -sf -m 2 "http://127.0.0.1:$P6/health" >/dev/null 2>&1 && break; sleep 1; done
+sleep 3
+B6=$(curl -s -m 20 "${A[@]}" "http://127.0.0.1:$P6/inbox/bob-reviewer")
+# CONTROL primero: el ledger VIVO tiene que estar, o lo de abajo pasaría con el
+# servicio indexando cero — que es como el CI de Linux me pilló el 2026-08-08.
+printf '%s' "$B6" | grep -q 'del vivo' \
+  && ok "el ledger vivo sigue en la bandeja (hay qué medir)" \
+  || fallo "el ledger vivo tiene que aparecer" "'del vivo'" "no aparece"
+# falsador: sin la exclusión, el archivo aparece y esto falla.
+printf '%s' "$B6" | grep -q 'del archivo' \
+  && fallo "el ledger de archivo NO puede servirse en la bandeja" "sin 'del archivo'" "aparece" \
+  || ok "y el de ARCHIVO no se sirve"
+# Y no se oculta en silencio: esconder correo sin avisar sería peor que el ahorro.
+printf '%s' "$B6" | grep -q 'fuera de la bandeja por archivo: arch' \
+  && ok "y la bandeja DECLARA lo que ha dejado fuera" \
+  || fallo "excluir en silencio es esconder correo" "línea 'fuera de la bandeja'" "no está"
+limpiar6
+
 echo "── una cabecera SIN flecha que nombra a @alguien SÍ se le entrega ──"
 # 995 de 1.350 cabeceras sin flecha nombraban con `@` a un agente del censo, y
 # llminbox no se las entregaba a NADIE: el mensaje dirigido no llegaba dirigido, y por
