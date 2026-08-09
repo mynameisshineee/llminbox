@@ -203,6 +203,7 @@ echo "── el barrido lento y el índice corrupto (un ledger grande, aparte) �
 # van en su propio contenedor con un ledger de 10.000 entradas.
 NOM2="humo2-$$"; P2=$((PUERTO+1)); TMP2="$(mktemp -d)"; D2="$(mktemp -d)"
 chmod 755 "$TMP2"; chmod 777 "$D2"
+
 limpiar2() { docker rm -f "$NOM2" >/dev/null 2>&1; rm -rf "$TMP2" "$D2"; }
 trap 'limpiar; limpiar2' EXIT
 python3 -c "
@@ -356,6 +357,19 @@ done
   && ok "el reordenado (50 entradas por delante) queda indexado: 30.050" \
   || fallo "PRECONDICIÓN: sin el reordenado indexado, lo que sigue mide otra cosa" \
            "30050 entradas" "${N_AHORA:-sin respuesta} tras 240 s"
+
+# GUARDA: si la precondición de arriba no se cumplió, este bloque entero mide otra
+# cosa. Sin ella, un índice a medio construir producía CUATRO rojos que nombraban
+# defectos inexistentes —«la reconstrucción devolvió 29.999», «el cursor no sigue
+# ahí»— y mandaban a arreglar la cura de corrupción, que estaba sana. Cuatro rojos
+# que mienten son peores que uno que dice la verdad: el que lee arregla lo que no
+# está roto y el defecto real se queda dentro del ruido.
+if [ -z "$LISTO" ]; then
+  echo "  ⏭️  bloque de corrupción SALTADO: la precondición no se cumplió (ver arriba)."
+  echo "     No se marcan rojos aquí — no se ha medido nada, y un rojo sin medición"
+  echo "     es una acusación sin prueba."
+else
+
 lee_eid() {   # a qué entrada apunta un cursor, en la base que haya ahora mismo
   python3 -c "
 import sqlite3
@@ -499,6 +513,8 @@ done
 # revienta en la migración de esquema y el contenedor no llega ni a contestar.
 [ -n "$ARR" ] && ok "y un índice corrupto EN EL ARRANQUE también se cura" \
   || fallo "un índice corrupto en el arranque se cura" "200 con 30.050 entradas" "cod=$cod entradas=${N2:-?}"
+fi   # cierra la guarda de la precondición (bloque de corrupción)
+
 limpiar2
 
 echo "── una cita a la COLA no puede aterrizar en el ledger de al lado ──"
