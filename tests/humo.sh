@@ -813,8 +813,14 @@ C5=(-H "X-Llminbox-Token: $TOK" -H 'Content-Type: application/json'); V5="http:/
 # del censo no puede coger trabajo, un `ag-7` cualquiera recibe su NO y la carrera
 # mediría el rechazo en vez de la exclusión. Doce peticiones sobre cinco nombres:
 # lo que se comprueba sigue siendo que sólo UNO acaba siendo el dueño.
-CENSADOS=(alice-backend alice-frontend bob-reviewer bob-research destilador)
-for i in $(seq 0 11); do (curl -s -m 10 "${C5[@]}" -d "{\"tema\":\"Escrow Freeze\",\"agent\":\"${CENSADOS[$((i%5))]}\"}" "$V5/claim" >/dev/null &); done
+# `bob-research` queda FUERA de la rotación a propósito: se reserva para la
+# comprobación de normalización de más abajo. Con él dentro, el test era FLAKY por
+# diseño — si ganaba la carrera, su claim posterior sobre el mismo tema normalizado
+# devolvía `ok:true` («ya era tuyo»), que es la respuesta CORRECTA. Verde en este
+# Mac, rojo en el CI de Linux, y el color dependía de quién ganase una carrera de
+# doce. Un gate cuyo resultado depende del azar no distingue arreglado de roto.
+CENSADOS=(alice-backend alice-frontend bob-reviewer destilador)
+for i in $(seq 0 11); do (curl -s -m 10 "${C5[@]}" -d "{\"tema\":\"Escrow Freeze\",\"agent\":\"${CENSADOS[$((i%4))]}\"}" "$V5/claim" >/dev/null &); done
 sleep 3
 GAN=$(curl -s -m 10 "${A[@]}" "$V5/claim/escrow_freeze" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(1 if d.get("ejecuta") else 0)' 2>/dev/null)
 # CONTROL primero: si no ganó NADIE, lo de abajo no distingue exclusión de servicio caído.
@@ -824,7 +830,7 @@ DUENOS=$(curl -s -m 10 "${A[@]}" "$V5/claims" | python3 -c 'import sys,json;prin
 comp "y en la tabla hay exactamente 1 fila 'ejecuta'" "1" "${DUENOS:-0}"
 # El tope de 3 se comprueba DENTRO de la sentencia: en dos pasos (contar y luego
 # insertar) el 4º y el 5º se cuelan cuando llegan a la vez.
-for i in $(seq 0 8); do (curl -s -m 10 "${C5[@]}" -d "{\"tema\":\"escrow_freeze\",\"agent\":\"${CENSADOS[$((i%5))]}\",\"rol\":\"revisa\"}" "$V5/claim" >/dev/null &); done
+for i in $(seq 0 8); do (curl -s -m 10 "${C5[@]}" -d "{\"tema\":\"escrow_freeze\",\"agent\":\"${CENSADOS[$((i%4))]}\",\"rol\":\"revisa\"}" "$V5/claim" >/dev/null &); done
 sleep 3
 REV=$(curl -s -m 10 "${A[@]}" "$V5/claim/escrow_freeze" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["revisan"]))' 2>/dev/null)
 # falsador: sin el tope en la sentencia, de 9 entran 4, 5 o los 9.
