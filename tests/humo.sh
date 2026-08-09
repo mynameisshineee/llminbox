@@ -413,6 +413,16 @@ for _ in $(seq 1 40); do
   fi
   sleep 1
 done
+# DIAGNÓSTICO CUANDO FALLA, porque este rojo sólo aparece en Linux y no se
+# reproduce en el Mac de quien lo mantiene. Sin esto, el informe dice QUÉ falló y
+# nunca POR QUÉ, y cada push es otra ronda de adivinar. El servicio ya imprime lo
+# que hace al reconstruir: basta traerlo al informe.
+if [ -z "$CURADO" ]; then
+  echo "  ── diagnóstico (últimas líneas del servicio) ──"
+  docker logs --tail 25 "$NOM2" 2>&1 | grep -iE 'reconstru|corrupt|ilegible|malformed|error|suelo' \
+    | tail -8 | sed 's/^/     /'
+  echo "     estado: cod=$cod · rotos=«$ROTOS2» · entradas=${N:-?}"
+fi
 [ -n "$CURADO" ] && ok "el índice corrupto se reconstruye solo (y vuelven las 30.050)" \
   || fallo "el índice corrupto se reconstruye solo" "200, sin rotos y 30.050 entradas" \
            "cod=$cod rotos=$ROTOS2 entradas=${N:-?}"
