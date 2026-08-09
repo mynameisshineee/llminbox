@@ -265,6 +265,12 @@ class Entrada:
     ts: str | None = None
     actor: str | None = None
     to: list[str] = field(default_factory=list)
+    # ¿Los destinatarios salieron de un `@` en una cabecera SIN flecha? Se marca
+    # porque quien indexa necesita distinguirlo: para una entrada NUEVA se enrutan
+    # siempre —es correo de ahora—, pero re-derivar el histórico añadiría 1.679
+    # entradas de golpe a las bandejas. La decisión no la puede tomar el troceador,
+    # que no sabe si la entrada es nueva; la toma `reindex`, que sí.
+    por_arroba: bool = False
     # Destinos de DIFUSIÓN (equipo/FLOTA/todos — ver roster.json), separados de
     # `to` a propósito: no son un agente al que dirigir una bandeja individual.
     # Campo nuevo (PARSER_V 5); servicio.py de hoy no lo lee — es aditivo, no
@@ -278,7 +284,11 @@ class Entrada:
 
 
 def _campos(head: str, cola: str) -> tuple[str | None, str | None, list[str], list[str], str | None]:
-    """Extrae (ts, actor, destinatarios, difusion, tipo). Devuelve None en lo que no se pueda leer."""
+    """Extrae (ts, actor, destinatarios, difusion, tipo, por_arroba).
+
+    Devuelve None en lo que no se pueda leer. `por_arroba` dice si los destinatarios
+    salieron de un `@` en una cabecera sin flecha — ver el campo del mismo nombre.
+    """
     m = TS.search(head) or TS.search(cola)
     ts = m.group(1) if m else None
 
@@ -297,6 +307,7 @@ def _campos(head: str, cola: str) -> tuple[str | None, str | None, list[str], li
 
     to: list[str] = []
     difusion: list[str] = []
+    por_arroba = False
     actor = None
     if FLECHA.search(inner):
         izq, der = FLECHA.split(inner, 1)
@@ -345,7 +356,10 @@ def _campos(head: str, cola: str) -> tuple[str | None, str | None, list[str], li
         ma = RE_AGENTE.search(PARENT.sub(" ", inner))
         actor = canonico(ma.group(1)) if ma else None
         # Sin flecha no hay lista de destino que leer… salvo los `@` (ver arriba).
-        if ARROBA_DESDE and ts and ts >= ARROBA_DESDE:
+        # Se calculan SIEMPRE que la función esté activa. El corte por fecha ya no
+        # se aplica aquí: exigir sello dejaba fuera el 15,7 % de las entradas —8.550
+        # sin `ts`— y a ésas el router ni las miraba. Quien decide es `reindex`.
+        if ARROBA_DESDE:
             vistos = {actor.lower()} if actor else set()
             for m in RE_ARROBA.finditer(inner):
                 bruto = m.group(1)
@@ -357,11 +371,12 @@ def _campos(head: str, cola: str) -> tuple[str | None, str | None, list[str], li
                 vistos.add(bruto.lower())
                 n = canonico(bruto)
                 (difusion if n.lower() in DIFSET else to).append(n)
+                por_arroba = True
 
     tipo = next((t for t in TIPOS if t in head), None)
     if tipo is None and etiqueta:
         tipo = etiqueta.group(1).upper()
-    return ts, actor, to, difusion, tipo
+    return ts, actor, to, difusion, tipo, por_arroba
 
 
 def parse(path: str, desde_byte: int = 0):
@@ -389,10 +404,10 @@ def parse(path: str, desde_byte: int = 0):
         text = "".join(lines[i:end]).rstrip() + "\n"
         head = lines[i].rstrip("\n")
         cola = "".join(lines[i + 1:i + 4])
-        ts, actor, to, difusion, tipo = _campos(head, cola)
+        ts, actor, to, difusion, tipo, por_arroba = _campos(head, cola)
         out.append(Entrada(seq=n, line_no=i + 1, byte_off=offs[i], head=head,
                            text=text, ts=ts, actor=actor, to=to, difusion=difusion,
-                           tipo=tipo))
+                           tipo=tipo, por_arroba=por_arroba))
     return out, acc
 
 

@@ -734,7 +734,12 @@ def reindex(ledger: str, path: str, con) -> dict:
                             "provisional=? WHERE ledger=? AND eid=?",
                             (pos, e.line_no, e.byte_off, prov, ledger, e.sha))
                 refrescadas += 1
-            if rederivar:
+            # RE-DERIVAR SÍ respeta el corte, y aquí está su razón de ser: recalcular
+            # el histórico con el router de `@` añadiría 1.679 entradas de golpe a las
+            # bandejas (medido 2026-08-09). Una entrada ya conocida sólo recupera sus
+            # destinatarios por `@` si su sello es posterior al corte.
+            if rederivar and (not e.por_arroba
+                              or (lp.ARROBA_DESDE and e.ts and e.ts >= lp.ARROBA_DESDE)):
                 # El texto es el mismo —su `eid` lo demuestra— pero el censo nuevo
                 # puede reconocer a alguien que antes no existía. Se recalcula lo
                 # DERIVADO y se conserva el `arrival`, que es lo que sostiene el
@@ -751,8 +756,17 @@ def reindex(ledger: str, path: str, con) -> dict:
         filas.append((ledger, e.sha, prox + nuevas, pos, e.line_no, e.byte_off,
                       e.ts, e.actor, e.tipo, e.head[:600], e.text, ahora, None,
                       1 if pos == len(ents) - 1 else 0))
-        for w in e.to:
-            dest.append((ledger, e.sha, w))
+        # ¿SE ENRUTA POR `@`? La pregunta no es «¿es nueva?» —en la PRIMERA
+        # indexación de un ledger TODO es nuevo, y eso volcaría el histórico entero
+        # en las bandejas: 12.442 entradas de golpe, medido—. La pregunta es si esto
+        # es una CARGA INICIAL o un apéndice incremental, y eso lo dice `previos`:
+        # vacío = primera vez que se ve este ledger.
+        #   · carga inicial → manda el corte por fecha (protege del volcado)
+        #   · incremental   → se enruta aunque no traiga sello, porque es correo de
+        #     ahora; exigirlo dejaba fuera el 15,7 % del corpus, que no lo trae.
+        if (not e.por_arroba) or previos or (lp.ARROBA_DESDE and e.ts and e.ts >= lp.ARROBA_DESDE):
+            for w in e.to:
+                dest.append((ledger, e.sha, w))
         nuevas += 1
 
     con.executemany("INSERT OR REPLACE INTO entries (ledger,eid,arrival,seq,line_no,"

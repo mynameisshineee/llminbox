@@ -809,6 +809,7 @@ NOM5="humo5-$$"; P5=$((PUERTO+4))
 limpiar5() { docker rm -f "$NOM5" >/dev/null 2>&1; rm -rf "$T5"; }
 printf '# t\n\n### [alice-backend habla del tema y avisa a @bob-reviewer] 2026-08-09T10:00:00Z — nueva\ncuerpo nuevo\n' > "$T5/l.md"
 printf '\n### [alice-backend habla de lo viejo y avisa a @bob-reviewer] 2026-08-01T10:00:00Z — vieja\ncuerpo viejo\n' >> "$T5/l.md"
+
 docker run -d --name "$NOM5" -p "127.0.0.1:$P5:8077" \
   -e LLMINBOX_LEDGERS="t=/l/l.md" -e LLMINBOX_TOKEN="$TOK" -e LLMINBOX_ARROBA_DESDE="2026-08-05" \
   -e LLMINBOX_DB=/tmp/h.sqlite -e LLMINBOX_POLL=1 -e LLMINBOX_ROSTER=/censo.json \
@@ -816,9 +817,17 @@ docker run -d --name "$NOM5" -p "127.0.0.1:$P5:8077" \
   "${IMAGEN:-llminbox:test}" >/dev/null || { echo "no arrancó $NOM5"; FALLOS=$((FALLOS+1)); }
 for _ in $(seq 1 40); do curl -sf -m 2 "http://127.0.0.1:$P5/health" >/dev/null 2>&1 && break; sleep 1; done
 sleep 3
+# SIN SELLO, Y APENDIZADA DESPUÉS DE LA PRIMERA INDEXACIÓN — que es el escenario
+# real y el único que distingue las dos cosas. El 15,7 % del corpus no trae sello
+# (8.550 entradas) y la primera versión del router les exigía uno ⇒ ni las miraba.
+# Pero relajarlo a secas volcaba el histórico entero en las bandejas, así que lo que
+# manda no es «¿es nueva?» —en la primera pasada todo lo es— sino si el ledger ya
+# estaba indexado. Por eso esta línea va DESPUÉS de esperar a que se indexe.
+printf '\n### [alice-backend escribe sin sello y avisa a @bob-reviewer] — sinsello\ncuerpo sin sello\n' >> "$T5/l.md"
+sleep 4
 BAND=$(curl -s -m 20 "${A[@]}" "http://127.0.0.1:$P5/inbox/bob-reviewer")
 # CONTROL primero: si el ledger no se indexó, los dos brazos de abajo son vacío puro.
-comp "el ledger de la prueba se indexó (hay qué entregar)" "2" \
+comp "el ledger de la prueba se indexó (hay qué entregar)" "3" \
   "$(curl -s "${A[@]}" "http://127.0.0.1:$P5/stat" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["entradas"])' 2>/dev/null)"
 # falsador ①: sin leer los `@`, bob no recibe NADA y esto sale 0.
 printf '%s' "$BAND" | grep -q 'nueva' \
@@ -829,6 +838,10 @@ printf '%s' "$BAND" | grep -q 'nueva' \
 printf '%s' "$BAND" | grep -q 'vieja' \
   && fallo "el corte por fecha tiene que dejar fuera lo anterior" "sin 'vieja'" "aparece 'vieja'" \
   || ok "y la ANTERIOR al corte NO se entrega (el historial no inunda)"
+# falsador: con la exigencia de sello de vuelta, esta entrada no llega a nadie.
+printf '%s' "$BAND" | grep -q 'sinsello' \
+  && ok "y una entrada NUEVA SIN SELLO también se entrega (es correo de ahora)" \
+  || fallo "una entrada nueva sin sello tiene que entregarse igual" "aparece 'sinsello'" "no aparece"
 echo "── reparto de trabajo: 1 coge · 3 revisan · nadie duplica ──"
 # La queja medida del operador: un símbolo técnico lo tocaban entre 12 y 21 agentes,
 # contra un techo de 4. Se reutiliza $NOM5 —recién creado y mío— y no el contenedor
