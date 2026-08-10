@@ -154,6 +154,22 @@ def _cargar_carriles() -> dict[str, str]:
 
 CARRIL_LEDGER = _cargar_carriles()
 
+# El inverso, para la vista `actor@carril` (⑫, idea de Albert vía el hub
+# 2026-08-10T18:08Z). El carril de una entrada NO se teclea ni se censa: se
+# DERIVA de su fichero, porque con una-ledger-por-proyecto el carril de una
+# entrada ES su ledger. Tecleado en la firma está medido y descartado (2 de 3
+# combos daban actor=None) y censar ~98 combinaciones reintroduce la clase
+# huérfano; derivado es imposible de driftar y no cambia la conducta de nadie.
+# Un ledger sin carril mapeado NO recibe sufijo: no se inventa procedencia.
+LEDGER_CARRIL = {v: k for k, v in CARRIL_LEDGER.items()}
+
+
+def actor_arroba_carril(actor: str | None, ledger: str) -> str:
+    """`cto@64bis` — el actor con su procedencia derivada del ledger."""
+    quien = actor or "?"
+    carril = LEDGER_CARRIL.get(ledger)
+    return f"{quien}@{carril}" if carril else quien
+
 # ── LA WIKI ───────────────────────────────────────────────────────────────────
 # El ledger es lo que se DIJO; la wiki es lo que quedó DECIDIDO. Son dos mitades
 # de la misma historia y aquí viven juntas, no en dos productos cosidos por una
@@ -1797,6 +1813,12 @@ def entries(respuesta: Response,ledger: str | None = None, to: str | None = None
             dest.setdefault(r["eid"], []).append(r["who"])
         for r in rows:
             r["to"] = dest.get(r["eid"], [])
+    # ⑫ — el carril, DERIVADO del ledger de cada fila. Va en /entries porque es
+    # la vista multi-ledger: aquí es donde `cto` de 64bis y `cto` de cfocockpit
+    # se mezclan en una lista y sin esto son indistinguibles. `None` cuando el
+    # ledger no está mapeado — el campo existe siempre, el valor no se inventa.
+    for r in rows:
+        r["carril"] = LEDGER_CARRIL.get(r["ledger"])
     # El presupuesto de bytes se aplica DESPUÉS de leer, sobre lo servido: es donde
     # se conoce el tamaño real. Recortar el cuerpo NO borra la entrada — se devuelve
     # sin `body` y con `cuerpo_recortado`, para que quien lo necesite lo pida solo.
@@ -1909,14 +1931,21 @@ def inbox(agent: str, limit: int = Query(30, le=200), only: str | None = None):
             (name, *nombres, last)).fetchone()["n"]
         cola = f" · {atras - len(rows)} más atrás" if atras > len(rows) else ""
         escucha = (" · escuchando " + ", ".join(nombres[1:])) if len(nombres) > 1 else ""
-        out.append(f"── {name} · {len(rows)} de {atras} para ti "
+        # El rótulo dice también el CARRIL, no sólo el ledger. No es adorno: el
+        # 422 de carril de fe·bikeus (2026-08-10T17:17Z) nació justo aquí — quien
+        # declara ámbito teclea lo que ve en este rótulo, que era el nombre del
+        # LEDGER. Ahora el valor bueno está delante de los ojos.
+        c_sec = LEDGER_CARRIL.get(name)
+        rotulo = f"{name} (carril: {c_sec})" if c_sec else name
+        out.append(f"── {rotulo} · {len(rows)} de {atras} para ti "
                    f"(lo más reciente{cola}){escucha} ──")
         for r in rows:
             # El `eid` va delante del número de línea a propósito: la línea se mueve
             # con cada apéndice de otro y el `eid` no. Es la coordenada que se puede
             # citar en una página de wiki y seguir resolviendo dentro de un año.
             out.append(f"  {r['eid'][:12]} #{r['arrival']} L{r['line_no']} {r['ts'] or '·'} "
-                       f"{r['actor'] or '?'} {('['+r['tipo']+']') if r['tipo'] else ''}")
+                       f"{actor_arroba_carril(r['actor'], name)} "
+                       f"{('['+r['tipo']+']') if r['tipo'] else ''}")
             out.append(f"    {r['head'][:150]}")
         tope[name] = rows[-1]["arrival"]
     con.close()
