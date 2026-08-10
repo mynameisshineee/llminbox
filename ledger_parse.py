@@ -162,6 +162,39 @@ AGENTES = AGENTES + DIFUSION
 CANON = {a.lower(): a for a in AGENTES}
 
 
+# ── Identidad para RESOLUCIÓN (llminbox ①/②) — DISTINTA de CANON/AGENTES/RE_AGENTE ──
+# CANON/AGENTES son para PARSEAR el markdown (quién firma, a quién va dirigido).
+# Esto es para decidir si un {agent} de una URL EXISTE. Mezclarlas ensancharía el
+# enrutado de correo sin que nadie lo haya pedido — "fe" es palabra española común,
+# "be" casaría con cualquier frase que la contenga. Nunca se usa para leer texto.
+ROLES_VALIDOS = {r.lower() for r in ROL_DE.values()}   # ~14 tokens: be,cto,fe,wiki...
+
+
+def canon_identidad(nombre: str) -> str | None:
+    """Forma canónica de `nombre` para identidad de cursor, o None si no resuelve.
+
+    Unión = agentes de roster.json ∪ humanos ∪ alias de humanos ∪ difusión (=CANON,
+    que el informe de censo del 2026-08-10 verificó BYTE A BYTE idéntico a los 51
+    nombres de roles-por-alias.json) ∪ los propios tokens de rol ("be","cto",...),
+    que SÍ hace falta añadir aparte: roles-por-alias.json los tiene como VALORES,
+    no como nombres, y roster.json tampoco los lista como agente. Se derivan de
+    ROL_DE (ya construido desde roster.json) en vez de montar una segunda copia de
+    roles-por-alias.json — evita crear el mismo problema de sincronización que ya
+    tiene roster.json↔roles-por-alias.json, en la dirección contraria.
+    FALSADOR: si roster.json y roles-por-alias.json divergen algún día (hoy: 0
+    discrepancias, sin mecanismo que lo garantice), esta función usa la copia de
+    roster.json, que puede quedar desactualizada respecto al censo firmado. No
+    hay gate hoy que lo detecte — ver nota de seguimiento en §7.
+    """
+    if not nombre:
+        return None
+    if nombre.lower() in CANON:
+        return CANON[nombre.lower()]
+    if nombre.lower() in ROLES_VALIDOS:
+        return nombre.lower()
+    return None
+
+
 # ── Direccionamiento por `@nombre` en cabeceras SIN flecha ────────────────────
 #
 # Sin flecha, `to` se quedaba vacío. Y eso NO significaba «no iba a nadie»: medido
