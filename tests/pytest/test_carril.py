@@ -49,24 +49,33 @@ def test_sin_carril_consume_todo_y_avisa(cliente):
     assert body["aviso"] == "sin carril: consumes TODOS los cursores"
 
 
-def test_carril_sin_mapa_cae_a_permisivo_y_avisa(cliente, servicio):
-    """Un carril que NO está en carriles.tsv (o no cruza con .llmi-mounts.json)
-    no filtra nada — mismo comportamiento que sin carril — y lo DICE.
+def test_carril_declarado_sin_mapa_es_422_con_pista(tmp_path, monkeypatch):
+    """CONTRATO CAMBIADO (hallazgo de fe·bikeus 2026-08-10, sustituye al test
+    permisivo que vivía aquí): declarar carril donde NO hay mapa montado ya no
+    degrada a drenar todo con un aviso que nadie lee — el servicio no puede
+    honrar el ámbito que le pediste, y lo dice con 422 y el fix («quita la
+    cabecera o monta carriles.tsv»). El caso «carril inválido CON mapa» está en
+    test_carril_invalido_es_422_y_no_toca_cursores.
 
-    FALSADOR: si sólo se aplicara UNO de los dos ledgers aquí, habría un filtro
-    FANTASMA operando sobre un mapa vacío para ese carril.
+    FALSADOR: con la rama permisiva de antes, esto era 200 con los DOS ledgers
+    en aplicados — las tres aserciones caen.
     """
-    assert "noexiste-en-tsv" not in servicio.CARRIL_LEDGER
-    r = cliente.post(
-        "/inbox/backend/leido",
-        json={"hasta": {"demo-ledger": 5, "otro-ledger": 9}},
-        headers={"X-Llminbox-Carril": "noexiste-en-tsv"},
-    )
-    assert r.status_code == 200
-    body = r.json()
-    assert set(body["aplicados"]) == {"demo-ledger", "otro-ledger"}
-    assert body["fuera_de_carril"] == []
-    assert "noexiste-en-tsv" in body["aviso"]
+    from fastapi.testclient import TestClient
+    s = construir(tmp_path, monkeypatch,
+                  extra_env={"LLMINBOX_CARRILES": "", "LLMINBOX_MOUNTS_JSON": ""})
+    assert s.CARRIL_LEDGER == {}
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        r = c.post("/inbox/backend/leido",
+                   json={"hasta": {"demo-ledger": 5}},
+                   headers={"X-Llminbox-Carril": "cualquiera"})
+        assert r.status_code == 422
+        assert "no tiene mapa de carriles montado" in r.json()["detail"]
+        con = db_directa(s)
+        filas = con.execute("SELECT COUNT(*) c FROM cursors WHERE agent='be'").fetchone()["c"]
+        con.close()
+        assert filas == 0
 
 
 def test_carril_ledger_se_resuelve_de_verdad(servicio):
@@ -97,3 +106,36 @@ def test_carril_ledger_vacio_por_defecto_sin_mapa(tmp_path, monkeypatch):
         c.headers.update({"X-Llminbox-Token": "test-token"})
         r = c.get("/inbox/backend")
         assert r.status_code == 200
+
+
+def test_carril_invalido_es_422_y_no_toca_cursores(cliente, servicio):
+    """Fail-closed de ③ (hallazgo de fe·bikeus 2026-08-10): una cabecera de
+    carril que NO resuelve devolvía ok:true y degradaba a consumir TODOS los
+    cursores, delatándose solo en un `aviso` que ningún llamador parsea.
+    Ahora: 422 que nombra los carriles válidos, y NI UN cursor tocado.
+
+    FALSADOR: revertir el raise (volver a la rama del aviso) deja esto en 200
+    con aplicados poblados — las tres aserciones caen.
+    """
+    r = cliente.post("/inbox/backend/leido",
+                     headers={"X-Llminbox-Carril": "noexiste"},
+                     json={"hasta": {"demo-ledger": 1, "otro-ledger": 0}})
+    assert r.status_code == 422
+    assert "noexiste" in r.json()["detail"] and "demo" in r.json()["detail"]
+    con = db_directa(servicio)
+    filas = con.execute("SELECT COUNT(*) c FROM cursors WHERE agent='be'").fetchone()["c"]
+    con.close()
+    assert filas == 0, "el 422 del carril escribió cursores — el fail-closed no cierra"
+
+
+def test_carril_con_nombre_de_ledger_ensena_el_carril(cliente):
+    """La trampa que fe señaló: el rótulo de sección de la bandeja es el nombre
+    del LEDGER (`demo-ledger`), no del carril (`demo`) — es lo que un humano
+    teclea. El 422 debe ENSEÑAR el fix, no solo rechazar.
+    """
+    r = cliente.post("/inbox/backend/leido",
+                     headers={"X-Llminbox-Carril": "demo-ledger"},
+                     json={"hasta": {"demo-ledger": 1}})
+    assert r.status_code == 422
+    assert "es un nombre de LEDGER" in r.json()["detail"]
+    assert "'demo'" in r.json()["detail"]

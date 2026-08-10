@@ -2242,7 +2242,31 @@ def marcar_leido(agent: str, l: Leido,
     # falta que la respuesta traiga el ANTES y el DESPUÉS, y que nombre lo ignorado.
     agent = resolver_o_422(agent)                  # ① — antes de tocar nada más
     canon = clave_cursor(agent)                     # ② — la clave es el ROL, no el nombre
-    carril_ledger = CARRIL_LEDGER.get(x_llminbox_carril) if x_llminbox_carril else None
+    # ③ fail-closed TAMBIÉN para el carril (hallazgo de fe·bikeus 2026-08-10T17:17Z):
+    # una cabecera que no resuelve devolvía `ok:true` y DEGRADABA a consumir TODOS
+    # los cursores — justo lo que la cabecera existe para evitar — con la única seña
+    # en un campo `aviso` que ningún llamador parsea después de leer el ok. Y el
+    # valor equivocado es fácil de teclear: el rótulo de sección de la bandeja
+    # (`── bik-marketing-web ──`) es el nombre del LEDGER, no del carril. Quien
+    # declara ámbito y se equivoca recibe un 422 que nombra el fix, no un drenaje.
+    carril_ledger = None
+    if x_llminbox_carril:
+        carril_ledger = CARRIL_LEDGER.get(x_llminbox_carril)
+        if not carril_ledger:
+            ledger_a_carril = {v: k for k, v in CARRIL_LEDGER.items()}
+            if x_llminbox_carril in ledger_a_carril:
+                pista = (f" — '{x_llminbox_carril}' es un nombre de LEDGER (el rótulo "
+                         f"que ves en la bandeja); su carril es "
+                         f"'{ledger_a_carril[x_llminbox_carril]}'")
+            elif not CARRIL_LEDGER:
+                pista = (" — este servicio no tiene mapa de carriles montado "
+                         "(carriles.tsv): quita la cabecera o móntalo")
+            else:
+                pista = ""
+            raise HTTPException(
+                422,
+                f"carril '{x_llminbox_carril}' no resuelve a ningún ledger de este "
+                f"servicio (válidos: {sorted(CARRIL_LEDGER)}){pista}")
     ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
     con = db()
     aplicados, ignorados, retrocedidos, sin_cambio, fuera_de_carril = {}, [], {}, [], []
@@ -2279,17 +2303,12 @@ def marcar_leido(agent: str, l: Leido,
         print(f"[leido] {canon}: ledgers desconocidos ignorados: {ignorados}", flush=True)
     # AVISO de ámbito de carril: sin cabecera, o con una que no resuelve a ningún
     # ledger de este servicio, la conducta es la de siempre (consume TODOS los
-    # cursores del `hasta`) — y se DICE, no se calla. `carril_ledger and name !=
-    # carril_ledger` es `False` por cortocircuito cuando `carril_ledger is None`
-    # (cabecera sin resolver): no filtra nada, mismo comportamiento que sin carril,
-    # que es justo lo que dice este aviso en esa rama.
+    # cursores del `hasta`) — y se DICE, no se calla. La rama «cabecera que no
+    # resuelve» ya no llega aquí: es 422 arriba, antes de tocar un solo cursor
+    # (fail-closed de ③ — antes degradaba a drenar todo con un aviso que nadie lee).
     aviso = None
     if not x_llminbox_carril:
         aviso = "sin carril: consumes TODOS los cursores"
-    elif not carril_ledger:
-        aviso = (f"carril '{x_llminbox_carril}' no resuelve a ningún ledger de este "
-                 f"servicio (revisa carriles.tsv / .llmi-mounts.json) — "
-                 f"consumes TODOS los cursores igual que sin carril")
     return {"ok": bool(aplicados), "agent": canon, "pediste": agent,
             "aplicados": aplicados,
             "ignorados": ignorados,          # nombres que este servicio no conoce

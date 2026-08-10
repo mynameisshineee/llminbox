@@ -625,8 +625,23 @@ case "$cmd" in
           json="$(sed -n 's/^ *\({"hasta":.*}\)$/\1/p' <<<"$out" | tail -1)"
           if [ -n "$json" ]; then
             Hc=("${H[@]}"); [ -n "$carril" ] && Hc+=(-H "X-Llminbox-Carril: $carril")
-            resp="$(curl -sf -m 10 "${Hc[@]}" -H 'Content-Type: application/json' -d "$json" \
-                 "$API/inbox/$1/leido")" && echo "· cursor avanzado ${carril:+(carril: $carril) }→ $resp"
+            # El 422 del carril (fail-closed de ③) se DICE y se sale con 4: antes un
+            # carril mal tecleado drenaba todo con ok:true, y tras el fix del
+            # servidor un `curl -sf` mudo lo convertía en «no pasó nada» — las dos
+            # mentiras opuestas sobre el mismo error.
+            cuerpo_post="$(mktemp)"
+            cod="$(curl -s -m 10 "${Hc[@]}" -H 'Content-Type: application/json' -d "$json" \
+                 -o "$cuerpo_post" -w '%{http_code}' "$API/inbox/$1/leido")" || cod=""
+            case "$cod" in
+              200) echo "· cursor avanzado ${carril:+(carril: $carril) }→ $(cat "$cuerpo_post")"
+                   rm -f "$cuerpo_post" ;;
+              422) python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("detail",""), file=sys.stderr)
+except Exception: print(open(sys.argv[1]).read(), file=sys.stderr)' "$cuerpo_post"
+                   rm -f "$cuerpo_post"; exit 4 ;;
+              *)   rm -f "$cuerpo_post"
+                   echo "· leído NO marcado (HTTP ${cod:-sin respuesta}) — el cursor no avanzó" >&2 ;;
+            esac
           fi ;;
   peek)   [ $# -ge 1 ] || { uso; exit 2; }; vivo || { sin_servicio; exit 3; }
           _get_inbox_o_422 "$1" "${2:-30}"; exit $? ;;

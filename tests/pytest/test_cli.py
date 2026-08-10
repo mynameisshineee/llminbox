@@ -55,6 +55,13 @@ class _Stub(http.server.BaseHTTPRequestHandler):
             return self._json(200, {"ok": True})
         if self.path.startswith("/inbox/malo"):
             return self._json(422, {"detail": "'malo' no resuelve en el censo — date de alta o revisa el nombre"})
+        if self.path.startswith("/inbox/malcarril"):
+            cuerpo = CUERPO_OK.replace("/inbox/ok/leido", "/inbox/malcarril/leido").encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(cuerpo)))
+            self.end_headers()
+            self.wfile.write(cuerpo)
+            return
         if self.path.startswith("/inbox/ok"):
             cuerpo = CUERPO_OK.encode()
             self.send_response(200)
@@ -68,6 +75,10 @@ class _Stub(http.server.BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         self.server.posts.append({"path": self.path, "headers": dict(self.headers),
                                   "body": self.rfile.read(n).decode()})
+        if self.path.startswith("/inbox/malcarril/"):
+            # El 422 de carril del servidor real (fail-closed de ③), para probar
+            # que el CLI lo DICE en vez de tragárselo.
+            return self._json(422, {"detail": "carril 'novale' no resuelve a ningún ledger de este servicio (válidos: ['demo'])"})
         self._json(200, {"ok": True})
 
     def log_message(self, *a):  # silencio: el ruido del stub no es del test
@@ -159,3 +170,15 @@ def test_carril_sin_valor_uso_limpio_exit_2(tmp_path):
     assert r.returncode == 2
     assert "--carril necesita un valor" in r.stderr
     assert "unbound" not in r.stderr
+
+
+def test_carril_invalido_el_cli_lo_dice_y_exit_4(stub, tmp_path):
+    """El 422 del POST /leido (carril que no resuelve) llega al operador: detail
+    a stderr y exit 4 — ni el ok:true de antes del fix del servidor, ni el
+    silencio del `curl -sf` de después.
+
+    FALSADOR: con el `curl -sf` mudo anterior, esto salía rc=0 sin una palabra."""
+    r = _llmi(["inbox", "malcarril", "--carril", "novale"], tmp_path,
+              f"http://127.0.0.1:{stub.server_port}")
+    assert r.returncode == 4
+    assert "novale" in r.stderr
