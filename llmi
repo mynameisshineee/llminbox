@@ -595,7 +595,11 @@ case "$cmd" in
           carril="${BIK_CARRIL:-}"; args=()
           while [ $# -gt 0 ]; do
             case "$1" in
-              --carril) carril="$2"; shift 2 ;;
+              # `$2` sin comprobar revienta bajo `set -u` con "unbound variable"
+              # cuando --carril llega como último token — un error crudo de bash
+              # donde tocaba un mensaje de uso (rc=2, como el resto de mal-uso).
+              --carril) [ $# -ge 2 ] || { echo "· --carril necesita un valor (p.ej. --carril 64bis)" >&2; uso; exit 2; }
+                        carril="$2"; shift 2 ;;
               *) args+=("$1"); shift ;;
             esac
           done
