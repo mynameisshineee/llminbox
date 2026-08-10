@@ -241,6 +241,13 @@ def test_migracion_no_fija_flag_con_censo_vacio(tmp_path, monkeypatch):
     assert flag is None, "el flag se fijó con censo vacío — la fusión no se reintentaría jamás"
     assert [f["agent"] for f in filas] == ["backend", "backend-biklabs"]
 
+    # Y el falsador de security del re-review×3: con el censo roto NO se crea
+    # backup — el corte va antes del con.backup(). Sin esto, un roster roto
+    # persistente + crash-loop acumulaba un .bak-* por reinicio, sin límite.
+    patron = os.path.join(os.path.dirname(os.environ["LLMINBOX_DB"]),
+                          "llminbox.sqlite.bak-migracion-alias-*")
+    assert glob.glob(patron) == [], "boot con censo vacío generó backup — acumulación en crash-loop"
+
     # Boot 2: mismo tmp_path (misma BD), roster ya sano (construir lo escribe y
     # apunta LLMINBOX_ROSTER de vuelta a él). El cambio de huella de censo NO
     # toca cursores (ver [arranque] CENSO cambiado en servicio.py) — lo que

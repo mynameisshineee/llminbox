@@ -25,6 +25,10 @@ ROLES_ALIAS_FIXTURE = {
         "backend": "be",
         "backend-biklabs": "be",
         "solo-en-alias": "be",
+        # Valor en MAYÚSCULAS a propósito (re-review×3, qa): el fichero firmado
+        # se edita a mano fuera de este repo — la normalización tiene que
+        # tragárselo, o un "FE" real dejaría ese rol sin matchear en silencio.
+        "front": "FE",
     },
     # 'herramienta-tool' NO está en el ROSTER de prueba; 'cto-A' SÍ (con rol).
     # La pareja reproduce los dos lados del caso `sin_rol` real: un nombre que
@@ -115,3 +119,37 @@ def test_alias_de_roster_sigue_resolviendo_con_fichero_montado(tmp_path, monkeyp
         c.headers.update({"X-Llminbox-Token": "test-token"})
         r = c.get("/inbox/backend")
         assert r.status_code == 200
+
+
+def test_rol_pelado_de_roster_sigue_resolviendo_montado(tmp_path, monkeypatch):
+    """El MAJOR del re-review×3: montar el fichero firmado tiene que AÑADIR
+    identidades, nunca quitarlas. 'cto' es rol en el ROSTER de prueba
+    (cto-A → cto) pero NO aparece como valor en ROLES_ALIAS_FIXTURE — con la
+    unión rota, /inbox/cto pasaba de 200 (sin montar) a 422 (montado), y la
+    migración ② escribe cursores justo bajo esos tokens vía rol_de().
+
+    FALSADOR: quitar la cláusula `bajo in ROLES_VALIDOS` de la rama montada de
+    canon_identidad() devuelve el 422 y esto se pone rojo.
+    """
+    s = _con_roles_alias(tmp_path, monkeypatch)
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        r = c.get("/inbox/cto")
+        assert r.status_code == 200
+
+
+def test_valor_con_mayusculas_normaliza(tmp_path, monkeypatch):
+    """'front' → 'FE' en el fichero (mayúsculas de quien edita a mano): tanto
+    el alias como el token de rol pelado 'fe' deben resolver — la comparación
+    es contra valores ya normalizados.
+
+    FALSADOR: sin el .lower() de los valores en _cargar_roles_por_alias(),
+    'fe' no está en values() (está 'FE') y da 422.
+    """
+    s = _con_roles_alias(tmp_path, monkeypatch)
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        assert c.get("/inbox/front").status_code == 200
+        assert c.get("/inbox/fe").status_code == 200
