@@ -37,6 +37,20 @@ services:
       # uno — ver ese fichero, GENERADO, para el porqué de cada montaje.
       LLMINBOX_LEDGERS: "${LLMINBOX_LEDGERS:-}"
       LLMINBOX_ROSTER: /censo.json
+      # Ámbito de carril (③): carriles.tsv (SoT de flota, fuera de este repo) ×
+      # .llmi-mounts.json (nombre-de-este-servicio→ruta, lo escribe `llmi init`).
+      # Vacío por defecto a propósito, mismo patrón que LLMINBOX_LEDGERS — quien
+      # clone esto no se encuentra un feature encendido sin haberlo montado.
+      LLMINBOX_CARRILES: "${LLMINBOX_CARRILES:-}"
+      LLMINBOX_MOUNTS_JSON: "${LLMINBOX_MOUNTS_JSON:-}"
+      # Fuente FIRMADA del censo (①/② — review×3 2026-08-10, MAJOR code): la
+      # unión de `canon_identidad()` prefiere `roles-por-alias.json` a
+      # `roster.json` cuando está montado, porque los dos pueden divergir sin
+      # que nada lo avise (ver `_cargar_roles_por_alias` en ledger_parse.py).
+      # Mismo patrón que LLMINBOX_CARRILES: vacío por defecto, ruta real en
+      # docker-compose.override.yml (gitignored, se edita a mano). Sin montar,
+      # degrada a la conducta de hoy (sólo roster.json) — no falla abierto.
+      LLMINBOX_ROLES_ALIAS: "${LLMINBOX_ROLES_ALIAS:-}"
     volumes:
       # El ÍNDICE va en volumen nombrado, no en bind-mount: SQLite sobre el sistema
       # de ficheros virtualizado de macOS es lento y su bloqueo es dudoso. El índice

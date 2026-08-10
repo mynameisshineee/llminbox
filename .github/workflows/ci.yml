@@ -21,6 +21,21 @@ jobs:
       - name: Correr el humo
         run: IMAGEN=llminbox:test ./tests/humo.sh
 
+  pytest:
+    name: pytest (fail-closed, migración, carril, CLI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        # Misma minor que el Dockerfile (python:3.13-slim): un test contra otro
+        # intérprete no prueba producción, igual que ya vale para las versiones
+        # de fastapi/pydantic de abajo.
+        with: { python-version: "3.13" }
+      - name: Instalar dependencias de test (mismas versiones que el Dockerfile)
+        run: pip install -r requirements-test.txt
+      - name: Correr la suite
+        run: python3 -m pytest tests/pytest -v
+
   interfaz:
     name: La interfaz compila con TypeScript estricto
     runs-on: ubuntu-latest

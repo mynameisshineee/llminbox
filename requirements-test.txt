@@ -1,0 +1,8 @@
+# Fijado igual que Dockerfile (pip install fastapi/uvicorn/pydantic) — un test
+# contra versiones distintas a producción no prueba producción.
+fastapi==0.121.*
+pydantic==2.*
+# También fijados por minor (re-review×3, security): sin pin, cualquier release
+# nueva —rota o comprometida— entraba al job de CI sin aviso.
+pytest==9.1.*
+httpx==0.28.*

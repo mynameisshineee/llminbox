@@ -117,6 +117,43 @@ LEDGERS = {
     )
 }
 
+
+def _cargar_carriles() -> dict[str, str]:
+    """carril → nombre de ledger DE ESTE SERVICIO. Cruce de dos ficheros ajenos por
+    la única columna que comparten (ruta de HOST): carriles.tsv (SoT de flota,
+    carril→ledger_path) × .llmi-mounts.json (nombre-de-este-servicio→ledger_path,
+    que ya escribe `llmi init`). Sin ninguno de los dos ⇒ {} ⇒ conducta actual.
+    Ningún nombre de carril hardcodeado: una fila nueva en carriles.tsv se resuelve
+    sola en el próximo arranque.
+    """
+    ruta_carriles = os.environ.get("LLMINBOX_CARRILES", "")
+    ruta_mounts = os.environ.get("LLMINBOX_MOUNTS_JSON", "")
+    if not ruta_carriles or not ruta_mounts:
+        return {}
+    try:
+        with open(ruta_mounts, encoding="utf-8") as fh:
+            path_a_nombre = {os.path.normpath(p): n for n, p in json.load(fh).items()}
+        carril_a_ledger = {}
+        with open(ruta_carriles, encoding="utf-8") as fh:
+            for linea in fh:
+                if not linea.strip() or linea.lstrip().startswith("#"):
+                    continue
+                partes = linea.rstrip("\n").split("\t")
+                if len(partes) < 2:
+                    continue
+                carril, ledger_path = partes[0], partes[1]
+                nombre = path_a_nombre.get(os.path.normpath(ledger_path))
+                if nombre:
+                    carril_a_ledger[carril] = nombre
+        return carril_a_ledger
+    except Exception as e:
+        print(f"[carriles] no pude cargar mapa carril→ledger: {e} — "
+              f"ámbito de carril desactivado (conducta actual)", flush=True)
+        return {}
+
+
+CARRIL_LEDGER = _cargar_carriles()
+
 # ── LA WIKI ───────────────────────────────────────────────────────────────────
 # El ledger es lo que se DIJO; la wiki es lo que quedó DECIDIDO. Son dos mitades
 # de la misma historia y aquí viven juntas, no en dos productos cosidos por una
@@ -342,6 +379,101 @@ def huella_esquema() -> str:
 
 def huella_censo() -> str:
     return hashlib.sha256(",".join(sorted(lp.AGENTES)).encode()).hexdigest()[:16]
+
+
+# ── MIGRACIÓN alias→rol de `cursors` (②) ───────────────────────────────────────
+# Antes de esto, `backend`, `backend-biklabs` y (donde apliquen) sus otros alias
+# tenían CADA UNO su propia fila de cursor por ledger — el mismo humano/rol leyendo
+# el mismo canal por tres puertas, con tres cursores que nunca se enteraban entre
+# sí. Colapsa a UNA fila por (rol, ledger) = MIN(last_arrival) de sus alias: MIN y
+# no MAX, porque perder correo por adelantar el cursor de golpe es peor que volver
+# a ver algo ya leído.
+MIGRACION_ALIAS_V = "1"
+
+
+def migrar_alias_a_rol(con: sqlite3.Connection) -> None:
+    """Colapsa cursores de alias del MISMO rol a una fila por (rol, ledger) =
+    MIN(last_arrival) de sus alias. Idempotente: gateada por meta['cursores_
+    migrados_v']; si ya corrió, no vuelve a leer `cursors` siquiera.
+    """
+    ya = con.execute("SELECT v FROM meta WHERE k='cursores_migrados_v'").fetchone()
+    if ya and ya["v"] == MIGRACION_ALIAS_V:
+        return
+
+    # CENSO VÁLIDO — mismo criterio que ya usa `huella_censo()`: `lp.AGENTES` no
+    # vacío. Si `roster.json` falla al leerse en este arranque (típicamente:
+    # el primero, antes de que exista el fichero), TODA fila de `cursors` cae
+    # por la rama "fantasma" de abajo — `lp.rol_de()` no agrupa nada porque no
+    # hay `rol` que leer, y `lp.canon_identidad()` no resuelve nada porque el
+    # censo está vacío — así que esta pasada no fusiona una sola fila. Fijar
+    # IGUALMENTE el flag de idempotencia dejaría un arranque POSTERIOR con
+    # censo sano sin reintentar: la migración real no correría nunca. Ver
+    # falsador (D, review×3 2026-08-10): primer boot con `LLMINBOX_ROSTER`
+    # inexistente ⇒ NO se fija el flag y las filas quedan sin fusionar;
+    # segundo boot con censo sano ⇒ SÍ fusiona.
+    #
+    # Y el corte va AQUÍ, antes del backup, no después (re-review×3): con el
+    # censo vacío esta pasada no va a mutar una sola fila, así que un backup
+    # por arranque sólo serviría para llenar el volumen — un roster roto de
+    # forma persistente + crash-loop acumulaba .bak-* sin límite ni purga.
+    if not bool(lp.AGENTES):
+        print("[migración] censo vacío/no cargado (roster.json ilegible o ausente en "
+              "este arranque) — NO fijo el flag de idempotencia ni toco nada: se "
+              "reintenta en el próximo arranque con censo sano", flush=True)
+        return
+
+    # BACKUP ANTES DE TOCAR. API de backup online de sqlite3 — funciona con WAL,
+    # no bloquea escritores, no requiere parar el servicio. Vive en el MISMO
+    # volumen (llminbox-data), junto al índice: si el volumen se pierde, se pierde
+    # el índice Y su backup igual — ese caso ya está cubierto por "el índice se
+    # reconstruye del markdown en 2,2s" (§ ④); el backup es para el caso de "la
+    # migración hizo algo que no querías", no para pérdida de volumen.
+    # Microsegundos, no sólo segundos: con resolución de segundo, dos migraciones
+    # reales que caen en el MISMO segundo UTC (gate forzado a mano + reinicio
+    # rápido; y en pruebas, casi cualquier ejecución) generan el MISMO nombre de
+    # fichero y la segunda SOBREESCRIBE la primera en silencio — justo lo
+    # contrario de "un backup por cada vez que la migración corre de verdad".
+    # Encontrado por el propio test de idempotencia (②) al arrancar dos veces
+    # seguidas en la misma sesión de pytest.
+    marca = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    backup_path = os.path.join(os.path.dirname(DB), f"llminbox.sqlite.bak-migracion-alias-{marca}")
+    bak = sqlite3.connect(backup_path)
+    con.backup(bak)
+    bak.close()
+    print(f"[migración] backup pre-migración: {backup_path}", flush=True)
+
+    filas = con.execute("SELECT agent, ledger, last_arrival FROM cursors").fetchall()
+    grupos: dict[tuple[str, str], list[tuple[str, int]]] = {}
+    for f in filas:
+        rol = lp.rol_de(f["agent"])
+        grupos.setdefault((rol, f["ledger"]), []).append((f["agent"], f["last_arrival"]))
+
+    ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    cambios, fantasmas = [], []
+    for (rol, ledger), miembros in grupos.items():
+        if len(miembros) == 1 and miembros[0][0] == rol:
+            if lp.canon_identidad(rol) is None:
+                fantasmas.append({"agent": rol, "ledger": ledger, "arrival": miembros[0][1]})
+            continue  # ya en forma canónica (o fantasma preexistente) — no tocar
+        minimo = min(v for _, v in miembros)
+        cambios.append({"rol": rol, "ledger": ledger, "min": minimo, "alias": miembros})
+        con.execute("INSERT INTO cursors(agent,ledger,last_arrival,updated) VALUES(?,?,?,?) "
+                    "ON CONFLICT(agent,ledger) DO UPDATE SET last_arrival=excluded.last_arrival, "
+                    "updated=excluded.updated", (rol, ledger, minimo, ahora))
+        for alias, _ in miembros:
+            if alias != rol:
+                con.execute("DELETE FROM cursors WHERE agent=? AND ledger=?", (alias, ledger))
+
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('cursores_migrados_v', ?)", (MIGRACION_ALIAS_V,))
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('cursores_migracion_backup', ?)", (backup_path,))
+    con.commit()
+    print(f"[migración] {len(cambios)} grupos (rol,ledger) colapsados por MIN — "
+          f"{len(fantasmas)} filas no resolubles preexistentes, NO tocadas "
+          f"(candidatas a limpieza manual, no borradas por esta migración)", flush=True)
+    for c in cambios:
+        print(f"  {c['rol']}/{c['ledger']}: MIN={c['min']} de {c['alias']}", flush=True)
+    for f in fantasmas:
+        print(f"  [fantasma sin tocar] agent={f['agent']} ledger={f['ledger']} arrival={f['arrival']}", flush=True)
 
 
 # ── CORRUPCIÓN DEL ÍNDICE ─────────────────────────────────────────────────────
@@ -1323,6 +1455,10 @@ async def lifespan(app: FastAPI):
         con.execute("INSERT OR REPLACE INTO meta VALUES ('schema_v', ?)", (h_esq,))
         # Aquí sí se van los cursores, y es correcto: cambió la FORMA de las tablas.
     con.executescript(SCHEMA)
+    migrar_alias_a_rol(con)        # ② — después de SCHEMA (tablas garantizadas),
+                                    # antes de CENSO cambiado (orden no crítico entre
+                                    # ambas, pero así quedan agrupados: migraciones de
+                                    # datos antes de recálculos derivados)
 
     # CENSO cambiado: lo derivado se recalcula, los cursores NO se tocan. Sin esto,
     # arreglar `roster.json` no servía de nada por el otro lado: el fichero de ledger
@@ -1390,6 +1526,37 @@ async def contar_coste(request, call_next):
         pass                      # medir NUNCA puede tumbar lo medido
     return resp
 GATE = [Depends(auth)]
+
+
+def resolver_o_422(nombre: str) -> str:
+    """Fail-closed en la puerta de identidad. Nombre no resoluble ⇒ 422, nunca
+    cursor fantasma. Devuelve la forma canónica (nivel AGENTE o token de ROL).
+    """
+    canon = lp.canon_identidad(nombre)
+    if canon is None:
+        # El mensaje nombra la fuente que DE VERDAD se consultó — y enumera los
+        # roles que DE VERDAD aceptaría: con el fichero firmado montado, citar
+        # sólo ROLES_VALIDOS mandaría a quien depura a la lista equivocada
+        # (re-review×3: el hint del error mentía sobre qué acepta el código).
+        if lp.ROLES_ALIAS is not None:
+            fuente = "roles-por-alias.json (censo firmado) ∪ roster.json"
+            roles = sorted(lp.ROLES_VALIDOS | set(lp.ROLES_ALIAS.values()))
+        else:
+            fuente = "roster.json"
+            roles = sorted(lp.ROLES_VALIDOS)
+        raise HTTPException(
+            422,
+            f"'{nombre}' no resuelve en el censo ({fuente}: agentes/humanos/"
+            f"difusión, o uno de los roles {roles}) — "
+            f"date de alta o revisa el nombre")
+    return canon
+
+
+def clave_cursor(nombre_valido: str) -> str:
+    """La CLAVE de `cursors` para un nombre ya validado por resolver_o_422: su ROL,
+    no su nombre de sesión. 'backend', 'be' y 'backend-biklabs' devuelven los tres
+    'be' — comparten UNA fila, que es lo que deja la migración de ②."""
+    return lp.rol_de(nombre_valido)
 
 
 @app.get("/")
@@ -1626,7 +1793,7 @@ def entries(respuesta: Response,ledger: str | None = None, to: str | None = None
 
 
 @app.get("/inbox/{agent}", response_class=PlainTextResponse, dependencies=GATE)
-def inbox(agent: str, limit: int = Query(30, le=200)):
+def inbox(agent: str, limit: int = Query(30, le=200), only: str | None = None):
     """Lo que este servicio existe para contestar: **qué hay para mí desde la última vez**.
 
     NO avanza el cursor. Lo hacía —`avanzar=True` por defecto— y era un GET que mutaba
@@ -1639,7 +1806,14 @@ def inbox(agent: str, limit: int = Query(30, le=200)):
 
     Marcar como leído es ahora un POST explícito con el `hasta` que se ha leído de
     verdad: quien consume decide cuándo consumió, y si se cae a mitad no pierde nada.
+
+    `only=<ledger>` acota la lectura a UN ledger — y de paso ATRAVIESA el archivo
+    (`INBOX_EXCLUIR`): pedirlo explícitamente no es "leer el canal entero" a ciegas,
+    es justo lo contrario. Ledger inexistente ⇒ 422 (①), no una bandeja vacía muda.
     """
+    agent = resolver_o_422(agent)                    # ① — antes de tocar nada más
+    if only is not None and only not in LEDGERS:
+        raise HTTPException(422, f"ledger '{only}' no existe — conocidos: {sorted(LEDGERS)}")
     con = db()
     # Se apunta que ALGUIEN miró esta bandeja. No cambia lo que nadie ve —el cursor
     # no se toca— así que un GET puede escribirlo sin ser el GET-que-muta de antes.
@@ -1669,12 +1843,12 @@ def inbox(agent: str, limit: int = Query(30, le=200)):
     marcas = ",".join("?" * len(nombres))
     out, tope = [], {}
     excluidos = []
-    for name in LEDGERS:
-        if name in INBOX_EXCLUIR:
+    for name in ([only] if only else LEDGERS):
+        if not only and name in INBOX_EXCLUIR:   # only= explícito pasa por encima del archivo
             excluidos.append(name)
             continue
         c = con.execute("SELECT last_arrival FROM cursors WHERE agent=? AND ledger=?",
-                        (lp.canonico(agent), name)).fetchone()
+                        (clave_cursor(agent), name)).fetchone()
         last = c["last_arrival"] if c else -1
         rows = con.execute(
             "SELECT e.arrival,e.eid,e.ts,e.actor,e.tipo,e.line_no,e.head FROM entries e "
@@ -1738,11 +1912,12 @@ def cursor(agent: str):
     separador de no-leídos sin tener que parsear el texto pensado para un LLM.
     -1 significa "nunca leído": no hay fila en `cursors` para este agente+ledger.
     """
+    agent = resolver_o_422(agent)                    # ① — fail-closed, igual que /inbox
     con = db()
     out = {}
     for name in LEDGERS:
         c = con.execute("SELECT last_arrival FROM cursors WHERE agent=? AND ledger=?",
-                        (lp.canonico(agent), name)).fetchone()
+                        (clave_cursor(agent), name)).fetchone()
         out[name] = c["last_arrival"] if c else -1
     con.close()
     return out
@@ -2014,7 +2189,8 @@ def wiki_pagina(path: str):
 
 
 @app.post("/inbox/{agent}/leido", dependencies=GATE)
-def marcar_leido(agent: str, l: Leido):
+def marcar_leido(agent: str, l: Leido,
+                  x_llminbox_carril: str | None = Header(default=None)):
     """Avanza el cursor. Verbo no-safe porque muta, que es lo que hace."""
     # El cursor se resuelve por el nombre CANÓNICO, igual que el destinatario. Sin
     # esto, `/inbox/WIKI-VAULT` emparejaba entradas (el destinatario pasa por
@@ -2023,8 +2199,6 @@ def marcar_leido(agent: str, l: Leido):
     # drenaba nunca; y el `POST …/leido` con esa grafía contestaba `ok:true` mientras
     # escribía el cursor de un agente que no existe. Medido 2026-08-08:
     # `/inbox/un-agente` daba 6 secciones y `/inbox/UN-AGENTE` daba 7.
-    # La migración es un no-op verificado: las 27 filas de `cursors` ya usaban el
-    # nombre canónico, así que canonizar no mueve ninguna clave ni inunda a nadie.
     # LA RESPUESTA DICE LO QUE PASÓ, NO LO QUE PEDISTE. Antes devolvía
     # `{"ok": true, "cursores": <tu propia entrada>}` pasara lo que pasara: un ledger
     # con el nombre mal escrito se saltaba con un `continue` mudo y quien llamaba se
@@ -2033,19 +2207,24 @@ def marcar_leido(agent: str, l: Leido):
     # drenar**. No era desidia de nadie — era esto. Un campo que refleja tu entrada
     # no es una verificación; para distinguir «funcionó» de «te lo tragaste» hace
     # falta que la respuesta traiga el ANTES y el DESPUÉS, y que nombre lo ignorado.
-    canon = lp.canonico(agent)
+    agent = resolver_o_422(agent)                  # ① — antes de tocar nada más
+    canon = clave_cursor(agent)                     # ② — la clave es el ROL, no el nombre
+    carril_ledger = CARRIL_LEDGER.get(x_llminbox_carril) if x_llminbox_carril else None
     ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
     con = db()
-    aplicados, ignorados, retrocedidos, sin_cambio = {}, [], {}, []
+    aplicados, ignorados, retrocedidos, sin_cambio, fuera_de_carril = {}, [], {}, [], []
     try:
-        for name, seq in l.hasta.items():
+        for name, arrival_hasta in l.hasta.items():        # ⑦a: era `seq`, medía `arrival`
             if name not in LEDGERS:
                 ignorados.append(name)
+                continue
+            if x_llminbox_carril and carril_ledger and name != carril_ledger:
+                fuera_de_carril.append(name)                # ③ — no se toca, se declara
                 continue
             fila = con.execute("SELECT last_arrival FROM cursors WHERE agent=? AND ledger=?",
                                (canon, name)).fetchone()
             antes = fila["last_arrival"] if fila else -1
-            nuevo = int(seq)
+            nuevo = int(arrival_hasta)
             con.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?)",
                         (canon, name, nuevo, ahora))
             aplicados[name] = {"antes": antes, "ahora": nuevo}
@@ -2065,11 +2244,26 @@ def marcar_leido(agent: str, l: Leido):
         con.close()
     if ignorados:
         print(f"[leido] {canon}: ledgers desconocidos ignorados: {ignorados}", flush=True)
+    # AVISO de ámbito de carril: sin cabecera, o con una que no resuelve a ningún
+    # ledger de este servicio, la conducta es la de siempre (consume TODOS los
+    # cursores del `hasta`) — y se DICE, no se calla. `carril_ledger and name !=
+    # carril_ledger` es `False` por cortocircuito cuando `carril_ledger is None`
+    # (cabecera sin resolver): no filtra nada, mismo comportamiento que sin carril,
+    # que es justo lo que dice este aviso en esa rama.
+    aviso = None
+    if not x_llminbox_carril:
+        aviso = "sin carril: consumes TODOS los cursores"
+    elif not carril_ledger:
+        aviso = (f"carril '{x_llminbox_carril}' no resuelve a ningún ledger de este "
+                 f"servicio (revisa carriles.tsv / .llmi-mounts.json) — "
+                 f"consumes TODOS los cursores igual que sin carril")
     return {"ok": bool(aplicados), "agent": canon, "pediste": agent,
             "aplicados": aplicados,
             "ignorados": ignorados,          # nombres que este servicio no conoce
             "retrocedidos": retrocedidos,    # el cursor VOLVIÓ ATRÁS: más correo visible
             "sin_cambio": sin_cambio,        # se escribió el mismo valor que ya había
+            "fuera_de_carril": fuera_de_carril,  # ③ — el carril los dejó fuera, no se tocaron
+            "aviso": aviso,
             "conocidos": sorted(LEDGERS) if ignorados else None}
 
 
