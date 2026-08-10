@@ -1931,14 +1931,19 @@ def inbox(agent: str, limit: int = Query(30, le=200), only: str | None = None):
             (name, *nombres, last)).fetchone()["n"]
         cola = f" · {atras - len(rows)} más atrás" if atras > len(rows) else ""
         escucha = (" · escuchando " + ", ".join(nombres[1:])) if len(nombres) > 1 else ""
-        # El rótulo dice también el CARRIL, no sólo el ledger. No es adorno: el
-        # 422 de carril de fe·bikeus (2026-08-10T17:17Z) nació justo aquí — quien
-        # declara ámbito teclea lo que ve en este rótulo, que era el nombre del
-        # LEDGER. Ahora el valor bueno está delante de los ojos.
+        # El rótulo dice también el CARRIL — quien declara ámbito teclea lo que ve
+        # aquí, y lo que veía era el nombre del LEDGER (de ahí el 422 de fe·bikeus,
+        # 2026-08-10T17:17Z). PERO VA AL FINAL, Y ESO NO ES ESTÉTICA: `── <ledger> ·`
+        # es un CONTRATO con al menos 7 vigías de la flota que anclan ese separador
+        # pegado al nombre (`awk '/^── 64bis-wiki ·/'`, `sed -nE "s/.*── X · [0-9]+
+        # de ([0-9]+) para ti.*/\1/p"`, …). Meterlo en medio —como hice el
+        # 2026-08-11 y estuvo 45 min desplegado— los ciega a todos en silencio: el
+        # de backend hace `continue`, o sea deja de mirar su bandeja para siempre.
+        # Al final, todos esos patrones siguen casando. Ver test_rotulo_contrato.py.
         c_sec = LEDGER_CARRIL.get(name)
-        rotulo = f"{name} (carril: {c_sec})" if c_sec else name
-        out.append(f"── {rotulo} · {len(rows)} de {atras} para ti "
-                   f"(lo más reciente{cola}){escucha} ──")
+        marca_carril = f" · carril: {c_sec}" if c_sec else ""
+        out.append(f"── {name} · {len(rows)} de {atras} para ti "
+                   f"(lo más reciente{cola}){escucha}{marca_carril} ──")
         for r in rows:
             # El `eid` va delante del número de línea a propósito: la línea se mueve
             # con cada apéndice de otro y el `eid` no. Es la coordenada que se puede

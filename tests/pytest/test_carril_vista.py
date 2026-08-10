@@ -40,11 +40,16 @@ def test_inbox_rotulo_dice_el_carril(cliente):
     fe·bikeus reportó (tecleó el nombre del LEDGER como carril porque es lo que
     el rótulo enseñaba) se cierra por la vía de enseñar el valor bueno.
 
-    FALSADOR: con el rótulo viejo (`── demo-ledger · …`), el `(carril: demo)`
-    no está y quien lea sigue sin saber qué teclear.
+    El carril va al FINAL del rótulo, no en medio: `── <ledger> ·` es contrato
+    con los vigías de la flota (ver test_rotulo_contrato.py — meterlo en medio
+    ciega a 7 de ellos, y estuvo 45 min así en producción).
+
+    FALSADOR: sin la marca, quien lea el rótulo sigue sin saber qué teclear en
+    --carril y vuelve el error de fe·bikeus.
     """
     texto = cliente.get("/inbox/backend").text
-    assert "── demo-ledger (carril: demo) ·" in texto
+    assert "── demo-ledger · " in texto           # el prefijo que la flota parsea
+    assert "· carril: demo ──" in texto           # y el dato nuevo, al final
 
 
 def test_ledger_sin_carril_no_inventa_procedencia(cliente):
@@ -57,7 +62,7 @@ def test_ledger_sin_carril_no_inventa_procedencia(cliente):
     texto = cliente.get("/inbox/backend").text
     seccion = texto.split("── otro-ledger", 1)[1]
     assert "@" not in seccion.split("marcar leído", 1)[0]
-    assert "(carril:" not in seccion.split("\n", 1)[0]
+    assert "carril:" not in seccion.split("\n", 1)[0]
 
 
 def test_sin_mapa_de_carriles_ninguna_vista_cambia(tmp_path, monkeypatch):
