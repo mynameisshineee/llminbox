@@ -21,7 +21,83 @@ trap limpiar EXIT
 
 ok()   { printf "  ✓ %s\n" "$1"; }
 fallo(){ printf "  ✗ %s\n     esperado: %s · obtenido: %s\n" "$1" "$2" "$3"; FALLOS=$((FALLOS+1)); }
-comp() { [ "$2" = "$3" ] && ok "$1" || fallo "$1" "$2" "$3"; }
+
+# ── «NO SE MIDIÓ» no es «el valor está mal» ───────────────────────────────────
+# Los dos entraban por la misma puerta y el informe mandaba a arreglar lo que no
+# estaba roto. Medido el 2026-08-09 sobre dos corridas de CI (31309566135 y
+# 31307587216): de los 3 rojos del bloque de corrupción, uno decía «el cursor
+# cambió: obtenido ⟨vacío⟩» y lo que había pasado es que el servicio NO CONTESTÓ
+# —`JSONDecodeError: Expecting value: line 1 column 1`, o sea cuerpo vacío— tras
+# agotar en silencio los 60 intentos de la espera a /health (63,97 s medidos).
+#
+# `NO-MEDIDO` SIGUE CONTANDO COMO FALLO, y eso no es negociable: si no contara,
+# romper el transporte apagaría la suite entera, que es la avería que elegiría un
+# despiste — o alguien con prisa por poner el CI en verde.
+no_medido() {
+  printf "  ⚠️  %s — NO SE MIDIÓ (%s)\n     no se afirma nada sobre el valor · cuenta como fallo\n" "$1" "$2"
+  FALLOS=$((FALLOS+1))
+}
+
+comp() {
+  case "${3-}" in NO-MEDIDO:*) no_medido "$1" "${3#NO-MEDIDO:}"; return ;; esac
+  case "${2-}" in NO-MEDIDO:*) no_medido "$1" "${2#NO-MEDIDO:}"; return ;; esac
+  # Un lado VACÍO no es «otro valor»: es que el `python3` de la tubería reventó
+  # (clave ausente, JSON roto, cuerpo vacío) y `stdout` salió en blanco. Esta
+  # línea cubre de golpe las 37 tuberías `curl | python3` del fichero.
+  # Y con los DOS lados vacíos `comp` daba VERDE por igualdad vacua, que es lo
+  # peor de todo: dos no-mediciones se confirmaban la una a la otra.
+  if [ -z "${2-}" ] || [ -z "${3-}" ]; then
+    no_medido "$1" "un lado de la comparación vino VACÍO"; return
+  fi
+  [ "$2" = "$3" ] && ok "$1" || fallo "$1" "$2" "$3"
+}
+
+# Devuelve el CUERPO de la respuesta, o `NO-MEDIDO:<motivo>`. Es la pieza que
+# separa «contestó algo que no esperaba» de «no contestó».
+cuerpo() {                      # cuerpo <args-de-curl…>
+  local tmp cod rc; tmp="$(mktemp)"
+  cod="$(curl -s -o "$tmp" -w '%{http_code}' "$@")"; rc=$?
+  if [ "$rc" -ne 0 ];           then rm -f "$tmp"; printf 'NO-MEDIDO:curl-rc%s' "$rc"; return; fi
+  if [ "${cod:-000}" -ge 400 ]; then rm -f "$tmp"; printf 'NO-MEDIDO:http-%s' "$cod"; return; fi
+  if [ ! -s "$tmp" ];           then rm -f "$tmp"; printf 'NO-MEDIDO:cuerpo-vacio'; return; fi
+  cat "$tmp"; rm -f "$tmp"
+}
+
+# `grep -c` sobre una respuesta muerta devuelve 0, y 0 era justo lo que varias
+# comprobaciones esperaban ⇒ salían VERDES sin servicio. Aquí, si no hubo
+# respuesta, no hay número: hay centinela.
+contar() {                      # contar <patrón> <args-de-curl…>
+  local pat="$1"; shift
+  local c; c="$(cuerpo "$@")"
+  case "$c" in NO-MEDIDO:*) printf '%s' "$c"; return ;; esac
+  printf '%s' "$c" | grep -c "$pat"
+}
+
+# La espera a /health TIENE que saber fallar. Las diez que había eran
+# `for … curl -sf … && break; sleep 1; done` sin brazo de `||`: si el servicio no
+# llega, el bucle se agota EN SILENCIO y todo lo que viene después mide un
+# servicio que no está — y lo reporta como valores incorrectos del producto.
+esperar_salud() {               # esperar_salud <url-base> <intentos> <etiqueta>
+  local u="$1" n="${2:-40}" et="${3:-el servicio}" i=0
+  while [ "$i" -lt "$n" ]; do
+    curl -sf -m 2 "$u/health" >/dev/null 2>&1 && return 0
+    i=$((i+1)); sleep 1
+  done
+  no_medido "$et" "no contestó a /health en $n intentos — lo que siga NO mide el producto"
+  return 1
+}
+
+# Un PASO DE PREPARACIÓN que falla sin abortar deja el bloque entero VERDE sobre
+# un experimento que no ocurrió. Es la avería exacta del 2026-08-09: los dos
+# `python3 -c` que envenenaban la huella y corrompían la base fallaban en Linux
+# (`readonly database` y `PermissionError`) y el script seguía como si nada,
+# porque corre con `set -uo pipefail` SIN `-e`. Salieron 5 verdes falsos.
+paso() {                        # paso <etiqueta> <comando…>
+  local et="$1"; shift
+  if "$@"; then return 0; fi
+  no_medido "$et" "el PASO DE PREPARACIÓN falló — lo que dependía de él no se ha medido"
+  return 1
+}
 
 printf '# t\n\n### [alice-backend → bob-reviewer · REQUEST] primera\ncuerpo uno\n' > "$TMP/l.md"
 printf '\n### [bob-reviewer → alice-backend · ACK] segunda\ncuerpo dos\n' >> "$TMP/l.md"
@@ -32,7 +108,7 @@ docker run -d --name "$NOMBRE" -p "127.0.0.1:$PUERTO:8077" \
   -v "$TMP:/l:ro" -v "$DATOS:/datos" -v "$PWD/roster.example.json:/censo.json:ro" \
   "${IMAGEN:-llminbox:test}" >/dev/null || { echo "no arrancó el contenedor"; exit 1; }
 
-for _ in $(seq 1 40); do curl -sf -m 2 "http://127.0.0.1:$PUERTO/health" >/dev/null 2>&1 && break; sleep 1; done
+esperar_salud "http://127.0.0.1:$PUERTO" 40 "el contenedor principal"
 sleep 3
 A=(-H "X-Llminbox-Token: $TOK"); U="http://127.0.0.1:$PUERTO"
 
@@ -48,8 +124,14 @@ comp "/openapi cerrado → 404" "404" "$(curl -s -o /dev/null -w '%{http_code}' 
 # Antes que nada: si el servicio no puede LEER un ledger, todo lo de abajo da cero
 # y el test culpa al indexado. `/health` ya lo dice —cada ledger roto con su motivo—;
 # lo que faltaba era mirarlo.
-ROTOS=$(curl -s "$U/health" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("rotos") or "")')
-[ -z "$ROTOS" ] && ok "ningún ledger roto" || fallo "ningún ledger roto" "ninguno" "$ROTOS"
+# ⚠️ `-z` sobre una respuesta muerta decía «ningún ledger roto»: el silencio del
+# servicio se leía como la mejor noticia posible. Ahora la respuesta se mide antes.
+SALUD=$(cuerpo "$U/health")
+case "$SALUD" in
+  NO-MEDIDO:*) no_medido "ningún ledger roto" "${SALUD#NO-MEDIDO:}" ;;
+  *) ROTOS=$(printf '%s' "$SALUD" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("rotos") or "")' 2>/dev/null)
+     [ -z "$ROTOS" ] && ok "ningún ledger roto" || fallo "ningún ledger roto" "ninguno" "$ROTOS" ;;
+esac
 
 echo "── indexado ──"
 comp "indexa las 2 entradas" "2" "$(curl -s "${A[@]}" "$U/stat" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["entradas"])')"
@@ -63,14 +145,14 @@ comp "extrae destinatarios" "alice-backend,bob-reviewer" \
   "$(curl -s "${A[@]}" "$U/entries?ledger=t" | python3 -c 'import sys,json;print(",".join(sorted({w for x in json.load(sys.stdin) for w in (x.get("to") or [])})))')"
 
 echo "── la bandeja, que es el producto ──"
-n=$(curl -s "${A[@]}" "$U/inbox/alice-backend" | grep -c "para ti")
+n=$(contar "para ti" "${A[@]}" "$U/inbox/alice-backend")
 comp "alice tiene bandeja" "1" "$n"
 # falsador: si el GET mutara el cursor (bug real, corregido), la 2ª lectura saldría vacía
-n2=$(curl -s "${A[@]}" "$U/inbox/alice-backend" | grep -c "para ti")
+n2=$(contar "para ti" "${A[@]}" "$U/inbox/alice-backend")
 comp "el GET no consume" "1" "$n2"
 # y el POST sí avanza
 curl -s "${A[@]}" -H 'Content-Type: application/json' -d '{"hasta":{"t":99}}' -o /dev/null "$U/inbox/alice-backend/leido"
-comp "el POST sí avanza" "0" "$(curl -s "${A[@]}" "$U/inbox/alice-backend" | grep -c 'para ti')"
+comp "el POST sí avanza" "0" "$(contar 'para ti' "${A[@]}" "$U/inbox/alice-backend")"
 # LA MISMA BANDEJA ESCRITA EN MAYÚSCULAS ES LA MISMA BANDEJA. El destinatario se
 # empareja por el nombre canónico (ignora la caja) pero el cursor se guardaba con la
 # cadena literal ⇒ `/inbox/ALICE-BACKEND` no encontraba cursor, leía desde -1 y
@@ -79,7 +161,7 @@ comp "el POST sí avanza" "0" "$(curl -s "${A[@]}" "$U/inbox/alice-backend" | gr
 # 2026-08-08: 6 secciones en minúsculas contra 7 en mayúsculas.
 # falsador: sin canonizar el cursor, esto devuelve las entradas otra vez (>0).
 comp "y la MISMA bandeja en MAYÚSCULAS está igual de drenada" "0" \
-  "$(curl -s "${A[@]}" "$U/inbox/ALICE-BACKEND" | grep -c 'para ti')"
+  "$(contar 'para ti' "${A[@]}" "$U/inbox/ALICE-BACKEND")"
 # El otro brazo: que el POST en mayúsculas NO cree un cursor paralelo. Se comprueba
 # por el efecto —el cursor canónico se mueve— y no por la respuesta, que dice ok:true
 # en los dos casos: un campo que refleja tu entrada no es una verificación.
@@ -127,7 +209,7 @@ echo "── integridad: distinguir escribir de borrar ──"
 printf '\n### [alice-backend → bob-reviewer · FYI] tercera a medias\n' >> "$TMP/l.md"; sleep 3
 printf 'el cuerpo llega tarde\n' >> "$TMP/l.md"; sleep 3
 # falsador: antes esto gritaba «entrada que ESTUVO y ya no está» por escribir en 2 pasos
-comp "escribir a trozos NO alarma" "0" "$(curl -s "${A[@]}" "$U/chain/verify" | grep -c '✗')"
+comp "escribir a trozos NO alarma" "0" "$(contar '✗' "${A[@]}" "$U/chain/verify")"
 # Y NO BASTA CON QUE NO ALARME: hay que contar FILAS. Si la limpieza de provisionales
 # se rompe, la versión a medias sobrevive junto a la completa y deja una fila
 # fantasma — medido con un mutante el 2026-08-08: 3 filas donde el fichero tenía 2
@@ -140,18 +222,22 @@ comp "escribir a trozos NO alarma" "0" "$(curl -s "${A[@]}" "$U/chain/verify" | 
 comp "y el índice tiene UNA fila por entrada (sin fantasma de la escritura a trozos)" "3" \
   "$(curl -s "${A[@]}" "$U/stat" | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["entradas"])' 2>/dev/null)"
 
-python3 -c "
+paso "el borrado de entradas del ledger" python3 -c "
 p='$TMP/l.md'; L=open(p).read().split(chr(10)); open(p,'w').write(chr(10).join(L[:4]))"; sleep 4
 # falsador: si no detectara borrados, esto seguiría en 0 y la promesa del producto es falsa
-[ "$(curl -s "${A[@]}" "$U/chain/verify" | grep -c '✗')" -ge 1 ] \
-  && ok "borrar SÍ alarma" || fallo "borrar SÍ alarma" "≥1 línea con ✗" "0"
+ALARMAS=$(contar '✗' "${A[@]}" "$U/chain/verify")
+case "$ALARMAS" in
+  NO-MEDIDO:*) no_medido "borrar SÍ alarma" "${ALARMAS#NO-MEDIDO:}" ;;
+  *) [ "$ALARMAS" -ge 1 ] && ok "borrar SÍ alarma" \
+       || fallo "borrar SÍ alarma" "≥1 línea con ✗" "$ALARMAS" ;;
+esac
 
 echo "── dar de alta a un agente NO le vacía la bandeja al equipo ──"
 # Falsador: el cursor se planta a 99, se añade un agente al censo y se reinicia. Si
 # vuelve a -1, dar de alta a un compañero le borra el estado de lectura a todos —
 # que es lo que hacía hasta el 2026-07-28 (reproducido: 5 → -1), porque la huella
 # del esquema y la del censo eran la misma y el censo tiraba la tabla `cursors`.
-python3 -c "
+paso "la escritura del censo con el agente nuevo" python3 -c "
 import json,sys
 d=json.load(open('$PWD/roster.example.json',encoding='utf-8'))
 d['agentes'].append({'nombre':'zz-alta-tardia','humano':'alice','clave':''})
@@ -163,7 +249,7 @@ docker run -d --name "$NOMBRE" -p "127.0.0.1:$PUERTO:8077" \
   -e LLMINBOX_DB=/datos/h.sqlite -e LLMINBOX_POLL=1 -e LLMINBOX_ROSTER=/censo.json \
   -v "$TMP:/l:ro" -v "$DATOS:/datos" -v "$TMP/censo2.json:/censo.json:ro" \
   "${IMAGEN:-llminbox:test}" >/dev/null
-for _ in $(seq 1 40); do curl -sf -m 2 "http://127.0.0.1:$PUERTO/health" >/dev/null 2>&1 && break; sleep 1; done
+esperar_salud "http://127.0.0.1:$PUERTO" 40 "el contenedor tras el alta de un agente"
 sleep 3
 DESPUES=$(curl -s "${A[@]}" "$U/cursor/alice-backend" | python3 -c 'import json,sys;print(json.load(sys.stdin)["t"])')
 comp "el cursor sobrevive al alta de un agente" "$ANTES" "$DESPUES"
@@ -206,7 +292,7 @@ chmod 755 "$TMP2"; chmod 777 "$D2"
 
 limpiar2() { docker rm -f "$NOM2" >/dev/null 2>&1; rm -rf "$TMP2" "$D2"; }
 trap 'limpiar; limpiar2' EXIT
-python3 -c "
+paso "la generación del ledger de 30.000 entradas" python3 -c "
 with open('$TMP2/g.md','w') as f:
     f.write('# grande' + chr(10))
     for i in range(30000):
@@ -217,7 +303,7 @@ docker run -d --name "$NOM2" -p "127.0.0.1:$P2:8077" \
   -e LLMINBOX_CHEQUEO=2 -e LLMINBOX_SUELO_RECONSTRUCCION=5 \
   -v "$TMP2:/l" -v "$D2:/datos" -v "$PWD/roster.example.json:/censo.json:ro" \
   "${IMAGEN:-llminbox:test}" >/dev/null
-for _ in $(seq 1 60); do curl -sf -m 2 "http://127.0.0.1:$P2/health" >/dev/null 2>&1 && break; sleep 1; done
+esperar_salud "http://127.0.0.1:$P2" 60 "el contenedor del ledger grande"
 B=(-H "X-Llminbox-Token: $TOK"); V="http://127.0.0.1:$P2"
 # Mismo motivo que abajo: el runner de CI es más lento que este Mac y 60 s no
 # bastaban para indexar 30.000 entradas. Un techo corto convierte una prueba de
@@ -308,7 +394,7 @@ docker run -d --name "$NOM2" -p "127.0.0.1:$P2:8077" \
   -e LLMINBOX_CHEQUEO=2 -e LLMINBOX_SUELO_RECONSTRUCCION=5 \
   -v "$TMP2:/l" -v "$D2:/datos" -v "$PWD/roster.example.json:/censo.json:ro" \
   "${IMAGEN:-llminbox:test}" >/dev/null
-for _ in $(seq 1 60); do curl -sf -m 2 "http://127.0.0.1:$P2/health" >/dev/null 2>&1 && break; sleep 1; done
+esperar_salud "http://127.0.0.1:$P2" 60 "el contenedor tras el reinicio con ajustes realistas"
 sleep 3
 # CONTROL de la frontera: si el reinicio no conservó la base, lo de abajo mediría
 # una reconstrucción desde cero y daría verde por el motivo equivocado.
@@ -382,16 +468,17 @@ EID_ANTES=$(lee_eid "$CUR_ANTES")
 # la huella rescatada de la base rota coincide con la actual y la comprobación de
 # más abajo pasaría con el arreglo puesto Y sin él. El veneno crea el caso que sí
 # distingue — el de un índice corrupto que viene de una versión anterior.
-python3 -c "
+MONTADO="sí"
+paso "el envenenado de la huella de esquema" python3 -c "
 import sqlite3
 c=sqlite3.connect('$D2/h.sqlite',timeout=20)
-c.execute(\"INSERT OR REPLACE INTO meta VALUES ('schema_v','huella-obsoleta')\"); c.commit(); c.close()"
+c.execute(\"INSERT OR REPLACE INTO meta VALUES ('schema_v','huella-obsoleta')\"); c.commit(); c.close()" || MONTADO=""
 # Se daña la FRANJA CENTRAL (25 %–65 %), no la cabecera ni la cola, y la elección
 # tiene motivo: así se reproduce la forma REAL del incidente —páginas de una tabla
 # grande ilegibles con el resto intacto, que es lo que permitió rescatar 5 cursores
 # y 13 lecturas de la base rota—. Reventar la cabecera haría irrecuperable el estado
 # por construcción y el brazo del cursor fallaría por culpa del test, no del código.
-python3 -c "
+paso "el daño a la franja central del índice" python3 -c "
 import os
 f='$D2/h.sqlite'
 for resto in (f+'-wal', f+'-shm'):
@@ -400,7 +487,15 @@ for resto in (f+'-wal', f+'-shm'):
 n=os.path.getsize(f); a=int(n*0.25); b=int(n*0.65)
 with open(f,'r+b') as h:
     h.seek(a); h.write(os.urandom(b-a))
-print(f'  (dañados {(b-a)//1024} KB de {n//1024} KB, franja {a}-{b})')"
+print(f'  (dañados {(b-a)//1024} KB de {n//1024} KB, franja {a}-{b})')" || MONTADO=""
+# ⚠️ EL PASO 0 DE TODO ESTE BLOQUE. En Linux los DOS pasos de arriba fallan
+# —`h.sqlite` lo crea el contenedor como uid 1000 en 0644, y `chmod 777` sobre el
+# DIRECTORIO no alcanza al FICHERO— y hasta hoy el bloque seguía corriendo: 5 de
+# sus 7 puertas certificaban en VERDE una reconstrucción que nunca ocurrió. En
+# macOS no se ve porque Docker Desktop virtualiza la propiedad.
+if [ -z "$MONTADO" ]; then
+  echo "  ⏭️  el índice NUNCA se llegó a dañar: lo que sigue NO mide la cura de corrupción."
+fi
 # Falsador: sin auto-reparación esto se queda sirviendo 500 —o con el ledger en
 # `rotos`— para siempre, que es literalmente lo que hacía antes.
 CURADO=""; cod=""; ROTOS2="?"
@@ -423,9 +518,14 @@ if [ -z "$CURADO" ]; then
     | tail -8 | sed 's/^/     /'
   echo "     estado: cod=$cod · rotos=«$ROTOS2» · entradas=${N:-?}"
 fi
-[ -n "$CURADO" ] && ok "el índice corrupto se reconstruye solo (y vuelven las 30.050)" \
-  || fallo "el índice corrupto se reconstruye solo" "200, sin rotos y 30.050 entradas" \
-           "cod=$cod rotos=$ROTOS2 entradas=${N:-?}"
+if [ -z "$MONTADO" ]; then
+  no_medido "el índice corrupto se reconstruye solo" "el índice nunca se llegó a dañar"
+elif [ -n "$CURADO" ]; then
+  ok "el índice corrupto se reconstruye solo (y vuelven las 30.050)"
+else
+  fallo "el índice corrupto se reconstruye solo" "200, sin rotos y 30.050 entradas" \
+        "cod=$cod rotos=$ROTOS2 entradas=${N:-?}"
+fi
 # EL OTRO BRAZO, y es el que separa una cura de una cura que sale cara: reconstruir
 # es trivial si se tira todo. `cursors` y `lecturas` NO salen del markdown — sin
 # rescate, cada hipo del disco le vaciaría la bandeja al equipo. Mismo daño que se
@@ -438,26 +538,51 @@ CUR_DESPUES=$(curl -s "${B[@]}" "$V/cursor/alice-backend" | python3 -c 'import j
 # comprueba el rescate. Cazado corriendo el humo contra el mutante, que es para lo
 # que existe el mutante.
 EID_DESPUES=$(lee_eid "$CUR_DESPUES")
-if [ -n "$CURADO" ]; then
-  # Lo que se compara es la ENTRADA, no el número. Falsador: restaurando el número
-  # tal cual (que es lo que hacía la primera versión), tras el reordenado de arriba
-  # el mismo 500 apunta a otro `eid` y esto sale rojo.
-  comp "y el cursor apunta A LA MISMA ENTRADA tras reconstruir" "$EID_ANTES" "$EID_DESPUES"
-  # CONTROL, y sin él lo de arriba no vale: si el número NO hubiera cambiado, la
-  # renumeración no habría ocurrido y la comparación de `eid` pasaría sola. Se exige
-  # que haya cambiado — o sea que el cursor se haya tenido que RE-ANCLAR de verdad.
-  [ "$CUR_ANTES" != "$CUR_DESPUES" ] \
-    && ok "y el número SÍ cambió ($CUR_ANTES → $CUR_DESPUES): hubo renumeración que compensar" \
-    || fallo "el número tenía que cambiar o esto no prueba nada" "≠ $CUR_ANTES" "$CUR_DESPUES"
+# El CONTROL manda sobre la propiedad, y por eso se mira antes: «el número SÍ
+# cambió» es lo único que distingue «hubo renumeración y el re-anclaje la
+# compensó» de «no pasó nada y por eso coinciden». Con el segundo caso, comparar
+# los dos `eid` no prueba el rescate: lo pasaría igual con la cura puesta Y sin
+# ella.
+# 🔴 Y el PRIMER guarda es `MONTADO`, no `CURADO`, porque aquí `CURADO` MIENTE:
+# sin daño el índice está sano y la sonda dice «curado» igual. Con `CURADO` de
+# guarda, el caso REAL del CI de Linux —los dos `python3 -c` de arriba revientan
+# por permisos y `MONTADO` queda vacío— caía en la rama de abajo y publicaba
+# `✗ … esperado: ≠ 500 · obtenido: 500`: una discrepancia MEDIDA, cuando no se
+# había medido nada. O sea, la avería que este parche existe para matar, viva
+# DENTRO del parche. El hermano de abajo (`verify`) ya guardaba con `MONTADO`;
+# esto era una inconsistencia, no una decisión. Cazado en revisión adversarial y
+# reproducido ejecutando el bloque con MONTADO="" · CURADO="sí" · 500 = 500.
+if [ -z "$MONTADO" ]; then
+  no_medido "y el cursor apunta A LA MISMA ENTRADA tras reconstruir" \
+            "el índice nunca se llegó a dañar: no hubo reconstrucción que observar"
+  no_medido "el número tenía que cambiar o esto no prueba nada" \
+            "el índice nunca se llegó a dañar: no hubo renumeración que observar"
+elif [ -z "$CURADO" ]; then
+  no_medido "y el cursor apunta A LA MISMA ENTRADA tras reconstruir" \
+            "no hubo reconstrucción: no hay nada que re-anclar"
+  no_medido "el número tenía que cambiar o esto no prueba nada" \
+            "no hubo reconstrucción: no hay renumeración que observar"
+elif [ "$CUR_ANTES" = "$CUR_DESPUES" ]; then
+  no_medido "y el cursor apunta A LA MISMA ENTRADA tras reconstruir" \
+            "su CONTROL falla justo debajo: sin renumeración que compensar, comparar los dos eid es vacuo"
+  fallo "el número tenía que cambiar o esto no prueba nada" "≠ $CUR_ANTES" "$CUR_DESPUES"
 else
-  fallo "y el cursor apunta A LA MISMA ENTRADA tras reconstruir" \
-        "sólo es medible si hubo reconstrucción" "no la hubo — nada que medir"
+  comp "y el cursor apunta A LA MISMA ENTRADA tras reconstruir" "$EID_ANTES" "$EID_DESPUES"
+  ok "y el número SÍ cambió ($CUR_ANTES → $CUR_DESPUES): hubo renumeración que compensar"
 fi
 # Falsador: si la reconstrucción no dejara rastro, `verify` diría «sin pérdidas»
 # sobre una ventana que este servicio no vigiló.
-curl -s "${B[@]}" "$V/chain/verify" | grep -q 'reconstrucción' \
-  && ok "la reconstrucción queda registrada en verify" \
-  || fallo "la reconstrucción queda registrada en verify" "línea con «reconstrucción»" "no aparece"
+if [ -z "$MONTADO" ]; then
+  no_medido "la reconstrucción queda registrada en verify" "no hubo reconstrucción que registrar"
+else
+  VERI=$(cuerpo "${B[@]}" "$V/chain/verify")
+  case "$VERI" in
+    NO-MEDIDO:*) no_medido "la reconstrucción queda registrada en verify" "${VERI#NO-MEDIDO:}" ;;
+    *) grep -q 'reconstrucción' <<<"$VERI" \
+         && ok "la reconstrucción queda registrada en verify" \
+         || fallo "la reconstrucción queda registrada en verify" "línea con «reconstrucción»" "no aparece" ;;
+  esac
+fi
 # Y el reverso: haberse curado NO puede dejar el servicio en rojo permanente. Un
 # rojo que no se puede apagar enseña a apagar la alarma.
 comp "y /health NO se queda rojo por haberse curado" "True" \
@@ -480,17 +605,29 @@ c=sqlite3.connect('file:$D2/h.sqlite?mode=ro',uri=True,timeout=20)
 r=c.execute(\"SELECT v FROM meta WHERE k='schema_v'\").fetchone()
 print(r[0] if r else 'NINGUNA')")
 # Falsador: sin el arreglo aquí saldría `huella-obsoleta`, la que se envenenó arriba.
-comp "la base nueva lleva la huella de esquema de AHORA" "$HUELLA" "$GUARDADA"
+if [ -z "$MONTADO" ]; then
+  no_medido "la base nueva lleva la huella de esquema de AHORA" \
+            "la huella no se llegó a envenenar: pasa igual con el arreglo y sin él"
+else
+  comp "la base nueva lleva la huella de esquema de AHORA" "$HUELLA" "$GUARDADA"
+fi
 docker restart "$NOM2" >/dev/null 2>&1
-for _ in $(seq 1 60); do curl -sf -m 2 "$V/health" >/dev/null 2>&1 && break; sleep 1; done
+esperar_salud "$V" 60 "el contenedor tras 'docker restart'"
 sleep 3
 # Falsador: si el arranque hubiera entrado por la rama de «esquema cambiado», esto
 # volvería a -1 — que es el número exacto del defecto que este repo ya arregló una vez.
 CUR_REINICIO=$(curl -s "${B[@]}" "$V/cursor/alice-backend" | python3 -c 'import json,sys;print(json.load(sys.stdin)["g"])')
 comp "y el cursor SIGUE ahí tras reiniciar" "$CUR_DESPUES" "$CUR_REINICIO"
-docker logs "$NOM2" 2>&1 | grep -q "ESQUEMA cambiado" \
-  && fallo "el arranque no debe ver «esquema cambiado»" "sin esa línea" "la imprimió" \
-  || ok "y el arranque no vio «esquema cambiado» (no había por qué tirar nada)"
+# ⚠️ Si `docker logs` viene vacío —contenedor muerto, nombre mal— el `grep` falla
+# y esto salía VERDE: un log que no se puede leer no absuelve a nadie.
+LOGS_ARR=$(docker logs "$NOM2" 2>&1)
+if [ -z "$LOGS_ARR" ]; then
+  no_medido "el arranque no debe ver «esquema cambiado»" "docker logs vino VACÍO"
+elif grep -q "ESQUEMA cambiado" <<<"$LOGS_ARR"; then
+  fallo "el arranque no debe ver «esquema cambiado»" "sin esa línea" "la imprimió"
+else
+  ok "y el arranque no vio «esquema cambiado» (no había por qué tirar nada)"
+fi
 
 # EL CAMINO DE ARRANQUE, que hasta aquí no ejercitaba ningún caso. Todo lo de arriba
 # corrompe con el servicio VIVO, y entonces quien cura es el vigilante. Pero el
@@ -500,7 +637,8 @@ docker logs "$NOM2" 2>&1 | grep -q "ESQUEMA cambiado" \
 # vigilante y sin `/health` todavía en pie—, y un camino que sólo se recorre el peor
 # día del servicio es justo el que no se puede dejar sin probar.
 docker stop "$NOM2" >/dev/null 2>&1
-python3 -c "
+MONTADO2="sí"
+paso "el daño al índice ANTES del arranque" python3 -c "
 import os
 f='$D2/h.sqlite'
 for resto in (f+'-wal', f+'-shm'):
@@ -508,7 +646,7 @@ for resto in (f+'-wal', f+'-shm'):
     except FileNotFoundError: pass
 n=os.path.getsize(f); a=int(n*0.25); b=int(n*0.65)
 with open(f,'r+b') as h:
-    h.seek(a); h.write(os.urandom(b-a))"
+    h.seek(a); h.write(os.urandom(b-a))" || MONTADO2=""
 docker start "$NOM2" >/dev/null 2>&1
 ARR=""
 for _ in $(seq 1 60); do
@@ -521,8 +659,13 @@ for _ in $(seq 1 60); do
 done
 # Falsador: sin la sonda de `lifespan`, el arranque se come la base corrupta — o
 # revienta en la migración de esquema y el contenedor no llega ni a contestar.
-[ -n "$ARR" ] && ok "y un índice corrupto EN EL ARRANQUE también se cura" \
-  || fallo "un índice corrupto en el arranque se cura" "200 con 30.050 entradas" "cod=$cod entradas=${N2:-?}"
+if [ -z "$MONTADO2" ]; then
+  no_medido "un índice corrupto en el arranque se cura" "el índice nunca se llegó a dañar"
+elif [ -n "$ARR" ]; then
+  ok "y un índice corrupto EN EL ARRANQUE también se cura"
+else
+  fallo "un índice corrupto en el arranque se cura" "200 con 30.050 entradas" "cod=$cod entradas=${N2:-?}"
+fi
 fi   # cierra la guarda de la precondición (bloque de corrupción)
 
 limpiar2
@@ -561,34 +704,52 @@ docker run -d --name "$NOM3" -p "127.0.0.1:$P3:8077" \
   -e LLMINBOX_ROSTER=/censo.json -e LLMINBOX_WIKI=/wiki \
   -v "$TMP3:/l:ro" -v "$D3:/datos" -v "$W3:/wiki:ro" \
   -v "$PWD/roster.example.json:/censo.json:ro" "${IMAGEN:-llminbox:test}" >/dev/null
-for _ in $(seq 1 40); do curl -sf -m 2 "http://127.0.0.1:$P3/health" >/dev/null 2>&1 && break; sleep 1; done
+esperar_salud "http://127.0.0.1:$P3" 40 "el contenedor de las citas"
 sleep 4
 C3=(-H "X-Llminbox-Token: $TOK"); Y="http://127.0.0.1:$P3"
 # Falsador: con el mapeo por parecido esto sale con una línea ✗ («NO existe esa
 # entrada»), porque busca el sello de la cola dentro del tronco.
-SAL=$(curl -s -m 30 "${C3[@]}" "$Y/wiki/citas?solo_rotas=true")
-grep -q '✗' <<<"$SAL" \
-  && fallo "la cita a la cola resuelve" "sin ✗" "$(grep -m1 '✗' <<<"$SAL")" \
-  || ok "la cita a la cola resuelve contra la COLA, no contra el tronco"
+SAL=$(cuerpo -m 30 "${C3[@]}" "$Y/wiki/citas?solo_rotas=true")
+case "$SAL" in
+  NO-MEDIDO:*) no_medido "la cita a la cola resuelve" "${SAL#NO-MEDIDO:}" ;;
+  *) grep -q '✗' <<<"$SAL" \
+       && fallo "la cita a la cola resuelve" "sin ✗" "$(grep -m1 '✗' <<<"$SAL")" \
+       || ok "la cita a la cola resuelve contra la COLA, no contra el tronco" ;;
+esac
 # Falsador: si el gate volviera a exigir el ancla en la PRIMERA línea, esta cita —a
 # una cabecera que su autor partió— saldría rota, que es lo que hacía.
 printf -- '\nCabecera partida. [source: repo/LEDGER.md 2026-07-05T08:08:08Z]\n' >> "$W3/p.md"; sleep 4
-curl -s -m 30 "${C3[@]}" "$Y/wiki/citas?solo_rotas=true" | grep -q '2026-07-05T08:08:08' \
-  && fallo "una cabecera PARTIDA resuelve igual" "sin ✗ para ese sello" "sale rota" \
-  || ok "una cabecera PARTIDA en dos líneas resuelve igual"
+SAL2=$(cuerpo -m 30 "${C3[@]}" "$Y/wiki/citas?solo_rotas=true")
+case "$SAL2" in
+  NO-MEDIDO:*) no_medido "una cabecera PARTIDA resuelve igual" "${SAL2#NO-MEDIDO:}" ;;
+  *) grep -q '2026-07-05T08:08:08' <<<"$SAL2" \
+       && fallo "una cabecera PARTIDA resuelve igual" "sin ✗ para ese sello" "sale rota" \
+       || ok "una cabecera PARTIDA en dos líneas resuelve igual" ;;
+esac
 # Y EL REVERSO, que es lo que impide que el arreglo se coma el gate: un sello que
 # sólo aparece en la PROSA de una entrada NO vale como cita. Sin esta comprobación,
 # relajar la regla para tragar cabeceras largas se lleva por delante la garantía.
 printf -- '\nEco en la prosa. [source: repo/LEDGER.md 2026-07-09T09:09:09Z]\n' >> "$W3/p.md"; sleep 4
-curl -s -m 30 "${C3[@]}" "$Y/wiki/citas?solo_rotas=true" | grep -q '2026-07-09T09:09:09' \
-  && ok "y un sello citado desde la PROSA sigue sin valer (el eco no es el ancla)" \
-  || fallo "un sello que sólo está en la prosa no puede resolver" "sale roto" "resolvió"
+SAL3=$(cuerpo -m 30 "${C3[@]}" "$Y/wiki/citas?solo_rotas=true")
+case "$SAL3" in
+  NO-MEDIDO:*) no_medido "un sello que sólo está en la prosa no puede resolver" "${SAL3#NO-MEDIDO:}" ;;
+  *) grep -q '2026-07-09T09:09:09' <<<"$SAL3" \
+       && ok "y un sello citado desde la PROSA sigue sin valer (el eco no es el ancla)" \
+       || fallo "un sello que sólo está en la prosa no puede resolver" "sale roto" "resolvió" ;;
+esac
 # CONTROL: que el gate sepa decir ✗ cuando toca. Sin esto, un gate que nunca ve
 # nada también pasaría la comprobación de arriba — el verde vacío de siempre.
 printf -- '\nOtro hecho. [source: repo/WIKI-QUEUE.md 2026-01-01T00:00:00Z]\n' >> "$W3/p.md"; sleep 4
-curl -s -m 30 "${C3[@]}" "$Y/wiki/citas?solo_rotas=true" | grep -q '✗' \
-  && ok "y un sello inventado SÍ sale roto (el gate no está mudo)" \
-  || fallo "un sello inventado tiene que salir roto" "una línea ✗" "ninguna"
+# Éste es el CONTROL de que el gate no está mudo: si se mide sobre una
+# respuesta muerta, dice «el gate está mudo» y acusa al producto de lo
+# contrario de lo que pasa.
+SAL4=$(cuerpo -m 30 "${C3[@]}" "$Y/wiki/citas?solo_rotas=true")
+case "$SAL4" in
+  NO-MEDIDO:*) no_medido "un sello inventado tiene que salir roto" "${SAL4#NO-MEDIDO:}" ;;
+  *) grep -q '✗' <<<"$SAL4" \
+       && ok "y un sello inventado SÍ sale roto (el gate no está mudo)" \
+       || fallo "un sello inventado tiene que salir roto" "una línea ✗" "ninguna" ;;
+esac
 limpiar3
 
 echo "── el cerrojo de escritura: pasada corta y lectura que no depende de ella ──"
@@ -613,7 +774,7 @@ docker run -d --name "$NOM4" -p "127.0.0.1:$P4:8077" \
   -e LLMINBOX_DB=/tmp/h.sqlite -e LLMINBOX_POLL=1 -e LLMINBOX_ROSTER=/censo.json \
   -v "$T4:/l:ro" -v "$PWD/roster.example.json:/censo.json:ro" \
   "${IMAGEN:-llminbox:test}" >/dev/null || { echo "no arrancó $NOM4"; FALLOS=$((FALLOS+1)); }
-for _ in $(seq 1 40); do curl -sf -m 2 "http://127.0.0.1:$P4/health" >/dev/null 2>&1 && break; sleep 1; done
+esperar_salud "http://127.0.0.1:$P4" 40 "el contenedor del cerrojo"
 sleep 3
 U4="http://127.0.0.1:$P4"
 
@@ -750,7 +911,7 @@ docker run -d --name "$NOM7" -p "127.0.0.1:$P7:8077" \
   -e LLMINBOX_DB=/tmp/h.sqlite -e LLMINBOX_POLL=1 -e LLMINBOX_ROSTER=/censo.json \
   -v "$T7:/l:ro" -v "$PWD/roster.example.json:/censo.json:ro" \
   "${IMAGEN:-llminbox:test}" >/dev/null || { echo "no arrancó $NOM7"; FALLOS=$((FALLOS+1)); }
-for _ in $(seq 1 40); do curl -sf -m 2 "http://127.0.0.1:$P7/health" >/dev/null 2>&1 && break; sleep 1; done
+esperar_salud "http://127.0.0.1:$P7" 40 "el contenedor del tope de cuerpos"
 sleep 3
 V7="http://127.0.0.1:$P7"
 # CONTROL primero: sin cuerpos el limit alto SÍ se respeta. Sin esto, un endpoint
@@ -781,7 +942,7 @@ docker run -d --name "$NOM6" -p "127.0.0.1:$P6:8077" \
   -e LLMINBOX_DB=/tmp/h.sqlite -e LLMINBOX_POLL=1 -e LLMINBOX_ROSTER=/censo.json \
   -v "$T6:/l:ro" -v "$PWD/roster.example.json:/censo.json:ro" \
   "${IMAGEN:-llminbox:test}" >/dev/null || { echo "no arrancó $NOM6"; FALLOS=$((FALLOS+1)); }
-for _ in $(seq 1 40); do curl -sf -m 2 "http://127.0.0.1:$P6/health" >/dev/null 2>&1 && break; sleep 1; done
+esperar_salud "http://127.0.0.1:$P6" 40 "el contenedor del ledger de archivo"
 sleep 3
 B6=$(curl -s -m 20 "${A[@]}" "http://127.0.0.1:$P6/inbox/bob-reviewer")
 # CONTROL primero: el ledger VIVO tiene que estar, o lo de abajo pasaría con el
@@ -815,7 +976,7 @@ docker run -d --name "$NOM5" -p "127.0.0.1:$P5:8077" \
   -e LLMINBOX_DB=/tmp/h.sqlite -e LLMINBOX_POLL=1 -e LLMINBOX_ROSTER=/censo.json \
   -v "$T5:/l:ro" -v "$PWD/roster.example.json:/censo.json:ro" \
   "${IMAGEN:-llminbox:test}" >/dev/null || { echo "no arrancó $NOM5"; FALLOS=$((FALLOS+1)); }
-for _ in $(seq 1 40); do curl -sf -m 2 "http://127.0.0.1:$P5/health" >/dev/null 2>&1 && break; sleep 1; done
+esperar_salud "http://127.0.0.1:$P5" 40 "el contenedor del router por @"
 sleep 3
 # SIN SELLO, Y APENDIZADA DESPUÉS DE LA PRIMERA INDEXACIÓN — que es el escenario
 # real y el único que distingue las dos cosas. El 15,7 % del corpus no trae sello
