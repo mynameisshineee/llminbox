@@ -899,6 +899,13 @@ def reindex(ledger: str, path: str, con) -> dict:
         if (not e.por_arroba) or previos or (lp.ARROBA_DESDE and e.ts and e.ts >= lp.ARROBA_DESDE):
             for w in e.to:
                 dest.append((ledger, e.sha, w))
+            # ⑩ — la difusión TAMBIÉN se persiste (PARSER_V 6): una entrada
+            # dirigida sólo a «flota»/«equipo» no generaba fila y ninguna
+            # bandeja la recibía. La separación difusión/`to` del troceador se
+            # conserva — quien necesita distinguir (p.ej. /lint) filtra por
+            # DIFSET al leer, no por ausencia de fila.
+            for w in e.difusion:
+                dest.append((ledger, e.sha, w))
         nuevas += 1
 
     con.executemany("INSERT OR REPLACE INTO entries (ledger,eid,arrival,seq,line_no,"
@@ -1477,6 +1484,18 @@ async def lifespan(app: FastAPI):
         con.execute("DELETE FROM files")
         REDERIVAR.update(LEDGERS)
         con.execute("INSERT OR REPLACE INTO meta VALUES ('roster_v', ?)", (h_censo,))
+    # TROCEADOR cambiado: mismo trato que el censo — lo derivado se recalcula,
+    # los cursores se quedan. Sin este gate, un salto de PARSER_V solo alcanzaba
+    # a los ledgers que cambiaran de tamaño/fecha después del deploy: la difusión
+    # de ⑩ (PARSER_V 6) habría sido efectiva solo para correo futuro, y las
+    # entradas históricas a «flota» seguirían sin bandeja para siempre.
+    f_parser = con.execute("SELECT v FROM meta WHERE k='parser_v'").fetchone()
+    if f_parser and f_parser["v"] != str(lp.PARSER_V):
+        print(f"[arranque] TROCEADOR cambiado (v{f_parser['v']} → v{lp.PARSER_V}) — "
+              f"recalculo destinatarios; los cursores se quedan", flush=True)
+        con.execute("DELETE FROM recipients")
+        con.execute("DELETE FROM files")
+        REDERIVAR.update(LEDGERS)
     con.execute("INSERT OR REPLACE INTO meta VALUES ('parser_v', ?)", (str(lp.PARSER_V),))
     con.commit()
     con.close()
@@ -1739,8 +1758,13 @@ def entries(respuesta: Response,ledger: str | None = None, to: str | None = None
     w, p = [], []
     if ledger:
         w.append("e.ledger=?"); p.append(ledger)
+    # `actor` y `to` se CANONIZAN al leer, igual que el indexador canoniza al
+    # escribir (⑪, hallazgo de db-mig 2026-08-10T08:56Z con controles ±):
+    # comparar la cadena cruda hacía que `to=albert` diera 0 sobre 182 filas
+    # existentes con HTTP 200 y sin aviso — y esta es la capa con la que la
+    # flota VERIFICA enrutado, así que un 0 falso dispara re-trabajo real.
     if actor:
-        w.append("e.actor=?"); p.append(actor)
+        w.append("e.actor=?"); p.append(lp.canonico(actor))
     if tipo:
         w.append("e.tipo=?"); p.append(tipo)
     if since:
@@ -1750,7 +1774,7 @@ def entries(respuesta: Response,ledger: str | None = None, to: str | None = None
     join = ""
     if to:
         join = "JOIN recipients r ON r.ledger=e.ledger AND r.eid=e.eid"
-        w.append("r.who=?"); p.append(to)
+        w.append("r.who=?"); p.append(lp.canonico(to))
     w.append("e.ausente IS NULL")           # lo desaparecido no se sirve como vigente
     sql = (f"SELECT e.ledger,e.eid,e.arrival,e.seq,e.ts,e.actor,e.tipo,e.line_no,e.head"
            f"{',e.body' if cuerpo else ''} FROM entries e {join}"
@@ -1840,6 +1864,15 @@ def inbox(agent: str, limit: int = Query(30, le=200), only: str | None = None):
     # Los nombres cuyo correo cae aquí: el suyo y los que escuche por censo. El cursor
     # sigue siendo de `agent` — escuchar un flujo no es consumirlo para su dueño.
     nombres = lp.escuchados(agent)
+    # ⑩ (hallazgo de frontend·cfocockpit, 2026-08-10): la difusión se EXPANDE en
+    # la entrega. Una entrada dirigida sólo a «flota» dependía de que cada agente
+    # la reconociera por su cuenta — ahora cada bandeja la recibe como dirigida,
+    # que es lo que «difusión» significa. Sólo entrega (/inbox): el cursor sigue
+    # siendo del agente, y /entries?to= sigue siendo un filtro literal canonizado.
+    for dif in lp.DIFUSION:
+        c = lp.canonico(dif)
+        if c not in nombres:
+            nombres.append(c)
     marcas = ",".join("?" * len(nombres))
     out, tope = [], {}
     excluidos = []
