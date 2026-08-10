@@ -243,12 +243,23 @@ def canon_identidad(nombre: str) -> str | None:
         return None
     bajo = nombre.lower()
     if ROLES_ALIAS is not None:
+        # CANON PRIMERO, y el orden es una cicatriz, no una preferencia: con
+        # ROLES_ALIAS delante, 'wiki-vault' resolvía a su rol 'wiki' y TODO el
+        # camino aguas abajo que trabaja con el nombre de agente —escuchados()
+        # busca en `recipients` lo que el parser escribió, y el parser escribe
+        # 'wiki-vault', jamás 'wiki'— devolvía bandeja VACÍA para toda identidad
+        # con alias en el fichero firmado. Lo cazó el falsador vivo post-deploy
+        # («nada nuevo» con 500+ entradas pendientes), no la suite: los tests
+        # asertaban códigos y cursores, no contenido — ver
+        # test_inbox_montado_muestra_contenido. El cursor no cambia con el
+        # orden: clave_cursor() pasa por rol_de() igual para 'wiki-vault' que
+        # para 'wiki'.
+        if bajo in CANON:
+            return CANON[bajo]
         if bajo in ROLES_ALIAS:
             return ROLES_ALIAS[bajo]
         if bajo in ROLES_ALIAS.values():
             return bajo
-        if bajo in CANON:
-            return CANON[bajo]
         if bajo in ROLES_VALIDOS:
             return bajo
         return None

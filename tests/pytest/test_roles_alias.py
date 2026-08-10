@@ -153,3 +153,24 @@ def test_valor_con_mayusculas_normaliza(tmp_path, monkeypatch):
         c.headers.update({"X-Llminbox-Token": "test-token"})
         assert c.get("/inbox/front").status_code == 200
         assert c.get("/inbox/fe").status_code == 200
+
+
+def test_inbox_montado_muestra_contenido(tmp_path, monkeypatch):
+    """La lección del falsador vivo post-deploy (2026-08-10): con el fichero
+    firmado montado, /inbox/backend devolvía 200 con bandeja VACÍA — la
+    resolución colapsaba 'backend' a su rol 'be' ANTES de mirar CANON, y
+    escuchados('be') no casa con lo que el parser escribió en `recipients`
+    ('backend'). Toda la suite pasaba porque nadie asertaba CONTENIDO.
+
+    FALSADOR: reordenar la rama montada (ROLES_ALIAS antes que CANON) devuelve
+    la bandeja vacía y esto se pone rojo — un 200 sin cuerpo ya no cuela.
+    """
+    s = _con_roles_alias(tmp_path, monkeypatch)
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        r = c.get("/inbox/backend")
+        assert r.status_code == 200
+        assert "primera" in r.text, (
+            "bandeja vacía para un alias con correo pendiente — la resolución "
+            "está colapsando el nombre a rol antes de tiempo")
