@@ -22,11 +22,19 @@ import pytest
 
 LLMI = str(Path(__file__).resolve().parents[2] / "llmi")
 
+# Formato EXACTO del pie de producción (servicio.py, final de inbox()):
+# `marcar leído — pega esto tal cual:` + POST + una línea JSON. La primera
+# versión de este stub inventó un formato propio (`marcar leído: … → k:v`)
+# que casaba con el sed VIEJO del CLI — el test pasaba mientras producción
+# no avanzaba un solo cursor. Un stub que no habla como el servidor real
+# certifica un CLI que no funciona: cazado por el falsador vivo de ③.
 CUERPO_OK = (
     "── demo-ledger · 1 de 1 para ti ──\n"
     "  abc123 #5 L10 2026-08-10T12:00:00 cto-A [REQUEST]\n"
     "    ### [cto-A → backend · REQUEST] primera\n"
-    "· marcar leído: POST → demo-ledger:5\n"
+    "\n\nmarcar leído — pega esto tal cual:\n"
+    "  POST /inbox/ok/leido\n"
+    '  {"hasta":{"demo-ledger":5,"otro-ledger":9}}\n'
 )
 
 
@@ -113,17 +121,22 @@ def test_servicio_caido_exit_3(tmp_path):
 def test_carril_se_propaga_al_leido(stub, tmp_path):
     """③ de punta a punta por el CLI real: `--carril demo` debe llegar como
     cabecera `X-Llminbox-Carril` en el POST /leido — que es el ÚNICO sitio
-    donde el carril decide algo (el GET muestra todo por diseño).
+    donde el carril decide algo (el GET muestra todo por diseño). El body es
+    el `hasta` COMPLETO del pie del servicio, con los ledgers de fuera del
+    carril incluidos: el recorte lo hace el SERVIDOR por la cabecera (probado
+    en test_carril.py), no este script.
 
-    FALSADOR: si el parseo de `--carril` se tragara el flag sin propagarlo
-    (args+=() sin la rama), el POST llegaría sin cabecera y esto lo vería."""
+    FALSADOR doble: sin la rama `--carril` del parseo, el POST llega sin
+    cabecera; y con la extracción del pie rota (el sed viejo que buscaba un
+    formato inexistente), el POST no llega — `leidos` vacío lo delata."""
     r = _llmi(["inbox", "ok", "--carril", "demo"], tmp_path,
               f"http://127.0.0.1:{stub.server_port}")
     assert r.returncode == 0
     leidos = [p for p in stub.posts if p["path"].endswith("/leido")]
-    assert leidos, "el CLI no llegó a marcar leído"
+    assert leidos, "el CLI no llegó a marcar leído — la extracción del pie está rota"
     assert leidos[0]["headers"].get("X-Llminbox-Carril") == "demo"
-    assert json.loads(leidos[0]["body"]) == {"hasta": {"demo-ledger": 5}}
+    assert json.loads(leidos[0]["body"]) == {"hasta": {"demo-ledger": 5, "otro-ledger": 9}}
+    assert "cursor avanzado" in r.stdout
 
 
 def test_bik_carril_equivale_al_flag(stub, tmp_path):

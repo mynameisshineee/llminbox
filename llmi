@@ -614,13 +614,19 @@ case "$cmd" in
           out="$(_get_inbox_o_422 "$1" "${2:-30}")"; rc=$?
           [ $rc -eq 0 ] || exit $rc
           printf '%s\n' "$out"
-          marcas="$(sed -n 's/.*marcar leído:.*→ //p' <<<"$out")"
-          if [ -n "$marcas" ]; then
-            json="$(python3 -c 'import sys,json;print(json.dumps({"hasta":{k:int(v) for k,v in (x.split(":") for x in sys.argv[1].split())}}))' "$marcas")"
+          # El pie del servicio es `marcar leído — pega esto tal cual:` + una línea
+          # `{"hasta":{...}}`. El sed antiguo buscaba `marcar leído: … → ` — un
+          # formato que el servicio NO emite (¿nunca emitió?): la extracción moría
+          # en silencio y `inbox` se quedaba en peek con otro nombre. Cazado por el
+          # falsador vivo de ③ (2026-08-10): el cursor del carril no avanzaba ni
+          # con el carril bien puesto. Ahora se coge el JSON del pie tal cual — el
+          # mismo payload que el humano pegaría — y el ámbito lo decide el
+          # servidor por la cabecera X-Llminbox-Carril, no este script.
+          json="$(sed -n 's/^ *\({"hasta":.*}\)$/\1/p' <<<"$out" | tail -1)"
+          if [ -n "$json" ]; then
             Hc=("${H[@]}"); [ -n "$carril" ] && Hc+=(-H "X-Llminbox-Carril: $carril")
-            curl -sf -m 10 "${Hc[@]}" -H 'Content-Type: application/json' -d "$json" \
-                 -o /dev/null "$API/inbox/$1/leido" && echo "· cursor avanzado: $marcas" \
-                 "${carril:+(carril: $carril)}"
+            resp="$(curl -sf -m 10 "${Hc[@]}" -H 'Content-Type: application/json' -d "$json" \
+                 "$API/inbox/$1/leido")" && echo "· cursor avanzado ${carril:+(carril: $carril) }→ $resp"
           fi ;;
   peek)   [ $# -ge 1 ] || { uso; exit 2; }; vivo || { sin_servicio; exit 3; }
           _get_inbox_o_422 "$1" "${2:-30}"; exit $? ;;
