@@ -16,7 +16,7 @@ import sqlite3
 
 from fastapi.testclient import TestClient
 
-from conftest import db_directa, sembrar_schema_y_meta
+from conftest import construir, db_directa, sembrar_schema_y_meta
 
 
 def test_migracion_min_no_max(servicio):
@@ -205,3 +205,53 @@ def test_interaccion_leido_por_rol_sin_migracion(servicio, monkeypatch):
     ).fetchone()
     con.close()
     assert fila["last_arrival"] == 50
+
+
+def test_migracion_no_fija_flag_con_censo_vacio(tmp_path, monkeypatch):
+    """(D) El flag de idempotencia NO se fija si el censo llegó vacío — el
+    falsador exacto del review×3: un fallo transitorio leyendo roster.json en
+    el primer arranque no puede dejar la fusión cancelada PARA SIEMPRE.
+
+    Boot 1 (LLMINBOX_ROSTER → ruta inexistente): la migración no agrupa nada
+    (censo vacío ⇒ todo cae por la rama fantasma) y NO escribe
+    meta['cursores_migrados_v'] — las filas alias quedan separadas.
+    Boot 2 (roster sano): la migración SÍ corre y fusiona por MIN.
+
+    FALSADOR del propio test: revertir el guard `censo_valido` en
+    migrar_alias_a_rol (fijar el flag incondicionalmente, como antes del fix)
+    deja el boot 2 sin reintentar y la aserción final cae con dos filas.
+    """
+    s1 = construir(tmp_path, monkeypatch,
+                   extra_env={"LLMINBOX_ROSTER": str(tmp_path / "no-existe.json")})
+    con = sembrar_schema_y_meta(s1)
+    con.execute("INSERT INTO cursors VALUES ('backend','demo-ledger',100,'x')")
+    con.execute("INSERT INTO cursors VALUES ('backend-biklabs','demo-ledger',40,'x')")
+    con.commit()
+    con.close()
+
+    with TestClient(s1.app):
+        pass
+
+    con = db_directa(s1)
+    flag = con.execute("SELECT v FROM meta WHERE k='cursores_migrados_v'").fetchone()
+    filas = con.execute(
+        "SELECT agent FROM cursors WHERE ledger='demo-ledger' ORDER BY agent"
+    ).fetchall()
+    con.close()
+    assert flag is None, "el flag se fijó con censo vacío — la fusión no se reintentaría jamás"
+    assert [f["agent"] for f in filas] == ["backend", "backend-biklabs"]
+
+    # Boot 2: mismo tmp_path (misma BD), roster ya sano (construir lo escribe y
+    # apunta LLMINBOX_ROSTER de vuelta a él). El cambio de huella de censo NO
+    # toca cursores (ver [arranque] CENSO cambiado en servicio.py) — lo que
+    # fusiona aquí es la migración reintentada, no un reset.
+    s2 = construir(tmp_path, monkeypatch)
+    with TestClient(s2.app):
+        pass
+
+    con = db_directa(s2)
+    filas = con.execute(
+        "SELECT agent, last_arrival FROM cursors WHERE ledger='demo-ledger'"
+    ).fetchall()
+    con.close()
+    assert [(f["agent"], f["last_arrival"]) for f in filas] == [("be", 40)]

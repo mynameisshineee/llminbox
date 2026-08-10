@@ -170,28 +170,82 @@ CANON = {a.lower(): a for a in AGENTES}
 ROLES_VALIDOS = {r.lower() for r in ROL_DE.values()}   # ~14 tokens: be,cto,fe,wiki...
 
 
+def _cargar_roles_por_alias():
+    """Lee `roles-por-alias.json` — la fuente FIRMADA del censo (Albert, ver
+    `_firmado_por`/`_orden` del propio fichero) — si está montada.
+
+    Antes, `canon_identidad()` derivaba su unión de `roster.json` en exclusiva.
+    Los dos ficheros eran byte-idénticos el 2026-08-10, pero sin ningún gate que
+    lo garantice: un alta firmada AQUÍ sin tocar `roster.json` (que cada operador
+    edita a mano en su máquina) devolvía 422 a una identidad legítima. Mismo
+    patrón que `_cargar_carriles()` en servicio.py: env var vacía por defecto
+    (`LLMINBOX_ROLES_ALIAS`) + mount read-only del fichero real — quien clone
+    esto no se encuentra una fuente ajena montada sola.
+
+    Devuelve None si la env var está vacía o el fichero no se deja leer — la
+    señal de "no montado" que `canon_identidad()` usa para DEGRADAR a la
+    conducta de hoy (roster.json) en vez de fallar abierto.
+
+    ⚠️ `sin_rol` NO se carga como veto, y no es un descuido. Un primer intento
+    de este fix devolvía 422 a todo nombre listado en `sin_rol`, leyendo su
+    nombre como "no es identidad". Falsado contra el índice vivo el 2026-08-10:
+    los 13 nombres de `sin_rol` están TODOS en `roster.json`, y dos tienen
+    cursores ACTIVOS (`bikeus` en 2 ledgers, `lead-b-cfo-cockpit` en 1) —
+    vetarlos habría roto la bandeja del carril bik.eus en el deploy. `sin_rol`
+    significa "sin ROL que agrupe" (no colapsan en la migración ②, cada uno es
+    su propia clave de cursor vía `rol_de()`), no "sin bandeja".
+    """
+    import json as _json
+    import os as _os
+    ruta = _os.environ.get("LLMINBOX_ROLES_ALIAS", "")
+    if not ruta:
+        return None
+    try:
+        with open(ruta, encoding="utf-8") as fh:
+            d = _json.load(fh)
+    except Exception as e:
+        print(f"[roles-alias] no pude leer {ruta}: {e} — degrado a roster.json "
+              f"(riesgo documentado: un alta firmada aquí sin tocar roster.json "
+              f"no se vería hasta que el fichero vuelva a leerse)", flush=True)
+        return None
+    return {k.lower(): v for k, v in d.get("rol_por_alias", {}).items()}
+
+
+ROLES_ALIAS = _cargar_roles_por_alias()
+
+
 def canon_identidad(nombre: str) -> str | None:
     """Forma canónica de `nombre` para identidad de cursor, o None si no resuelve.
 
-    Unión = agentes de roster.json ∪ humanos ∪ alias de humanos ∪ difusión (=CANON,
-    que el informe de censo del 2026-08-10 verificó BYTE A BYTE idéntico a los 51
-    nombres de roles-por-alias.json) ∪ los propios tokens de rol ("be","cto",...),
-    que SÍ hace falta añadir aparte: roles-por-alias.json los tiene como VALORES,
-    no como nombres, y roster.json tampoco los lista como agente. Se derivan de
-    ROL_DE (ya construido desde roster.json) en vez de montar una segunda copia de
-    roles-por-alias.json — evita crear el mismo problema de sincronización que ya
-    tiene roster.json↔roles-por-alias.json, en la dirección contraria.
-    FALSADOR: si roster.json y roles-por-alias.json divergen algún día (hoy: 0
-    discrepancias, sin mecanismo que lo garantice), esta función usa la copia de
-    roster.json, que puede quedar desactualizada respecto al censo firmado. No
-    hay gate hoy que lo detecte — ver nota de seguimiento en §7.
+    Con `roles-por-alias.json` MONTADO (`LLMINBOX_ROLES_ALIAS`), la unión del
+    encargo: `rol_por_alias` (claves = alias, valores = rol) ∪ sus propios
+    tokens de rol sueltos ∪ agentes/humanos/difusión de roster.json (CANON).
+    Los nombres de `sin_rol` NO vetan nada: si están en roster resuelven como
+    ellos mismos (caso `bikeus`, con cursores vivos — ver docstring de
+    `_cargar_roles_por_alias`), y si no están en ninguna fuente no resuelven,
+    como cualquier otro nombre desconocido.
+
+    SIN montar (env var vacía o fichero ilegible): degrada a la conducta de
+    hoy — sólo roster.json (CANON ∪ ROLES_VALIDOS) — SIN fail-open. El riesgo
+    de que las dos fuentes diverjan queda documentado, no resuelto: mientras
+    no esté montado, un alta que sólo exista en roles-por-alias.json sigue sin
+    resolver, igual que antes de este fix.
     """
     if not nombre:
         return None
-    if nombre.lower() in CANON:
-        return CANON[nombre.lower()]
-    if nombre.lower() in ROLES_VALIDOS:
-        return nombre.lower()
+    bajo = nombre.lower()
+    if ROLES_ALIAS is not None:
+        if bajo in ROLES_ALIAS:
+            return ROLES_ALIAS[bajo]
+        if bajo in ROLES_ALIAS.values():
+            return bajo
+        if bajo in CANON:
+            return CANON[bajo]
+        return None
+    if bajo in CANON:
+        return CANON[bajo]
+    if bajo in ROLES_VALIDOS:
+        return bajo
     return None
 
 

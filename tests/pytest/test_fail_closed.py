@@ -94,6 +94,10 @@ def test_inbox_por_rol_no_422(cliente):
     FALSADOR: si 'be' diera 422 aquí, ①(rol) y ②(migración, que escribe filas
     bajo agent='be') quedarían inconsistentes entre sí — la migración dejaría
     cursores bajo una clave que el propio fail-closed rechaza al leer.
+
+    `== 200`, no `!= 422`: esta última deja pasar CUALQUIER error que no sea
+    422 —un 500 por una excepción no capturada incluido— como si fuera éxito,
+    que es precisamente la clase de aserción débil que el review×3 marcó.
     """
     r = cliente.get("/inbox/be")
-    assert r.status_code != 422
+    assert r.status_code == 200

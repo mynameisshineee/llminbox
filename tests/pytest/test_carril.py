@@ -3,7 +3,9 @@
 """
 from __future__ import annotations
 
-from conftest import db_directa
+from fastapi.testclient import TestClient
+
+from conftest import construir, db_directa
 
 
 def test_carril_filtra_solo_su_ledger(cliente, servicio):
@@ -74,3 +76,24 @@ def test_carril_ledger_se_resuelve_de_verdad(servicio):
     probando la rama de fallback permisivo sin saberlo.
     """
     assert servicio.CARRIL_LEDGER.get("demo") == "demo-ledger"
+
+
+def test_carril_ledger_vacio_por_defecto_sin_mapa(tmp_path, monkeypatch):
+    """(F) Camino DEFAULT real del compose: `LLMINBOX_CARRILES=""` y
+    `LLMINBOX_MOUNTS_JSON=""` (docker-compose.yml sin override — ver ese
+    fichero) ⇒ `CARRIL_LEDGER == {}` y el servicio arranca igual, sin ámbito
+    de carril activado en silencio ni excepción al importar.
+
+    FALSADOR: si `_cargar_carriles()` no tolerara las dos rutas vacías (p.ej.
+    intentando abrir "" como fichero en vez de cortar por el `if not ruta_*`
+    de antes), el import de `servicio` reventaría antes de llegar aquí, o
+    `CARRIL_LEDGER` saldría con un mapa fantasma en vez de vacío.
+    """
+    s = construir(tmp_path, monkeypatch,
+                  extra_env={"LLMINBOX_CARRILES": "", "LLMINBOX_MOUNTS_JSON": ""})
+    assert s.CARRIL_LEDGER == {}
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        r = c.get("/inbox/backend")
+        assert r.status_code == 200

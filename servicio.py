@@ -400,6 +400,19 @@ def migrar_alias_a_rol(con: sqlite3.Connection) -> None:
     if ya and ya["v"] == MIGRACION_ALIAS_V:
         return
 
+    # CENSO VÁLIDO — mismo criterio que ya usa `huella_censo()`: `lp.AGENTES` no
+    # vacío. Si `roster.json` falla al leerse en este arranque (típicamente:
+    # el primero, antes de que exista el fichero), TODA fila de `cursors` cae
+    # por la rama "fantasma" de abajo — `lp.rol_de()` no agrupa nada porque no
+    # hay `rol` que leer, y `lp.canon_identidad()` no resuelve nada porque el
+    # censo está vacío — así que esta pasada no fusiona una sola fila. Fijar
+    # IGUALMENTE el flag de idempotencia dejaría un arranque POSTERIOR con
+    # censo sano sin reintentar: la migración real no correría nunca. Ver
+    # falsador (D, review×3 2026-08-10): primer boot con `LLMINBOX_ROSTER`
+    # inexistente ⇒ NO se fija el flag y las filas quedan sin fusionar;
+    # segundo boot con censo sano ⇒ SÍ fusiona.
+    censo_valido = bool(lp.AGENTES)
+
     # BACKUP ANTES DE TOCAR. API de backup online de sqlite3 — funciona con WAL,
     # no bloquea escritores, no requiere parar el servicio. Vive en el MISMO
     # volumen (llminbox-data), junto al índice: si el volumen se pierde, se pierde
@@ -442,7 +455,12 @@ def migrar_alias_a_rol(con: sqlite3.Connection) -> None:
             if alias != rol:
                 con.execute("DELETE FROM cursors WHERE agent=? AND ledger=?", (alias, ledger))
 
-    con.execute("INSERT OR REPLACE INTO meta VALUES ('cursores_migrados_v', ?)", (MIGRACION_ALIAS_V,))
+    if censo_valido:
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('cursores_migrados_v', ?)", (MIGRACION_ALIAS_V,))
+    else:
+        print("[migración] censo vacío/no cargado (roster.json ilegible o ausente en "
+              "este arranque) — NO fijo el flag de idempotencia: se reintenta en el "
+              "próximo arranque con censo sano", flush=True)
     con.execute("INSERT OR REPLACE INTO meta VALUES ('cursores_migracion_backup', ?)", (backup_path,))
     con.commit()
     print(f"[migración] {len(cambios)} grupos (rol,ledger) colapsados por MIN — "
@@ -1512,9 +1530,14 @@ def resolver_o_422(nombre: str) -> str:
     """
     canon = lp.canon_identidad(nombre)
     if canon is None:
+        # El mensaje nombra la fuente que DE VERDAD se consultó: con el fichero
+        # firmado montado, decir sólo "roster.json" mandaría a quien depura a
+        # editar el fichero equivocado.
+        fuente = ("roles-por-alias.json (censo firmado) ∪ roster.json"
+                  if lp.ROLES_ALIAS is not None else "roster.json")
         raise HTTPException(
             422,
-            f"'{nombre}' no resuelve en el censo (roster.json: agentes/humanos/"
+            f"'{nombre}' no resuelve en el censo ({fuente}: agentes/humanos/"
             f"difusión, o uno de los roles {sorted(lp.ROLES_VALIDOS)}) — "
             f"date de alta o revisa el nombre")
     return canon
