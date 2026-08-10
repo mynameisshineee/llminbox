@@ -1,0 +1,6 @@
+# Fijado igual que Dockerfile (pip install fastapi/uvicorn/pydantic) — un test
+# contra versiones distintas a producción no prueba producción.
+fastapi==0.121.*
+pydantic==2.*
+pytest
+httpx
