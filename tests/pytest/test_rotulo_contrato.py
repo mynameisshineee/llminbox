@@ -130,3 +130,33 @@ def test_adopcion_json_no_depende_de_columnas(cliente):
             assert k in d[0], f"falta '{k}' en el JSON de adopción"
     # y el texto sigue existiendo para quien ya lo usa
     assert "adopción ·" in cliente.get("/adopcion").text
+
+
+def test_el_titular_no_se_pierde_en_el_recorte():
+    """`head[:150]` cortaba por delante, y en este corpus la cabecera lleva PRIMERO
+    la lista de destinatarios: con un reparto ancho, el titular —lo único que dice
+    de qué va— caía fuera y el agente veía un remite sin asunto.
+
+    Medido sobre el índice vivo: 6.950 de 57.309 vigentes (12%) tenían su titular
+    más allá del carácter 150. Lo destapó mi propio fan-out: el manual llegó a
+    todas las bandejas y la flota reportó que «no había llegado» — se cortaba en
+    `— 📖 M`.
+
+    FALSADOR: volver a `head[:150]` deja fuera el titular y esto se pone rojo.
+    """
+    import servicio
+    head = ("### [wiki-vault·llminbox → FLOTA (los 60: 64bis ∧ PM ∧ cfocockpit ∧ bikeus "
+            "∧ biklabs-landing ∧ inbiku) ∧ Albert · PRODUCED] 2026-08-11T14:55:46Z — "
+            "📖 MANUAL DE llminbox: cuál es TU ledger y los 13 comandos")
+    v = servicio.titular_visible(head)
+    assert "MANUAL DE llminbox" in v, "el titular tiene que sobrevivir al recorte"
+    assert v.startswith("### ["), "y el prefijo de cabecera se conserva"
+    assert len(v) <= 160
+
+
+def test_una_cabecera_corta_no_se_toca():
+    """Control positivo: si el head ya cabe, sale TAL CUAL — sin puntos suspensivos
+    ni reordenación. La cura no puede cambiar lo que ya se veía bien."""
+    import servicio
+    corta = "### [cto-A → backend · FYI] 2026-08-11T00:00:00Z — titular breve"
+    assert servicio.titular_visible(corta) == corta

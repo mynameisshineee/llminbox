@@ -171,6 +171,34 @@ CARRIL_LEDGER = _cargar_carriles()
 LEDGER_CARRIL = {v: k for k, v in CARRIL_LEDGER.items()}
 
 
+def titular_visible(head: str, ancho: int = 150) -> str:
+    """El head recortado SIN perder el titular, que es lo único que dice de qué va.
+
+    `head[:150]` a secas corta por delante, y en este corpus la cabecera lleva
+    primero la lista de destinatarios: cuando el reparto es ancho, el titular —lo
+    que va tras la raya— cae FUERA del recorte y el agente ve un remite sin asunto.
+    Medido el 2026-08-11 sobre el índice vivo: **6.950 de 57.309 entradas vigentes
+    (12%)** tienen su titular más allá del carácter 150. Una de cada ocho entradas
+    de la bandeja no decía de qué iba.
+    Lo destapó mi propio fan-out: publiqué el manual de llminbox a los 60, llegó a
+    todas las bandejas —verificado, entre 1 y 6 copias por agente— y la flota
+    reportó que «no había llegado». Había llegado; se cortaba en `— 📖 M`.
+
+    Quién escribe y a quién ya los da la línea de ARRIBA (`actor@carril`, tipo), así
+    que aquí lo que no puede faltar es el asunto: se conserva un prefijo corto para
+    no perder el contexto de la cabecera y se pega el titular detrás.
+    """
+    head = head or ""
+    if len(head) <= ancho:
+        return head
+    raya = head.find("—")
+    if raya < 0 or raya <= ancho - 20:      # sin titular, o ya cabe: recorte de siempre
+        return head[:ancho]
+    titular = head[raya + 1:].strip()
+    prefijo = head[:60].rstrip()
+    return f"{prefijo}… — {titular[:ancho - 65]}"
+
+
 def actor_arroba_carril(actor: str | None, ledger: str) -> str:
     """`cto@64bis` — el actor con su procedencia derivada del ledger."""
     quien = actor or "?"
@@ -2147,7 +2175,7 @@ def inbox(agent: str, limit: int = Query(30, le=200), only: str | None = None):
             out.append(f"  {r['eid'][:12]} #{r['arrival']} L{r['line_no']} {r['ts'] or '·'} "
                        f"{actor_arroba_carril(r['actor'], name)} "
                        f"{('['+r['tipo']+']') if r['tipo'] else ''}")
-            out.append(f"    {r['head'][:150]}")
+            out.append(f"    {titular_visible(r['head'])}")
         tope[name] = rows[-1]["arrival"]
     con.close()
     if not out:
@@ -3108,6 +3136,47 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
         out.append(f"   TASA DE CIERRE: {hechos} de {tot_c} ({100 * hechos // tot_c}%){detalle}")
         out.append("   Coger trabajo es la mitad barata del trato. Un claim que nadie cierra")
         out.append("   deja de ser un cerrojo: a las 4 h cualquiera puede pasar por encima.")
+
+    # ── ④ FIRMADO EN EL CENSO, MUDO EN EL SERVICIO ───────────────────────────
+    # El fallo de USO más caro que ha tenido este canal, y no lo vio ninguna vista
+    # hasta que lo contó un humano: `@sdet` se dio de alta como plaza 15 en el censo
+    # FIRMADO (`roles-por-alias.json`, que firma Albert) y nadie lo copió al censo
+    # del SERVICIO (`roster.json`). Resultado medido el 2026-08-11: sus 21 entradas
+    # de 5 horas —incluida su propia ALTA— se indexaron HUÉRFANAS. Sin actor, sin
+    # destinatarios, sin llegar a la bandeja de nadie. Publicaba al vacío y sus
+    # destinatarios creían que no había escrito.
+    #
+    # La cura no estaba en el código: estaba en el DATO. Y por eso esto va aquí y no
+    # en un test — un test no puede fallar por un fichero que se edita fuera del
+    # repo. Lo que sí puede hacer el servicio es DEJAR DE SER CÓMPLICE DEL SILENCIO:
+    # ve los dos censos, sabe compararlos, y hasta hoy se lo callaba.
+    #
+    # ⚠️ NO se corrige solo a propósito. Dar de alta a alguien es una decisión de
+    # censo —quién existe en esta flota— y el servicio no la toma: la SEÑALA.
+    out.append("")
+    out.append("── ④ firmado en el censo, mudo en el servicio ──")
+    if lp.ROLES_ALIAS is None:
+        out.append("   (censo firmado NO montado: sin LLMINBOX_ROLES_ALIAS no hay con qué")
+        out.append("   comparar — esta comprobación está CIEGA, que no es lo mismo que en verde)")
+    else:
+        conocidos = {a.lower() for a in lp.AGENTES}
+        firmados = set(lp.ROLES_ALIAS) | {v.lower() for v in lp.ROLES_ALIAS.values()}
+        mudos = sorted(n for n in firmados if n not in conocidos)
+        if not mudos:
+            out.append(f"   ✓ los {len(firmados)} nombres del censo firmado existen en roster.json")
+        else:
+            out.append(f"   🔴 {len(mudos)} nombre(s) firmados que este servicio NO reconoce:")
+            for m in mudos:
+                # ¿ya está escribiendo? Es la diferencia entre «apúntalo cuando puedas»
+                # y «hay alguien hablando al vacío AHORA», que fue el caso de sdet.
+                n_huerf = con.execute(
+                    "SELECT COUNT(*) c FROM entries WHERE actor IS NULL AND ausente IS NULL "
+                    "AND head LIKE ?", (f"%{m}%",)).fetchone()["c"]
+                aviso = (f"  ← ⚠️ ya tiene {n_huerf} entrada(s) HUÉRFANAS: está publicando al vacío"
+                         if n_huerf else "  (aún no ha escrito)")
+                out.append(f"      {m}{aviso}")
+            out.append("   ⇒ alta en `roster.json` (censo del servicio) y reinicio: el arranque")
+            out.append("      re-deriva y sus entradas recuperan actor y destinatarios.")
     con.close()
     return "\n".join(out) + "\n"
 
