@@ -1461,21 +1461,6 @@ def _preparar_indice(con: sqlite3.Connection) -> None:
     # identidad por contenido: si `entries` sobrevive, cada `eid` conserva su
     # `arrival`, y un cursor «he leído hasta la #400» sigue apuntando a lo mismo.
     # La justificación se quedó puesta después de que el motivo desapareciera.
-    # COLUMNAS AÑADIDAS A UNA TABLA QUE YA EXISTE. `executescript(SCHEMA)` con
-    # `IF NOT EXISTS` cubre tablas e índices nuevos, pero NO añade una columna a una
-    # tabla ya creada: la sentencia se salta entera y la columna nunca aparece.
-    # Me pasó el 2026-08-08 con `coste.maximo`: el volcado fallaba en cada barrido y
-    # la sección de coste desaparecía de `/adopcion` sin decir por qué. El comentario
-    # de SCHEMA_V decía «un cambio aditivo no necesita subirla» — cierto para tablas,
-    # FALSO para columnas, y esa media verdad es la que me costó el rato.
-    for tabla, col, tipo in (("coste", "maximo", "INTEGER DEFAULT 0"),):
-        try:
-            hay = {r[1] for r in con.execute(f"PRAGMA table_info({tabla})")}
-            if hay and col not in hay:
-                con.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {tipo}")
-                print(f"[arranque] {tabla}: columna {col} añadida", flush=True)
-        except sqlite3.OperationalError as e:
-            print(f"[arranque] no pude añadir {tabla}.{col}: {e}", flush=True)
     h_esq = huella_esquema()
     h_censo = huella_censo()
     fila = con.execute("SELECT v FROM meta WHERE k='schema_v'").fetchone()
@@ -1487,6 +1472,37 @@ def _preparar_indice(con: sqlite3.Connection) -> None:
         con.execute("INSERT OR REPLACE INTO meta VALUES ('schema_v', ?)", (h_esq,))
         # Aquí sí se van los cursores, y es correcto: cambió la FORMA de las tablas.
     con.executescript(SCHEMA)
+    # ⚠️ VA DESPUÉS DE `executescript(SCHEMA)`, y no es orden estético: estaba
+    # ANTES, y sobre una base NUEVA la tabla todavía no existe, así que el bucle
+    # la saltaba («if hay and …») y la columna no aparecía nunca. En las bases ya
+    # creadas sí funcionaba — o sea que el defecto sólo se veía al estrenar, que
+    # es justo donde nadie mira. Cazado por el test de `claims.motivo`.
+    # Y NO se añaden estas columnas al CREATE TABLE: cambiar SCHEMA cambia su
+    # huella, y un cambio de huella TIRA `cursors` — o sea le borra a los 14 su
+    # posición de lectura por una columna cosmética. El ALTER no toca la huella.
+    # COLUMNAS AÑADIDAS A UNA TABLA QUE YA EXISTE. `executescript(SCHEMA)` con
+    # `IF NOT EXISTS` cubre tablas e índices nuevos, pero NO añade una columna a una
+    # tabla ya creada: la sentencia se salta entera y la columna nunca aparece.
+    # Me pasó el 2026-08-08 con `coste.maximo`: el volcado fallaba en cada barrido y
+    # la sección de coste desaparecía de `/adopcion` sin decir por qué. El comentario
+    # de SCHEMA_V decía «un cambio aditivo no necesita subirla» — cierto para tablas,
+    # FALSO para columnas, y esa media verdad es la que me costó el rato.
+    # `claims.cerrado` no distinguía «lo cerró su dueño» de «se lo relevaron por
+    # vencimiento»: los dos caminos escribían la misma columna. Medido el 2026-08-11
+    # sobre la tabla viva, eso hacía ILEGIBLE el único número que importa de la
+    # disciplina —26 de 96 cerrados (27 %)—, porque «qa: 10 de 10» incluía el relevo
+    # que le hice yo esa mañana. Un dato que no distingue las dos cosas se lee como
+    # la buena.
+    for tabla, col, tipo in (("coste", "maximo", "INTEGER DEFAULT 0"),
+                             ("claims", "motivo", "TEXT"),
+                             ("claims", "cerrado_por", "TEXT")):
+        try:
+            hay = {r[1] for r in con.execute(f"PRAGMA table_info({tabla})")}
+            if hay and col not in hay:
+                con.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {tipo}")
+                print(f"[arranque] {tabla}: columna {col} añadida", flush=True)
+        except sqlite3.OperationalError as e:
+            print(f"[arranque] no pude añadir {tabla}.{col}: {e}", flush=True)
     migrar_alias_a_rol(con)        # ② — después de SCHEMA (tablas garantizadas),
                                     # antes de CENSO cambiado (orden no crítico entre
                                     # ambas, pero así quedan agrupados: migraciones de
@@ -2597,8 +2613,9 @@ def coger(c_in: ClaimIn):
                             "desde": fila["abierto"],
                             "motivo": "ya lo tiene cogido otro — REVISA lo suyo o pregúntale"}
                 # Vencido: se cierra el viejo y se dice de quién era.
-                con.execute("UPDATE claims SET cerrado=? WHERE tema=? AND rol='ejecuta' "
-                            "AND cerrado IS NULL", (ahora, tema))
+                con.execute("UPDATE claims SET cerrado=?, motivo='relevo', cerrado_por=? "
+                            "WHERE tema=? AND rol='ejecuta' AND cerrado IS NULL",
+                            (ahora, agente, tema))
                 relevado = fila["agent"]
             con.execute("INSERT INTO claims(tema,rol,agent,agent_bruto,abierto,bruto) "
                         "VALUES(?,?,?,?,?,?)",
@@ -2632,8 +2649,13 @@ def cerrar(c_in: ClaimIn):
     ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
     con = db()
     try:
-        n = con.execute("UPDATE claims SET cerrado=? WHERE tema=? AND agent=? AND "
-                        "cerrado IS NULL", (ahora, tema, lp.rol_de(c_in.agent))).rowcount
+        # `motivo` separa esto del RELEVO por vencimiento, que escribe la misma
+        # columna `cerrado`. Sin la distinción, «cerrados» mezcla «lo terminó» con
+        # «se lo quitaron», y el segundo caso cuenta a favor del que paró.
+        n = con.execute("UPDATE claims SET cerrado=?, motivo='cierro', cerrado_por=? "
+                        "WHERE tema=? AND agent=? AND cerrado IS NULL",
+                        (ahora, lp.rol_de(c_in.agent), tema,
+                         lp.rol_de(c_in.agent))).rowcount
         con.commit()
         return {"ok": n > 0, "tema": tema, "cerrados": n}
     finally:
@@ -2915,6 +2937,28 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
         out.append("   (ninguno pasado de plazo)")
     out.append("   Vencido ≠ abandonado: el TTL dice que otro PUEDE relevarte, no que")
     out.append("   hayas fallado. Ciérralo, o di en el ledger por qué sigue abierto.")
+    # LA TASA DE CIERRE, que es el único número que dice si la disciplina se usa o
+    # sólo se toma. Medido el 2026-08-11 al estrenar esto: 26 de 96 (27 %), con 69 de
+    # los 70 abiertos pasados de plazo. Coger trabajo se adoptó; soltarlo no.
+    tot_c = con.execute("SELECT COUNT(*) n FROM claims").fetchone()["n"]
+    try:
+        cerr = list(con.execute("SELECT motivo, COUNT(*) n FROM claims "
+                                "WHERE cerrado IS NOT NULL GROUP BY motivo"))
+    except sqlite3.OperationalError:
+        cerr = []
+    por = {r["motivo"]: r["n"] for r in cerr}
+    hechos = sum(por.values())
+    if tot_c:
+        # `motivo IS NULL` son los cerrados ANTES de que existiera la columna: no se
+        # pueden repartir entre cierre y relevo, y meterlos en cualquiera de los dos
+        # sacos inventa el dato. Se dicen aparte.
+        detalle = (f" — {por.get('cierro', 0)} los cerró su dueño · "
+                   f"{por.get('relevo', 0)} fueron relevos · "
+                   f"{por.get(None, 0)} de antes de distinguirlo")
+        out.append("")
+        out.append(f"   TASA DE CIERRE: {hechos} de {tot_c} ({100 * hechos // tot_c}%){detalle}")
+        out.append("   Coger trabajo es la mitad barata del trato. Un claim que nadie cierra")
+        out.append("   deja de ser un cerrojo: a las 4 h cualquiera puede pasar por encima.")
     con.close()
     return "\n".join(out) + "\n"
 

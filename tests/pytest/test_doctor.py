@@ -221,3 +221,32 @@ def test_un_alias_de_difusion_va_marcado(tmp_path, monkeypatch):
     assert "alias de difusión" in equipo
     be = next(l for l in sec.splitlines() if l.strip().startswith("be "))
     assert "alias de difusión" not in be and "humano" not in be
+
+
+def test_cerrar_y_relevar_no_se_confunden(cliente, servicio):
+    """`cerrado` la escribían los DOS caminos —cerrar lo tuyo y que te relevem por
+    vencimiento— y el informe los sumaba en un solo «cerrados». Medido en la tabla
+    viva, eso hacía ilegible el único número de la disciplina: «qa, 10 de 10» incluía
+    el relevo que le hicieron. Un dato que no distingue se lee como el bueno.
+
+    FALSADOR: si `motivo` no se escribiera, las dos filas saldrían con el mismo valor
+    (o con ninguno) y la tasa de cierre volvería a mezclar las dos cosas.
+    """
+    cliente.post("/claim", json={"tema": "mio", "rol": "ejecuta", "agent": "backend"})
+    cliente.post("/claim/cierro", json={"tema": "mio", "rol": "ejecuta", "agent": "backend"})
+
+    cliente.post("/claim", json={"tema": "suyo", "rol": "ejecuta", "agent": "backend"})
+    con = servicio.db()
+    con.execute("UPDATE claims SET abierto='2020-01-01T00:00:00+00:00' WHERE tema='suyo'")
+    con.commit()
+    con.close()
+    r = cliente.post("/claim", json={"tema": "suyo", "rol": "ejecuta", "agent": "cto-A"})
+    assert r.json().get("relevaste_a") == "be", r.json()
+
+    con = servicio.db()
+    motivos = dict(con.execute("SELECT tema, motivo FROM claims WHERE cerrado IS NOT NULL"))
+    con.close()
+    assert motivos == {"mio": "cierro", "suyo": "relevo"}, motivos
+    # Y el informe los reparte en vez de sumarlos en un montón.
+    s = _seccion(_texto(cliente), 3)
+    assert "1 los cerró su dueño" in s and "1 fueron relevos" in s
