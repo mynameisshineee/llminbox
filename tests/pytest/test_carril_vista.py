@@ -81,3 +81,21 @@ def test_sin_mapa_de_carriles_ninguna_vista_cambia(tmp_path, monkeypatch):
         assert "@" not in texto.split("marcar leído", 1)[0]
         assert "(carril:" not in texto
         assert all(f["carril"] is None for f in c.get("/entries?limit=50").json())
+
+
+def test_endpoint_carriles_sirve_el_mapa(cliente):
+    """`/carriles` — lo consume el CLI para decir «0 nuevas en TU ledger» sin
+    traerse una copia del carriles.tsv (la duplicación de censo que este carril
+    lleva dos días quitando)."""
+    d = cliente.get("/carriles").json()
+    assert d == {"demo": "demo-ledger"}
+
+
+def test_carriles_vacio_sin_mapa(tmp_path, monkeypatch):
+    """Sin mapa montado (default del compose) devuelve {} — no inventa carriles."""
+    from fastapi.testclient import TestClient
+    s = construir(tmp_path, monkeypatch,
+                  extra_env={"LLMINBOX_CARRILES": "", "LLMINBOX_MOUNTS_JSON": ""})
+    with TestClient(s.app) as c:
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        assert c.get("/carriles").json() == {}

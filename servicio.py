@@ -1787,7 +1787,19 @@ def stat():
     for name, path in LEDGERS.items():
         r = con.execute(
             "SELECT COUNT(*) n, SUM(ausente IS NOT NULL) idas, SUM(tipo IS NOT NULL) tipada,"
-            " SUM(ts IS NOT NULL) fechada, MAX(ts) ultimo FROM entries WHERE ledger=?",
+            # `ultimo` y `ultimo_arrival` SÓLO SOBRE LO VIGENTE. `MAX(ts)` a secas
+            # agregaba también las DESAPARECIDAS —las que ya no están en el fichero—
+            # y `stat` publicaba como «última» una entrada que el servicio no sirve:
+            # medido en `64bis-wiki`, decía `9999-99-99T99:99:99` (una entrada con
+            # sello imposible, ausente desde la rotación) mientras `/entries` no la
+            # devolvía nunca. Una métrica que se contradice con la vista que resume
+            # manda a depurar un fantasma. Reportado por @vision-canon 2026-08-11.
+            # `ultimo_arrival` va al lado a propósito: es la cabeza REAL del ledger,
+            # la que no depende del sello del emisor (ver `orden=arrival` en /entries).
+            " SUM(ts IS NOT NULL) fechada,"
+            " MAX(CASE WHEN ausente IS NULL THEN ts END) ultimo,"
+            " MAX(CASE WHEN ausente IS NULL THEN arrival END) ultimo_arrival"
+            " FROM entries WHERE ledger=?",
             (name,)).fetchone()
         n = r["n"] or 0
         dest = con.execute("SELECT COUNT(DISTINCT eid) d FROM recipients WHERE ledger=?",
@@ -1801,9 +1813,23 @@ def stat():
             "con_fecha_pct": round(100 * (r["fechada"] or 0) / n, 1) if n else 0,
             "con_destinatario_pct": round(100 * dest / n, 1) if n else 0,
             "ultima": r["ultimo"],
+            "ultimo_arrival": r["ultimo_arrival"],
         })
     con.close()
     return out
+
+
+@app.get("/carriles", dependencies=GATE)
+def carriles():
+    """El mapa carril → ledger que este servicio tiene montado.
+
+    Lo pide el CLI para poder decir «0 nuevas en TU ledger» cuando la bandeja sólo
+    trae secciones de otros carriles (ver `peek` en `llmi`): sin esta ruta, el
+    cliente tendría que traerse una copia del `carriles.tsv` — la duplicación de
+    censo que este carril lleva dos días quitando de en medio. Vacío = sin mapa
+    montado, que es el default del compose.
+    """
+    return CARRIL_LEDGER
 
 
 @app.get("/roster", dependencies=GATE)
@@ -1836,7 +1862,8 @@ def roster():
 @app.get("/entries", dependencies=GATE)
 def entries(respuesta: Response,ledger: str | None = None, to: str | None = None, actor: str | None = None,
             tipo: str | None = None, since: str | None = None, q: str | None = None,
-            limit: int = Query(50, le=500), cuerpo: bool = False):
+            limit: int = Query(50, le=500), cuerpo: bool = False,
+            orden: str = Query("ts", pattern="^(ts|arrival)$")):
     # PEDIR CUERPOS ACOTA LA CONSULTA. `cuerpo=true` no capaba `limit`, así que una
     # llamada legítima con los parámetros que la propia API ofrece devolvía cientos
     # de cuerpos enteros. Medido el 2026-08-08 sobre este índice: las 500 entradas
@@ -1870,7 +1897,18 @@ def entries(respuesta: Response,ledger: str | None = None, to: str | None = None
     if since:
         w.append("e.ts>=?"); p.append(since)
     if q:
-        w.append("e.body LIKE ?"); p.append(f"%{q}%")
+        # EL SALTO DE LÍNEA NO PUEDE ESCONDER UNA ENTRADA. Los posts van envueltos a
+        # ~90 columnas, así que media frase de la cabecera cae en la línea siguiente y
+        # un `LIKE '%dos palabras%'` daba CERO EXACTO sobre una entrada que existe y
+        # estaba entregada. Medido: `'nunca ocurría **CI VERDE**'` ⇒ 0, y cada mitad
+        # por su cuenta ⇒ 3 y 6. Reportado por @marketing vía @vision-canon, que
+        # estuvo a un paso de reemitir un duplicado por creerle al buscador — un
+        # buscador que dice «no está» sobre algo que está es peor que no tenerlo.
+        # Se aplanan los saltos EN LA COLUMNA y se colapsan los espacios DEL TÉRMINO,
+        # que es lo que hace que las dos mitades vuelvan a tocarse.
+        termino = " ".join(q.split())
+        w.append("REPLACE(REPLACE(e.body, char(13), ' '), char(10), ' ') LIKE ?")
+        p.append(f"%{termino}%")
     join = ""
     if to:
         join = "JOIN recipients r ON r.ledger=e.ledger AND r.eid=e.eid"
@@ -1878,7 +1916,20 @@ def entries(respuesta: Response,ledger: str | None = None, to: str | None = None
     w.append("e.ausente IS NULL")           # lo desaparecido no se sirve como vigente
     sql = (f"SELECT e.ledger,e.eid,e.arrival,e.seq,e.ts,e.actor,e.tipo,e.line_no,e.head"
            f"{',e.body' if cuerpo else ''} FROM entries e {join}"
-           f"{' WHERE ' + ' AND '.join(w) if w else ''} ORDER BY e.ts DESC, e.arrival DESC LIMIT ?")
+           # `orden=arrival` — LA CABEZA DEL LEDGER NO LA PUEDE DECIDIR EL EMISOR.
+           # Por defecto se ordena por `ts`, que sella QUIEN ESCRIBE: una entrada con
+           # sello futuro se sienta en la cabeza de la ventana y no se mueve. Medido
+           # por @vision-canon en `64bis-wiki` (2026-08-11): la 1ª fila tenía
+           # `ts=2026-10-17` con `arrival=32237`, mientras el arrival real más alto
+           # era `33777` ⇒ quien tome «la primera» como cabeza está ciego hasta
+           # octubre. Le pasó: su medidor de atraso salió 30 entradas corto y habría
+           # reportado «al día» — FALLA HACIA VERDE, que es el lado malo.
+           # `arrival` lo pone el servidor al recibir y es monótono: es la magnitud
+           # que el emisor no controla. El default NO cambia (hay vigías colgando de
+           # esta vista); quien mida atraso o cabeza debe pedir `orden=arrival`.
+           f"{' WHERE ' + ' AND '.join(w) if w else ''} "
+           + ("ORDER BY e.arrival DESC LIMIT ?" if orden == "arrival"
+              else "ORDER BY e.ts DESC, e.arrival DESC LIMIT ?"))
     p.append(limit)
     # La misma marca que lleva `/inbox`: esto también sirve texto escrito por otros
     # agentes a un agente que lo va a leer. Va en cabecera y no envolviendo el JSON
