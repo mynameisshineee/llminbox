@@ -121,15 +121,43 @@ paso() {                        # paso <etiqueta> <comando…>
 # en las dos plataformas, con el servicio vivo o muerto, y sin pedir `sudo` en el
 # runner. LEER se sigue haciendo desde el host: un 0644 lo lee cualquiera.
 #
-# Y corre con el USUARIO POR DEFECTO de la imagen —`llmi`, uid 1000, el mismo que el
-# servicio—, NO con `-u 0`. Escribir esto como root parecía lo seguro y costó una
-# corrida entera de CI: SQLite crea `-wal` y `-shm` junto a la base, root los deja
-# suyos, y al arrancar el servicio se encuentra una base que NO PUEDE ESCRIBIR —
-# `attempt to write a readonly database` en `lifespan`, contenedor muerto con exit 3.
-# El uid del servicio escribe su propio 0644 sin ese daño colateral. Un privilegio que
-# no hace falta no es «por si acaso»: es una avería que sólo aparece en la otra máquina.
+# Y el uid con el que escribe NO se elige: SE LEE DEL FICHERO. Las dos elecciones «de
+# sentido común» fallaron, cada una por un lado, y en la máquina de otro:
+#   `-u 0`  → escribe siempre… y SQLite deja `-wal`/`-shm` de root al lado. El servicio
+#             arranca como 1000, se cura bien, y muere en la línea siguiente con
+#             `attempt to write a readonly database` (exit 3). La avería que este
+#             bloque existe para probar, reintroducida por el andamio.
+#   uid 1000 (el `USER` de la imagen) → en este Mac va; en el runner de Linux el mismo
+#             `INSERT` daba `readonly database` con el fichero 0644 delante.
+# Así que se lee `st_uid` de la base y se escribe COMO SU DUEÑO, sea quien sea en esa
+# máquina. Deja de haber una suposición sobre uids que sólo se comprueba en CI.
+# (Y si el dueño resultara ser root, no se disimula: la guarda de propiedad de más
+# abajo declara el bloque NO MEDIDO.)
+#
+# Por qué `docker run --rm` y no `docker exec`: el daño del camino de ARRANQUE se hace
+# con el contenedor PARADO, y `exec` ahí no existe. Un contenedor efímero escribe igual
+# en las dos plataformas, con el servicio vivo o muerto, y sin pedir `sudo` en el
+# runner. LEER se sigue haciendo desde el host: un 0644 lo lee cualquiera.
 en_contenedor() {               # en_contenedor <dir-datos> <programa-python>
-  docker run --rm -v "$1:/datos" "${IMAGEN:-llminbox:test}" python3 -c "$2"
+  local d="$1" prog="$2" dueno
+  dueno=$(docker run --rm -v "$d:/datos" "${IMAGEN:-llminbox:test}" python3 -c \
+    "import os; print(os.stat('/datos/h.sqlite').st_uid)" 2>/dev/null)
+  docker run --rm ${dueno:+-u "$dueno"} -v "$d:/datos" "${IMAGEN:-llminbox:test}" python3 -c "$prog"
+}
+
+# Quién es dueño de qué y quién puede escribir qué, dicho por un proceso DENTRO del
+# contenedor. Existe porque dos corridas de CI se fueron en adivinarlo desde un Mac
+# que virtualiza la propiedad: aquí este volcado es decorativo, en Linux es la prueba.
+propiedad_datos() {             # propiedad_datos <dir-datos> <etiqueta>
+  echo "  ── propiedad de $2 (vista desde dentro del contenedor) ──"
+  docker run --rm -v "$1:/datos" "${IMAGEN:-llminbox:test}" python3 -c "
+import os
+print('     yo=uid', os.getuid(), '· /datos modo', oct(os.stat('/datos').st_mode)[-4:],
+      'uid', os.stat('/datos').st_uid, '· escribible', os.access('/datos', os.W_OK))
+for n in sorted(os.listdir('/datos')):
+    st = os.stat('/datos/' + n)
+    print(f'     {n}: uid={st.st_uid} gid={st.st_gid} modo={oct(st.st_mode)[-4:]} '
+          f'escribible={os.access(\"/datos/\" + n, os.W_OK)}')" 2>&1 | head -12
 }
 
 printf '# t\n\n### [alice-backend → bob-reviewer · REQUEST] primera\ncuerpo uno\n' > "$TMP/l.md"
@@ -502,6 +530,7 @@ EID_ANTES=$(lee_eid "$CUR_ANTES")
 # más abajo pasaría con el arreglo puesto Y sin él. El veneno crea el caso que sí
 # distingue — el de un índice corrupto que viene de una versión anterior.
 MONTADO="sí"
+propiedad_datos "$D2" "la base del servicio, ANTES de tocarla"
 paso "el envenenado de la huella de esquema" en_contenedor "$D2" "
 import sqlite3
 c=sqlite3.connect('/datos/h.sqlite',timeout=20)
