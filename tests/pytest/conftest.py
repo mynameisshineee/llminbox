@@ -26,15 +26,20 @@ ROSTER = {
 }
 
 
-def construir(tmp_path, monkeypatch, extra_env=None):
+def construir(tmp_path, monkeypatch, extra_env=None, roster=None):
     """Arma un roster + dos ledgers + un carriles.tsv de prueba, y devuelve el
     módulo `servicio` importado FRESCO contra ese entorno.
 
     Dos ledgers a propósito: `demo-ledger` (mapeado al carril `demo` en el
     carriles.tsv de prueba) y `otro-ledger` (en LLMINBOX_LEDGERS pero SIN mapear a
     ningún carril) — es la pareja mínima que necesitan los tests de ③ y ⑤.
+
+    `roster` (⑰): opcional, default `None` = el `ROSTER` fijo de siempre (cero
+    impacto en los 12 ficheros de test existentes). Los tests de censo-en-escritura
+    necesitan dar de alta agentes/difusión propios (p.ej. `security`, `TODOS`) sin
+    tocar el roster compartido del resto de la suite.
     """
-    (tmp_path / "roster.json").write_text(json.dumps(ROSTER))
+    (tmp_path / "roster.json").write_text(json.dumps(roster if roster is not None else ROSTER))
 
     demo_md = tmp_path / "DEMO-LEDGER.md"
     demo_md.write_text(

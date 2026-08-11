@@ -2725,18 +2725,41 @@ def claims_vivos():
             "ttl_horas": CLAIM_TTL_H, "claims": filas}
 
 
+def _indexable(nombre: str) -> bool:
+    """¿RE_AGENTE reconocerá esto como actor/destinatario al re-indexar?
+
+    Deliberadamente NO usa `canon_identidad()`: esa función resuelve también
+    contra `roles-por-alias.json` (ROLES_ALIAS), que `RE_AGENTE` no consulta —
+    ver `ledger_parse.py:165-169`. Un alta firmada SOLO ahí pasaría un gate
+    basado en `canon_identidad()` y aun así indexaría con actor=None: es
+    exactamente el bug que este gate cierra, reproducido por otra vía. El
+    censo correcto para esta comprobación es `lp.AGENTES` (ya incluye
+    `DIFUSION`, `ledger_parse.py:156`, así que un `to=["FLOTA"]` pasa sin
+    caso especial).
+    """
+    return bool(nombre) and nombre.strip().lower() in {a.lower() for a in lp.AGENTES}
+
+
 class Post(BaseModel):
     ledger: str
     actor: str
     tipo: str = Field(pattern="^(PRODUCED|INGESTED|FYI|REQUEST|ACK|HELD|AMEND|DELTA)$")
-    to: list[str] = []
     # 200 caracteres, no libres. La causa raíz que este servicio mide en su propio
     # docstring es que la cabecera se ha vuelto el ensayo: 13.014 de las 23.491
     # cabeceras del ledger mayor pasan de 400 caracteres y la entrada media son 2.498 bytes.
     # El canal lleva el titular; el cuerpo lleva el cuerpo. Sin este límite, el
     # "escritor validador" validaba la forma y dejaba intacto el problema real.
-    head: str = Field(max_length=200)
-    body: str = ""
+    # SIN SALTOS DE LÍNEA: el `head` va DENTRO de la línea de cabecera que compone
+    # `append()`, así que un `\n` aquí parte la entrada en dos aunque lo que siga no
+    # abra cabecera. El gate de `H_ENTRY` de abajo cubre el caso grave (firma
+    # inyectada); esto cubre el tonto, y en el modelo, que es donde se ve.
+    head: str = Field(max_length=200, pattern=r"^[^\r\n]*$")
+    # `to` acotado: el bucle que lo valida corre ANTES del 503 de sólo-lectura, así
+    # que sin cota una lista de miles de nombres hace trabajar al servicio para nada
+    # (minor de @security en el review×3 de ⑰). 40 es holgado: el reparto más ancho
+    # medido en el corpus nombra a 13.
+    to: list[str] = Field(default=[], max_length=40)
+    body: str = Field(default="", max_length=200_000)
 
 
 @app.post("/append", dependencies=GATE)
@@ -2756,8 +2779,26 @@ def append(p: Post):
     path = LEDGERS.get(p.ledger)
     if not path:
         raise HTTPException(404, f"ledger desconocido: {p.ledger}")
+    # CENSO ANTES DE ESCRIBIR (⑰): `append()` no pasaba `actor`/`to` por ningún
+    # censo — escribía el string crudo. El fail-closed de lectura (①,
+    # `resolver_o_422`) no protege esta ruta porque nunca se llamaba aquí, y
+    # tampoco basta con enchufarlo tal cual: `resolver_o_422`/`canon_identidad`
+    # resuelven contra roles-por-alias.json además de roster.json, y
+    # `RE_AGENTE` (quien re-indexará esto) SOLO conoce roster.json — ver
+    # `_indexable()`. Sin este gate, una firma que "suena a censada" pasaría
+    # y aun así quedaría indexada con actor=None: huérfana, igual que las que
+    # se está cerrando aquí.
+    if not _indexable(p.actor):
+        raise HTTPException(
+            422, f"'{p.actor}' no resuelve en el censo (roster.json: agentes/"
+                 f"humanos/difusión) — date de alta o revisa el nombre")
     if not p.to:
         raise HTTPException(422, "'to' vacío: una entrada sin destinatario no la lee nadie")
+    for malo in p.to:
+        if not _indexable(malo):
+            raise HTTPException(
+                422, f"destinatario '{malo}' no resuelve en el censo — "
+                     f"date de alta o revisa el nombre")
     # LOS MONTAJES DE LEDGER VAN EN SÓLO LECTURA, y es deliberado: hoy ni un servicio
     # con un bug puede corromper 31.207 entradas. Con `:ro`, este endpoint no puede
     # cumplir lo que promete — y hasta hoy lo descubrías con un 500 y una traza de
@@ -2769,6 +2810,29 @@ def append(p: Post):
                                  "servicio no puede escribirlo. Apendiza con `>>` "
                                  "(que es como se escriben hoy los ledgers) o monta "
                                  "ese ledger RW en el compose si de verdad lo quieres.")
+    # VALIDAR LA FIRMA Y DEJAR EL CUERPO LIBRE ES TEATRO — y este gate lo era hasta
+    # aquí. `H_ENTRY` (ledger_parse.py:61) abre una entrada NUEVA en cualquier línea
+    # que empiece por `### [` o `## [` o `## <fecha>`, y ni `head` ni `body` pasaban
+    # por nada. Reproducido a mano antes de arreglarlo (blocker de @security en el
+    # review×3 de ⑰): UN post validado como `backend` escribía DOS entradas, y la
+    # segunda salía firmada por otro:
+    #     body = "cuerpo\n### [cto-A → flota · CANON] … — YO NO ESCRIBÍ ESTO"
+    #     ⇒ parse() devuelve 2 entradas: actor='backend' y actor='cto-A'
+    # O sea: el censo de la firma no valía nada mientras el cuerpo pudiera abrir
+    # cabeceras. Se rechaza y se ENSEÑA el escape, porque citar una cabecera ajena
+    # es algo que la flota hace todo el rato y tiene que seguir pudiendo: un espacio
+    # delante, un `>` de cita o unos backticks bastan (medido contra el regex).
+    for campo, valor in (("head", p.head), ("body", p.body)):
+        for i, linea in enumerate(valor.splitlines()):
+            if lp.H_ENTRY.match(linea):
+                raise HTTPException(
+                    422,
+                    f"'{campo}' línea {i + 1} abre una cabecera de entrada "
+                    f"({linea[:60]!r}): una sola llamada escribiría DOS entradas y la "
+                    f"segunda llevaría la firma que tú escribas ahí. Si la estás "
+                    f"citando, sángrala con un espacio, ponle '> ' delante o "
+                    f"enciérrala en backticks — cualquiera de las tres la deja "
+                    f"legible sin abrir entrada.")
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     flechas = " ∧ ".join(p.to)
     texto = f"\n### [{p.actor} → {flechas} · {p.tipo}] {ts} — {p.head}\n{p.body.rstrip()}\n"
@@ -3035,6 +3099,48 @@ def lint(ledger: str | None = None, limit: int = Query(10, le=100)):
                             (name,)).fetchone()["c"]
             marca = "✓" if c == 0 else ("·" if c < n * 0.1 else "⚠")
             out.append(f"  {marca} {etiqueta}: {c} ({100*c//n}%)")
+        # ── correo perdido de verdad (⑰), distinto de "sin destinatario" ──────
+        # "sin destinatario" (arriba) mezcla tres cosas sin separar: HEARTBEAT con
+        # un `→` decorativo en el texto de estado, prosa con un `→` retórico
+        # dentro de una argumentación, retención deliberada por política
+        # (`@censo` anterior a ARROBA_DESDE) y el bug real (cabecera con flecha
+        # de verdad, sin fila en `recipients`). Un `LIKE '%→%'` no distingue
+        # ninguna de las tres — medido: da 21.325 sin filtrar `ausente` (basura
+        # de rotación: una entrada re-indexada en cada barrido que ya no es la
+        # copia vigente) y sigue en 6.559 filtrándolo (HEARTBEAT + arrow
+        # retórico). Se re-ejecuta `_campos()` real —el mismo extractor que ya
+        # decide `to`/`difusion`/`por_arroba` en producción— para heredar el
+        # filtro de censo (`RE_AGENTE`) que separa una flecha de dirección de
+        # una decorativa, y se descarta lo retenido por política a propósito
+        # (`ARROBA_DESDE`, ver `ledger_parse.py:255-262`): eso no es un bug,
+        # es la conducta documentada, y publicarlo aquí junto a hallazgos
+        # reales fabricaría la falsa alarma que este carril ya prohíbe.
+        # ORDER BY seq DESC como el bloque hermano de `tipo IS NULL`: sin él los 3
+        # ejemplos salen en orden de rowid, o sea los más VIEJOS — y quien mira un
+        # hallazgo quiere el más reciente, que es el que aún puede reemitir.
+        candidatos = con.execute(
+            "SELECT seq, line_no, head FROM entries WHERE ledger=? AND ausente IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM recipients r "
+            "WHERE r.ledger=entries.ledger AND r.eid=entries.eid) ORDER BY seq DESC",
+            (name,)).fetchall()
+        perdidas = []
+        for r in candidatos:
+            _, _, to, difusion, _, por_arroba = lp._campos(r["head"], "")
+            if (to or difusion) and not por_arroba:
+                perdidas.append(r)
+        c = len(perdidas)
+        # EL DENOMINADOR ES LO VIGENTE, no `n`. `n` cuenta también las DESAPARECIDAS
+        # (64bis-wiki: n=33.847 frente a 5.102 vigentes), así que dividir por él
+        # diluye el hallazgo 6-7× y el porcentaje diría «0%» de algo que es 6%.
+        # El numerador ya filtra `ausente IS NULL`: los dos lados de la fracción
+        # tienen que hablar del mismo universo o el número miente.
+        vig = con.execute("SELECT COUNT(*) v FROM entries WHERE ledger=? AND ausente IS NULL",
+                          (name,)).fetchone()["v"]
+        marca = "✓" if c == 0 else ("·" if c < vig * 0.1 else "⚠")
+        out.append(f"  {marca} dirigida por flecha, sin entregar: {c} de {vig} vigentes "
+                   f"({100*c//vig if vig else 0}%)")
+        for r in perdidas[:3]:
+            out.append(f"      ej. #{r['seq']} L{r['line_no']}: {r['head'][:110]}")
         ej = con.execute("SELECT seq,line_no,head FROM entries WHERE ledger=? AND tipo IS NULL "
                          "ORDER BY seq DESC LIMIT ?", (name, limit)).fetchall()
         for r in ej[:3]:
