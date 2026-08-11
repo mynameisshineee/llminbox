@@ -82,7 +82,7 @@ def test_lint_flecha_sin_recipients_cuenta(cliente_seg):
 
     r = c.get("/lint", params={"ledger": "demo-ledger"})
     assert r.status_code == 200
-    assert "dirigida por flecha, sin entregar: 1 (" in r.text
+    assert "dirigida por flecha, sin entregar: 1 de" in r.text
 
 
 def test_lint_heartbeat_arrow_no_cuenta(cliente, servicio):
@@ -100,7 +100,7 @@ def test_lint_heartbeat_arrow_no_cuenta(cliente, servicio):
 
     r = cliente.get("/lint", params={"ledger": "demo-ledger"})
     assert r.status_code == 200
-    assert "dirigida por flecha, sin entregar: 0 (" in r.text
+    assert "dirigida por flecha, sin entregar: 0 de" in r.text
 
 
 def test_lint_arroba_precorte_no_cuenta(cliente_seg):
@@ -119,7 +119,7 @@ def test_lint_arroba_precorte_no_cuenta(cliente_seg):
 
     r = c.get("/lint", params={"ledger": "demo-ledger"})
     assert r.status_code == 200
-    assert "dirigida por flecha, sin entregar: 0 (" in r.text
+    assert "dirigida por flecha, sin entregar: 0 de" in r.text
 
 
 def test_lint_ausente_no_cuenta(cliente_seg):
@@ -135,7 +135,7 @@ def test_lint_ausente_no_cuenta(cliente_seg):
 
     r = c.get("/lint", params={"ledger": "demo-ledger"})
     assert r.status_code == 200
-    assert "dirigida por flecha, sin entregar: 0 (" in r.text
+    assert "dirigida por flecha, sin entregar: 0 de" in r.text
 
 
 def test_lint_no_rompe_censo_section_ni_grep_ancla(cliente):
@@ -170,4 +170,4 @@ def test_mutante_filtro_arroba_neutralizado_se_ve(cliente_seg, monkeypatch):
 
     r = c.get("/lint", params={"ledger": "demo-ledger"})
     assert r.status_code == 200
-    assert "dirigida por flecha, sin entregar: 1 (" in r.text
+    assert "dirigida por flecha, sin entregar: 1 de" in r.text

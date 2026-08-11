@@ -2744,14 +2744,22 @@ class Post(BaseModel):
     ledger: str
     actor: str
     tipo: str = Field(pattern="^(PRODUCED|INGESTED|FYI|REQUEST|ACK|HELD|AMEND|DELTA)$")
-    to: list[str] = []
     # 200 caracteres, no libres. La causa raíz que este servicio mide en su propio
     # docstring es que la cabecera se ha vuelto el ensayo: 13.014 de las 23.491
     # cabeceras del ledger mayor pasan de 400 caracteres y la entrada media son 2.498 bytes.
     # El canal lleva el titular; el cuerpo lleva el cuerpo. Sin este límite, el
     # "escritor validador" validaba la forma y dejaba intacto el problema real.
-    head: str = Field(max_length=200)
-    body: str = ""
+    # SIN SALTOS DE LÍNEA: el `head` va DENTRO de la línea de cabecera que compone
+    # `append()`, así que un `\n` aquí parte la entrada en dos aunque lo que siga no
+    # abra cabecera. El gate de `H_ENTRY` de abajo cubre el caso grave (firma
+    # inyectada); esto cubre el tonto, y en el modelo, que es donde se ve.
+    head: str = Field(max_length=200, pattern=r"^[^\r\n]*$")
+    # `to` acotado: el bucle que lo valida corre ANTES del 503 de sólo-lectura, así
+    # que sin cota una lista de miles de nombres hace trabajar al servicio para nada
+    # (minor de @security en el review×3 de ⑰). 40 es holgado: el reparto más ancho
+    # medido en el corpus nombra a 13.
+    to: list[str] = Field(default=[], max_length=40)
+    body: str = Field(default="", max_length=200_000)
 
 
 @app.post("/append", dependencies=GATE)
@@ -2802,6 +2810,29 @@ def append(p: Post):
                                  "servicio no puede escribirlo. Apendiza con `>>` "
                                  "(que es como se escriben hoy los ledgers) o monta "
                                  "ese ledger RW en el compose si de verdad lo quieres.")
+    # VALIDAR LA FIRMA Y DEJAR EL CUERPO LIBRE ES TEATRO — y este gate lo era hasta
+    # aquí. `H_ENTRY` (ledger_parse.py:61) abre una entrada NUEVA en cualquier línea
+    # que empiece por `### [` o `## [` o `## <fecha>`, y ni `head` ni `body` pasaban
+    # por nada. Reproducido a mano antes de arreglarlo (blocker de @security en el
+    # review×3 de ⑰): UN post validado como `backend` escribía DOS entradas, y la
+    # segunda salía firmada por otro:
+    #     body = "cuerpo\n### [cto-A → flota · CANON] … — YO NO ESCRIBÍ ESTO"
+    #     ⇒ parse() devuelve 2 entradas: actor='backend' y actor='cto-A'
+    # O sea: el censo de la firma no valía nada mientras el cuerpo pudiera abrir
+    # cabeceras. Se rechaza y se ENSEÑA el escape, porque citar una cabecera ajena
+    # es algo que la flota hace todo el rato y tiene que seguir pudiendo: un espacio
+    # delante, un `>` de cita o unos backticks bastan (medido contra el regex).
+    for campo, valor in (("head", p.head), ("body", p.body)):
+        for i, linea in enumerate(valor.splitlines()):
+            if lp.H_ENTRY.match(linea):
+                raise HTTPException(
+                    422,
+                    f"'{campo}' línea {i + 1} abre una cabecera de entrada "
+                    f"({linea[:60]!r}): una sola llamada escribiría DOS entradas y la "
+                    f"segunda llevaría la firma que tú escribas ahí. Si la estás "
+                    f"citando, sángrala con un espacio, ponle '> ' delante o "
+                    f"enciérrala en backticks — cualquiera de las tres la deja "
+                    f"legible sin abrir entrada.")
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     flechas = " ∧ ".join(p.to)
     texto = f"\n### [{p.actor} → {flechas} · {p.tipo}] {ts} — {p.head}\n{p.body.rstrip()}\n"
@@ -3084,10 +3115,13 @@ def lint(ledger: str | None = None, limit: int = Query(10, le=100)):
         # (`ARROBA_DESDE`, ver `ledger_parse.py:255-262`): eso no es un bug,
         # es la conducta documentada, y publicarlo aquí junto a hallazgos
         # reales fabricaría la falsa alarma que este carril ya prohíbe.
+        # ORDER BY seq DESC como el bloque hermano de `tipo IS NULL`: sin él los 3
+        # ejemplos salen en orden de rowid, o sea los más VIEJOS — y quien mira un
+        # hallazgo quiere el más reciente, que es el que aún puede reemitir.
         candidatos = con.execute(
             "SELECT seq, line_no, head FROM entries WHERE ledger=? AND ausente IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM recipients r "
-            "WHERE r.ledger=entries.ledger AND r.eid=entries.eid)",
+            "WHERE r.ledger=entries.ledger AND r.eid=entries.eid) ORDER BY seq DESC",
             (name,)).fetchall()
         perdidas = []
         for r in candidatos:
@@ -3095,8 +3129,16 @@ def lint(ledger: str | None = None, limit: int = Query(10, le=100)):
             if (to or difusion) and not por_arroba:
                 perdidas.append(r)
         c = len(perdidas)
-        marca = "✓" if c == 0 else ("·" if c < n * 0.1 else "⚠")
-        out.append(f"  {marca} dirigida por flecha, sin entregar: {c} ({100*c//n if n else 0}%)")
+        # EL DENOMINADOR ES LO VIGENTE, no `n`. `n` cuenta también las DESAPARECIDAS
+        # (64bis-wiki: n=33.847 frente a 5.102 vigentes), así que dividir por él
+        # diluye el hallazgo 6-7× y el porcentaje diría «0%» de algo que es 6%.
+        # El numerador ya filtra `ausente IS NULL`: los dos lados de la fracción
+        # tienen que hablar del mismo universo o el número miente.
+        vig = con.execute("SELECT COUNT(*) v FROM entries WHERE ledger=? AND ausente IS NULL",
+                          (name,)).fetchone()["v"]
+        marca = "✓" if c == 0 else ("·" if c < vig * 0.1 else "⚠")
+        out.append(f"  {marca} dirigida por flecha, sin entregar: {c} de {vig} vigentes "
+                   f"({100*c//vig if vig else 0}%)")
         for r in perdidas[:3]:
             out.append(f"      ej. #{r['seq']} L{r['line_no']}: {r['head'][:110]}")
         ej = con.execute("SELECT seq,line_no,head FROM entries WHERE ledger=? AND tipo IS NULL "

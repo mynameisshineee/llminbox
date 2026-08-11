@@ -20,7 +20,10 @@ NO estuviera cerrado.
 """
 from __future__ import annotations
 
+import json
 import os
+
+from fastapi.testclient import TestClient
 
 from conftest import construir
 
@@ -123,3 +126,40 @@ def test_mutante_gate_actor_neutralizado_se_ve(cliente, servicio, monkeypatch):
     assert r.status_code == 200       # con el mutante, ya no cierra en 422
     despues = os.path.getsize(path)
     assert despues > antes            # y el fantasma queda escrito
+
+
+def test_indexable_no_es_canon_identidad(tmp_path, monkeypatch):
+    """EL FALSADOR CENTRAL DEL SPEC, que faltaba (major de @qa en el review×3):
+    ningún test distinguía `_indexable()` de `canon_identidad()`, así que un
+    refactor a `canon_identidad` —la regresión exacta que ⑰ cierra— dejaba los
+    5 tests en verde.
+
+    El caso es REAL y está vivo hoy: `sdet` se firmó en `roles-por-alias.json`
+    el 2026-08-11 («plaza 15») y NO está en `roster.json`. `canon_identidad()`
+    lo resuelve (la unión incluye el censo firmado), pero `RE_AGENTE` —el
+    extractor que re-indexa lo escrito— se construye SÓLO de `roster.json`. Si
+    `/append` gateara con `canon_identidad`, `sdet` pasaría el 422 y su entrada
+    se indexaría con `actor=None`: el bug que este encargo cierra, reproducido
+    por la propia cura.
+
+    FALSADOR: sustituir `_indexable()` por `bool(lp.canon_identidad(n))` y correr
+    esto — pasa a 503/200 y el test cae.
+    """
+    alias = tmp_path / "roles.json"
+    alias.write_text(json.dumps({"rol_por_alias": {"sdet": "sdet", "backend": "be"}}))
+    s = construir(tmp_path, monkeypatch,
+                  roster={"agentes": [{"nombre": "backend", "humano": "a", "clave": "", "rol": "be"}],
+                          "humanos": [], "difusion": ["flota"]},
+                  extra_env={"LLMINBOX_ROLES_ALIAS": str(alias)})
+    # premisa del test, verificada aquí y no supuesta: resuelve como identidad…
+    assert s.lp.canon_identidad("sdet") is not None
+    # …pero el extractor NO lo conoce, así que su entrada quedaría huérfana
+    assert "sdet" not in [a.lower() for a in s.lp.AGENTES]
+    with TestClient(s.app) as c:
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        r = c.post("/append", json={"ledger": "demo-ledger", "actor": "sdet",
+                                    "tipo": "FYI", "to": ["backend"],
+                                    "head": "firmado en el censo, invisible al parser",
+                                    "body": "cuerpo"})
+        assert r.status_code == 422, ("un actor que resuelve en canon_identidad pero no "
+                                      "es extraíble por RE_AGENTE debe rebotar")
