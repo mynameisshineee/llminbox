@@ -22,11 +22,38 @@ T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 printf '# ledger de prueba\n' > "$T/L.md"
 python3 -c "import json,sys; json.dump({'prueba': sys.argv[1]+'/L.md'}, open(sys.argv[1]+'/m.json','w'))" "$T"
 
+# CENSO PROPIO, y no es celo: `roster.json` lo crea `llmi init` y está en .gitignore,
+# así que en el runner NO EXISTE. La primera versión de esta prueba usaba el del
+# operador —verde en su Mac, 9 rojos en CI con «no pude leer roster.json … el
+# extractor no reconocerá a nadie»—. Tercera vez en un día que un arnés mío mide MI
+# máquina en vez del producto; la cura es la misma siempre: que la prueba se traiga su
+# entorno. Y de propina, así no hay nombres de una flota real dentro de un repo público.
+cat > "$T/censo.json" <<'JSON'
+{"agentes": [{"nombre": "cto-A", "humano": "alguien", "clave": "", "rol": "cto"},
+             {"nombre": "qa", "humano": "alguien", "clave": "", "rol": "qa"},
+             {"nombre": "security", "humano": "alguien", "clave": "", "rol": "security"}],
+ "humanos": [{"nombre": "alguien", "alias": []}],
+ "difusion": ["equipo"]}
+JSON
+export LLMINBOX_ROSTER="$T/censo.json"
+
 publica() {                       # publica <yo> <dest> <tipo> <titular> [cuerpo]
   printf '%s\n' "${5:-cuerpo}" | env -u BIK_CARRIL \
     LLMI_YO="$1" LLMI_A="$2" LLMI_TIPO="$3" LLMI_TITULAR="$4" LLMI_LEDGER=prueba \
-    LLMI_MOUNTS="$T/m.json" LLMI_DIR=. python3 publicar.py 2>&1
+    LLMI_MOUNTS="$T/m.json" LLMI_DIR=. LLMINBOX_ROSTER="$T/censo.json" python3 publicar.py 2>&1
 }
+
+# CONTROL DE ARRANQUE: si el censo de prueba no cargara, TODO saldría «no está en el
+# censo» y las nueve comprobaciones de abajo pasarían por el motivo equivocado —que es
+# justo lo que pasó en CI. Se comprueba ANTES de medir nada.
+if ! python3 -c "
+import os, sys; sys.path.insert(0, '.')
+import ledger_parse as lp
+sys.exit(0 if 'cto-A'.lower() in lp.CANON else 1)"; then
+  echo "  ✗ el censo de prueba no carga: lo que siga NO mide la validación" >&2
+  exit 1
+fi
+echo "  · censo de prueba cargado (3 agentes) — las comprobaciones miden la validación"
 
 echo "── lo que no dirige, no se publica ──"
 # El defecto exacto que mide `/doctor ②`: 34 % del corpus. Aquí se para en el origen.
