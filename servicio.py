@@ -1995,13 +1995,20 @@ def entries(respuesta: Response,ledger: str | None = None, to: str | None = None
     # justifica todo esto, y pedirla en una segunda llamada por entrada sería N+1
     # sobre una lista de 120. Una consulta con IN sobre la clave primaria.
     if rows:
+        # La clave es (LEDGER, eid), no el eid a secas. Un mismo texto publicado en
+        # varios ledgers —cualquier FYI a la flota, que se apendiza en los 6— tiene
+        # el MISMO eid (es el sha del texto) y una fila de destinatario por ledger:
+        # agrupar sólo por eid devolvía `to` multiplicado por el nº de copias.
+        # Medido al publicar el manual de hoy en 6 ledgers: `to` salía
+        # ['ALBERT','FLOTA'] × 6 = 12 entradas. @cto PARSEA este campo.
         eids = [r["eid"] for r in rows]
         marcas = ",".join("?" * len(eids))
         dest = {}
-        for r in con.execute(f"SELECT eid, who FROM recipients WHERE eid IN ({marcas})", eids):
-            dest.setdefault(r["eid"], []).append(r["who"])
+        for r in con.execute(
+                f"SELECT ledger, eid, who FROM recipients WHERE eid IN ({marcas})", eids):
+            dest.setdefault((r["ledger"], r["eid"]), []).append(r["who"])
         for r in rows:
-            r["to"] = dest.get(r["eid"], [])
+            r["to"] = dest.get((r["ledger"], r["eid"]), [])
     # ⑫ — el carril, DERIVADO del ledger de cada fila. Va en /entries porque es
     # la vista multi-ledger: aquí es donde `cto` de 64bis y `cto` de cfocockpit
     # se mezclan en una lista y sin esto son indistinguibles. `None` cuando el

@@ -109,3 +109,28 @@ def test_la_difusion_sobrevive_a_una_rederivacion(tmp_path, monkeypatch):
         c.headers.update({"X-Llminbox-Token": "test-token"})
         assert "entrada de difusion" in c.get("/inbox/backend").text, (
             "la re-derivación se comió la difusión del histórico")
+
+
+def test_to_no_se_multiplica_por_las_copias_del_mismo_texto(cliente, servicio):
+    """El `eid` es el sha del TEXTO, así que un FYI publicado en varios ledgers
+    tiene el mismo eid en todos. Agrupar los destinatarios sólo por eid devolvía
+    `to` multiplicado por el número de copias — medido al publicar el manual de
+    hoy en 6 ledgers: ['ALBERT','FLOTA'] salía 12 veces. @cto parsea este campo.
+
+    FALSADOR: quitar el `ledger` de la clave del dict devuelve el duplicado.
+    """
+    import sqlite3
+    from conftest import db_directa
+    con = db_directa(servicio)
+    # el MISMO eid en los dos ledgers del arnés, cada uno con su destinatario
+    for led in ("demo-ledger", "otro-ledger"):
+        con.execute("INSERT OR REPLACE INTO entries (ledger,eid,arrival,seq,line_no,byte_off,"
+                    "ts,actor,tipo,head,body,visto,ausente,provisional) VALUES"
+                    "(?,'copia01',77,7,7,0,'2026-08-11T12:00:00','cto-A','FYI',"
+                    "'### [cto-A → backend] misma copia','cuerpo',NULL,NULL,NULL)", (led,))
+        con.execute("INSERT OR REPLACE INTO recipients VALUES (?,'copia01','backend')", (led,))
+    con.commit(); con.close()
+    filas = [f for f in cliente.get("/entries?limit=50").json() if f["eid"] == "copia01"]
+    assert len(filas) == 2, "deben verse las dos copias"
+    for f in filas:
+        assert f["to"] == ["backend"], f"to multiplicado: {f['to']}"
