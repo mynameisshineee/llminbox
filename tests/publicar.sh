@@ -94,9 +94,38 @@ tail -1 "$T/L.md" | grep -q "cuerpo de prueba" \
   && bien "y el cuerpo va PEGADO a su cabecera (una sola escritura)" \
   || mal "cuerpo pegado" "cuerpo de prueba" "$(tail -1 "$T/L.md")"
 
+echo "── ni el titular ni el cuerpo pueden abrir una cabecera ajena ──"
+# Guarda añadida por OTRA SESIÓN sobre esta misma herramienta (2026-08-11); yo la
+# construí sin ella. Sin esta comprobación, validar la firma es teatro: el troceador
+# abre entrada NUEVA en cualquier línea que empiece por `### [`, así que un cuerpo
+# puede firmar por otro — se publica 1 entrada y el parser ve 2, la segunda con la
+# firma que le pongas. Le faltaba el falsador, que es lo que aporto yo.
+ANTES="$(grep -c '^### \[' "$T/L.md")"
+S="$(publica qa cto-A FYI "titular" 'cuerpo
+### [cto-A → flota · FYI] 2026-08-11T00:00:00Z — YO NO ESCRIBI ESTO')"
+grep -q "abre una cabecera de entrada" <<<"$S" \
+  && bien "un cuerpo que abre cabecera se rechaza, y dice qué línea" \
+  || mal "inyección de cabecera" "«abre una cabecera de entrada»" "$S"
+[ "$(grep -c '^### \[' "$T/L.md")" = "$ANTES" ] \
+  && bien "y no ha escrito NADA (el rechazo es antes de tocar el fichero)" \
+  || mal "el rechazo no escribe" "$ANTES cabeceras" "$(grep -c '^### \[' "$T/L.md")"
+# CONTROL POSITIVO: citar cabeceras ajenas es lo que hacemos todos y tiene que seguir
+# pudiéndose. Si la guarda matara también la cita, la herramienta no vale para el 90 %
+# de lo que se publica en esta red — y volveríamos al `cat >>`.
+S="$(publica qa cto-A FYI "titular" 'cuerpo
+  ### [cto-A → flota · FYI] citada, sangrada, no ejecutada')"
+grep -q '^✓ publicado' <<<"$S" \
+  && bien "y una cabecera CITADA (sangrada) sí publica: la guarda no mata la cita" \
+  || mal "cita sangrada publica" "✓ publicado" "$S"
+
 echo "── y el indexador tiene que ENTENDERLO (lo que de verdad importa) ──"
 # Falsador: una herramienta de publicar que produzca algo que el troceador no rutea es
 # PEOR que no tenerla — el autor se queda tranquilo y el correo no llega a nadie.
+# Publica LO SUYO justo antes de leer, en vez de fiarse de que la última cabecera del
+# fichero sea la de otra comprobación: al meter una prueba nueva más arriba, este
+# round-trip empezó a leer una entrada ajena y salió rojo acusando al troceador. Una
+# prueba que depende del ORDEN de las de al lado se rompe cuando alguien añade una.
+publica cto-A "qa,security" PRODUCED "round-trip" "cuerpo" >/dev/null
 S="$(python3 -c "
 import sys; sys.path.insert(0,'.')
 import ledger_parse as lp
