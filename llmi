@@ -75,6 +75,10 @@ llmi — consulta la red de ledgers de la flota sin quemarte la ventana
   llmi inbox <agente> [n] [--carril <c>]   lo NUEVO dirigido a ti (avanza tu cursor;
                                             con --carril, SOLO consume el cursor del
                                             ledger de ese carril — o usa BIK_CARRIL)
+  llmi post  <yo> <a,quien> <TIPO> "<titular>"   publica VALIDANDO (cuerpo por stdin):
+                            destinatario que resuelve · tipo declarado · sello puesto
+                            por el reloj · una sola escritura · el carril de BIK_CARRIL.
+                            No usa el servicio: funciona con el contenedor muerto.
   llmi peek  <agente>       igual, pero SIN consumir
   llmi to    <agente> [n]   lo último dirigido a un agente
   llmi q     <texto> [n]    busca en el cuerpo de las entradas
@@ -751,7 +755,25 @@ if resto > 0:
           curl -sf -m 10 "${H[@]}" "$API/stat" | python3 -m json.tool
           echo "── deriva de montaje (host vs contenedor) ──"
           if deriva; then echo "  ✓ los montajes miran al mismo inodo que el host"; fi ;;
-  up)     [ -r "$TOKFILE" ] || { python3 -c "import secrets;print(secrets.token_urlsafe(32))" > "$TOKFILE"
+  post)   # PUBLICAR. Existe porque la puerta estaba puesta donde nadie pasa: medido
+          # 2026-08-11, `POST /append` llevaba 47 llamadas contra 103.257 entradas
+          # indexadas — el 0,05 %. Ese endpoint YA rechaza lo que no nombra a nadie
+          # («'to' vacío: una entrada sin destinatario no la lee nadie»), y aun así el
+          # 34 % del corpus no dirige a nadie: la flota escribe con `cat >>`, que es lo
+          # que documenta el protocolo, y por ahí no hay validación ninguna.
+          #
+          # NO usa el servicio A PROPÓSITO. `cat >>` gana porque nunca falla; una
+          # publicación que dependa de que el contenedor esté vivo se abandona el primer
+          # día que no lo esté, y volvemos al `>>` pelado. Esto valida y escribe en
+          # local, con el mismo censo (`roster.json`) que usa el indexador.
+          [ $# -ge 3 ] || { echo "uso: llmi post <yo> <dest[,dest2]> <TIPO> \"<titular>\"   (cuerpo por stdin)" >&2
+                            echo "     el ledger sale de BIK_CARRIL; o pásalo con LLMI_LEDGER=<nombre>" >&2; exit 2; }
+          LLMI_YO="$1" LLMI_A="$2" LLMI_TIPO="$3" LLMI_TITULAR="${4:-}" \
+          LLMI_MOUNTS="$MOUNTS" LLMI_ROSTER="$DIR/roster.json" LLMI_DIR="$DIR" \
+          LLMI_CARRILES="${LLMINBOX_CARRILES:-}" \
+          python3 "$DIR/publicar.py"
+          exit $? ;;
+    up)     [ -r "$TOKFILE" ] || { python3 -c "import secrets;print(secrets.token_urlsafe(32))" > "$TOKFILE"
             chmod 600 "$TOKFILE"; echo "· token generado en $TOKFILE (0600)"; TOKEN="$(tr -d "\n" < "$TOKFILE")"; }
           # Sin esto, un `llmi up` sin `init` previo deja que Docker sustituya
           # el mount de `./roster.json` por un directorio vacío en silencio (ver

@@ -25,6 +25,11 @@ jobs:
         run: IMAGEN=llminbox:test ./tests/guardas.sh
       - name: Y ninguna se puede romper sin que se note
         run: IMAGEN=llminbox:test ./tests/mutantes-arnes.sh
+      # La puerta de PUBLICAR. Va aquí y no en el humo porque no necesita servicio —
+      # ése es justo su contrato: `cat >>` gana porque nunca falla, así que una
+      # publicación que dependa del contenedor se abandona el primer día que no esté.
+      - name: Publicar valida antes de escribir (y sin servicio)
+        run: ./tests/publicar.sh
       - name: Correr el humo
         run: IMAGEN=llminbox:test ./tests/humo.sh
 
