@@ -2357,6 +2357,14 @@ def adopcion(formato: str = Query("texto", pattern="^(texto|json)$")):
         "SELECT agent, COUNT(*) n, MAX(updated) u FROM cursors GROUP BY agent")}
     con.close()
     quien = sorted(set(lec) | set(cur))
+    # AVISO DE LECTURA, porque esta tabla se malinterpreta sola y ya pasó: `lecturas`
+    # guarda el NOMBRE con el que se miró (`cto-A`) y `cursors` guarda la clave de
+    # cursor, que es el ROL (`cto`). Así que un agente con varias sesiones se ve a sí
+    # mismo con «3.952 lecturas · 0 consumidos» en tres filas y una cuarta que sí
+    # consume — y lee que su cursor está partido cuando NO lo está: los 6 ledgers
+    # están drenados bajo su rol. Lo reportó @cto-PM el 2026-08-11 y tuvo la
+    # prudencia de no afirmarlo sin medir. El dato es correcto; lo que faltaba era
+    # decir qué mide cada columna.
     if formato == "json":
         return JSONResponse([{
             "agente": a,
@@ -2375,6 +2383,9 @@ def adopcion(formato: str = Query("texto", pattern="^(texto|json)$")):
     if not quien:
         out.append("   (nadie ha mirado su bandeja todavía)")
     out.append("")
+    out.append("   ⚠️ «lecturas» va por NOMBRE (con el que miraste) y «consumo» por ROL")
+    out.append("      (la clave del cursor). Si te ves con lecturas y 0 consumo en varias")
+    out.append("      filas, NO tienes el cursor partido: mira la fila de tu ROL.")
     out.append("   LEER no consume (`llmi peek`, `curl GET /inbox`); CONSUMIR es el POST")
     out.append("   de `llmi inbox`. Un agente que sólo lee está usando esto bien.")
     # EL COSTE, que es la métrica de éxito real de este servicio: no MB indexados
