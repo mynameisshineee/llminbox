@@ -54,7 +54,8 @@ from dataclasses import dataclass, field
 # corpus real cambian de actor); difusión (FLOTA/equipo/todos) sale de `to` a
 # su propio campo (1.915 entradas cambian de forma, ninguna de cobertura real
 # perdida — ver PROTOCOL.md, sección "Qué NO garantiza el formato hoy").
-PARSER_V = 6   # 6: la difusión se persiste en recipients (⑩) — ver reindex()
+PARSER_V = 7   # 7: un HEARTBEAT no genera destinatarios por arroba cosechada
+               #    (6: la difusión se persiste en recipients — ⑩) — ver reindex()
 
 # Una entrada empieza en una cabecera de cualquiera de las convenciones vivas.
 # Orden importante: `### [` es la dominante (94% del corpus).

@@ -936,7 +936,20 @@ def reindex(ledger: str, path: str, con) -> dict:
         #   · carga inicial → manda el corte por fecha (protege del volcado)
         #   · incremental   → se enruta aunque no traiga sello, porque es correo de
         #     ahora; exigirlo dejaba fuera el 15,7 % del corpus, que no lo trae.
-        if (not e.por_arroba) or previos or (lp.ARROBA_DESDE and e.ts and e.ts >= lp.ARROBA_DESDE):
+        # UN LATIDO NO ES CORREO, y esto lo destapó `vision-canon` sobre su propio
+        # monitor: su script llevaba `@wiki-vault` dentro de la línea que EMITE, así
+        # que cada 15 minutos un HEARTBEAT entraba en mi bandeja como correo dirigido
+        # —58 suyos, todos a la misma persona—. Ellos curaron su texto; esto cura la
+        # clase: son 1.040 filas de destinatario nacidas de latidos, en toda la red.
+        # Arreglarlo emisor a emisor exige que 14 agentes no escriban nunca una arroba
+        # en una línea que corre sola; arreglarlo aquí lo cierra una vez.
+        # Y va ACOTADO al enrutado por arroba: un latido con FLECHA explícita sí lleva
+        # destinatario, porque ahí alguien lo escribió a mano y a propósito. Lo que se
+        # descarta es el nombre COSECHADO del texto libre, que es lo que se fabrica.
+        latido_cosechado = e.tipo == "HEARTBEAT" and e.por_arroba
+        if latido_cosechado:
+            pass
+        elif (not e.por_arroba) or previos or (lp.ARROBA_DESDE and e.ts and e.ts >= lp.ARROBA_DESDE):
             for w in e.to:
                 dest.append((ledger, e.sha, w))
             # ⑩ — la difusión TAMBIÉN se persiste (PARSER_V 6): una entrada
