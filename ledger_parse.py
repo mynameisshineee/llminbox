@@ -54,7 +54,14 @@ from dataclasses import dataclass, field
 # corpus real cambian de actor); difusión (FLOTA/equipo/todos) sale de `to` a
 # su propio campo (1.915 entradas cambian de forma, ninguna de cobertura real
 # perdida — ver PROTOCOL.md, sección "Qué NO garantiza el formato hoy").
-PARSER_V = 8   # 8: la flecha de RUTA sólo cuenta dentro del corchete (7: latidos)
+PARSER_V = 9   # 9: la difusión sobrevive a una re-derivación — sin esto, cada
+               #    arranque con censo o parser nuevo borraba las filas de
+               #    entrega de FLOTA/equipo/todos de TODO el histórico (6.220
+               #    entradas del corpus, 32 filas vivas al medirlo). Se sube
+               #    aquí porque el gate de este número es lo que dispara la
+               #    re-derivación que las recupera: el arreglo sin el gate
+               #    sólo valdría para el correo futuro.
+               #    (8: la flecha de RUTA sólo cuenta dentro del corchete · 7: latidos)
                #    (6: la difusión se persiste en recipients — ⑩) — ver reindex()
 
 # Una entrada empieza en una cabecera de cualquiera de las convenciones vivas.
