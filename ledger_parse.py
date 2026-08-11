@@ -54,7 +54,7 @@ from dataclasses import dataclass, field
 # corpus real cambian de actor); difusión (FLOTA/equipo/todos) sale de `to` a
 # su propio campo (1.915 entradas cambian de forma, ninguna de cobertura real
 # perdida — ver PROTOCOL.md, sección "Qué NO garantiza el formato hoy").
-PARSER_V = 7   # 7: un HEARTBEAT no genera destinatarios por arroba cosechada
+PARSER_V = 8   # 8: la flecha de RUTA sólo cuenta dentro del corchete (7: latidos)
                #    (6: la difusión se persiste en recipients — ⑩) — ver reindex()
 
 # Una entrada empieza en una cabecera de cualquiera de las convenciones vivas.
@@ -418,8 +418,21 @@ def _campos(head: str, cola: str) -> tuple[str | None, str | None, list[str], li
     difusion: list[str] = []
     por_arroba = False
     actor = None
-    if FLECHA.search(inner):
-        izq, der = FLECHA.split(inner, 1)
+    # LA FLECHA DE RUTA VIVE DENTRO DEL CORCHETE. El comentario de arriba decía «lo de
+    # dentro del primer corchete» y el regex captura hasta FIN DE LÍNEA: la intención
+    # estaba escrita y no implementada. Consecuencia medida (2026-08-11, red entera):
+    # una flecha usada como PUNTUACIÓN en la prosa —`cdfaf09b→c48021ca→dee19a1a`, una
+    # cadena de SHAs— partía la cabecera ahí y convertía el resto del titular en lista
+    # de destinatarios. **1.870 filas de destinatario fabricadas así**, 1.040 de ellas
+    # en latidos que se colaban en bandejas ajenas cada 15 minutos.
+    # ⚠️ El acotado es SÓLO para la flecha. La cosecha de `@` sigue leyendo el titular
+    # ENTERO, y eso no es descuido: 661 destinatarios vivos hoy tienen su `@` DESPUÉS
+    # del `]`. Acotar las dos cosas a la vez habría dado de baja ese correo en
+    # silencio — arreglar 1.870 rompiendo 661 no es arreglar.
+    cierre = inner.find("]")
+    inner_ruta = inner[:cierre] if cierre != -1 else inner
+    if FLECHA.search(inner_ruta):
+        izq, der = FLECHA.split(inner_ruta, 1)
         # El actor es el nombre PEGADO a la flecha, no el primero que se mencione:
         # una cabecera que MENCIONA a otro agente antes de la flecha (`escritor
         # ... cita a @lector ... → destinatarios`) se atribuía a "lector" por ir

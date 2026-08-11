@@ -56,3 +56,37 @@ def test_un_latido_con_FLECHA_explicita_sigue_dirigiendo(tmp_path, monkeypatch):
         tmp_path, monkeypatch,
         "### [cto-A → backend · HEARTBEAT] 2026-08-11T10:00:00Z — vigía vivo\n"
     ) == ["backend"]
+
+
+# ── la flecha de RUTA vive dentro del corchete ───────────────────────────────
+
+def test_una_flecha_en_la_prosa_no_reparte_correo(tmp_path, monkeypatch):
+    """El caso real, copiado del corpus: una cadena de SHAs unida con flechas
+    (`cdfaf09b→c48021ca`) partía la cabecera ahí y convertía el resto del titular en
+    lista de destinatarios. 1.870 filas fabricadas así en la red."""
+    assert _destinatarios(
+        tmp_path, monkeypatch,
+        "### [HEARTBEAT cto-A] 2026-08-11T10:00:00Z — cadena firma "
+        "`cdfaf09b→c48021ca` completa · pendientes de backend\n"
+    ) == []
+
+
+def test_la_flecha_de_verdad_sigue_repartiendo(tmp_path, monkeypatch):
+    """CONTROL POSITIVO: 126.021 destinatarios vivos entran por aquí. Si esta prueba
+    no estuviera, el acotado podría dejar la entrega entera muda y nadie lo vería
+    hasta que la flota dejara de recibir correo."""
+    assert _destinatarios(
+        tmp_path, monkeypatch,
+        "### [cto-A → backend · FYI] 2026-08-11T10:00:00Z — algo\n"
+    ) == ["backend"]
+
+
+def test_una_arroba_DESPUES_del_corchete_sigue_entregando(tmp_path, monkeypatch):
+    """EL LÍMITE DEL ACOTADO, y es la mitad que evita romper 661 entregas vivas: sólo
+    se acota la FLECHA. La cosecha de `@` sigue leyendo el titular entero, porque hay
+    661 destinatarios de hoy cuyo `@` está DESPUÉS del `]`. Arreglar 1.870 rompiendo
+    661 no es arreglar."""
+    assert _destinatarios(
+        tmp_path, monkeypatch,
+        "### [cto-A · FYI] 2026-08-11T10:00:00Z — esto lo mira @backend\n"
+    ) == ["backend"]
