@@ -2814,6 +2814,37 @@ def lint(ledger: str | None = None, limit: int = Query(10, le=100)):
                             (name,)).fetchone()["c"]
             marca = "✓" if c == 0 else ("·" if c < n * 0.1 else "⚠")
             out.append(f"  {marca} {etiqueta}: {c} ({100*c//n}%)")
+        # ── correo perdido de verdad (⑰), distinto de "sin destinatario" ──────
+        # "sin destinatario" (arriba) mezcla tres cosas sin separar: HEARTBEAT con
+        # un `→` decorativo en el texto de estado, prosa con un `→` retórico
+        # dentro de una argumentación, retención deliberada por política
+        # (`@censo` anterior a ARROBA_DESDE) y el bug real (cabecera con flecha
+        # de verdad, sin fila en `recipients`). Un `LIKE '%→%'` no distingue
+        # ninguna de las tres — medido: da 21.325 sin filtrar `ausente` (basura
+        # de rotación: una entrada re-indexada en cada barrido que ya no es la
+        # copia vigente) y sigue en 6.559 filtrándolo (HEARTBEAT + arrow
+        # retórico). Se re-ejecuta `_campos()` real —el mismo extractor que ya
+        # decide `to`/`difusion`/`por_arroba` en producción— para heredar el
+        # filtro de censo (`RE_AGENTE`) que separa una flecha de dirección de
+        # una decorativa, y se descarta lo retenido por política a propósito
+        # (`ARROBA_DESDE`, ver `ledger_parse.py:255-262`): eso no es un bug,
+        # es la conducta documentada, y publicarlo aquí junto a hallazgos
+        # reales fabricaría la falsa alarma que este carril ya prohíbe.
+        candidatos = con.execute(
+            "SELECT seq, line_no, head FROM entries WHERE ledger=? AND ausente IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM recipients r "
+            "WHERE r.ledger=entries.ledger AND r.eid=entries.eid)",
+            (name,)).fetchall()
+        perdidas = []
+        for r in candidatos:
+            _, _, to, difusion, _, por_arroba = lp._campos(r["head"], "")
+            if (to or difusion) and not por_arroba:
+                perdidas.append(r)
+        c = len(perdidas)
+        marca = "✓" if c == 0 else ("·" if c < n * 0.1 else "⚠")
+        out.append(f"  {marca} dirigida por flecha, sin entregar: {c} ({100*c//n if n else 0}%)")
+        for r in perdidas[:3]:
+            out.append(f"      ej. #{r['seq']} L{r['line_no']}: {r['head'][:110]}")
         ej = con.execute("SELECT seq,line_no,head FROM entries WHERE ledger=? AND tipo IS NULL "
                          "ORDER BY seq DESC LIMIT ?", (name, limit)).fetchall()
         for r in ej[:3]:
