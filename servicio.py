@@ -3159,8 +3159,13 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
         out.append("   (censo firmado NO montado: sin LLMINBOX_ROLES_ALIAS no hay con qué")
         out.append("   comparar — esta comprobación está CIEGA, que no es lo mismo que en verde)")
     else:
+        # SÓLO LAS CLAVES del censo firmado, que son los NOMBRES. Los valores son
+        # ROLES (`contratosbik` → `contratos`) y un rol no tiene por qué existir como
+        # agente: compararlos daba 3 falsos positivos —`contratos`, `vision`, `wiki`—
+        # y los publiqué en producción antes de medirlos. Este carril prohíbe fabricar
+        # alarmas y la primera versión de este detector fabricó tres.
         conocidos = {a.lower() for a in lp.AGENTES}
-        firmados = set(lp.ROLES_ALIAS) | {v.lower() for v in lp.ROLES_ALIAS.values()}
+        firmados = set(lp.ROLES_ALIAS)
         mudos = sorted(n for n in firmados if n not in conocidos)
         if not mudos:
             out.append(f"   ✓ los {len(firmados)} nombres del censo firmado existen en roster.json")
@@ -3169,9 +3174,16 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
             for m in mudos:
                 # ¿ya está escribiendo? Es la diferencia entre «apúntalo cuando puedas»
                 # y «hay alguien hablando al vacío AHORA», que fue el caso de sdet.
-                n_huerf = con.execute(
-                    "SELECT COUNT(*) c FROM entries WHERE actor IS NULL AND ausente IS NULL "
-                    "AND head LIKE ?", (f"%{m}%",)).fetchone()["c"]
+                # El recuento va por el patrón de FIRMA, no por `LIKE '%nombre%'`:
+                # el laxo casa con cualquier mención en el titular y con nombres que
+                # lo contienen (`contratos` casaba con `contratosbik`), y decía 69
+                # donde había 0. Un detector que exagera se deja de mirar.
+                firma = re.compile(rf"###\s*\[\s*(\W+\s*)?{re.escape(m)}\b", re.I)
+                n_huerf = sum(
+                    1 for (h,) in con.execute(
+                        "SELECT head FROM entries WHERE actor IS NULL AND ausente IS NULL "
+                        "AND head LIKE ?", (f"%{m}%",))
+                    if h and firma.match(h))
                 aviso = (f"  ← ⚠️ ya tiene {n_huerf} entrada(s) HUÉRFANAS: está publicando al vacío"
                          if n_huerf else "  (aún no ha escrito)")
                 out.append(f"      {m}{aviso}")

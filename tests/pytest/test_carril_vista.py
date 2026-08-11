@@ -99,3 +99,29 @@ def test_carriles_vacio_sin_mapa(tmp_path, monkeypatch):
     with TestClient(s.app) as c:
         c.headers.update({"X-Llminbox-Token": "test-token"})
         assert c.get("/carriles").json() == {}
+
+
+def test_doctor_no_confunde_un_ROL_con_un_nombre_firmado(tmp_path, monkeypatch):
+    """④ de /doctor comparaba las CLAVES y los VALORES del censo firmado contra
+    los nombres del roster. Los valores son ROLES (`contratosbik` → `contratos`)
+    y un rol no tiene por qué existir como agente: la primera versión publicó
+    3 falsos positivos en producción (`contratos`, `vision`, `wiki`), con un
+    recuento de huérfanas inflado por un `LIKE '%contratos%'` que casaba con
+    `contratosbik` — decía 69 donde había 0.
+
+    FALSADOR: volver a meter `.values()` en el conjunto de firmados hace que
+    'unrol' aparezca como mudo y esto se pone rojo.
+    """
+    import json
+    from fastapi.testclient import TestClient
+    alias = tmp_path / "roles.json"
+    # 'backend' es nombre (está en el roster); 'unrol' es SÓLO un rol
+    alias.write_text(json.dumps({"rol_por_alias": {"backend": "unrol"}}))
+    s = construir(tmp_path, monkeypatch, extra_env={"LLMINBOX_ROLES_ALIAS": str(alias)})
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        d = c.get("/doctor").text
+        assert "④" in d
+        assert "unrol" not in d, "un ROL no es un nombre firmado ausente"
+        assert "✓" in d.split("④")[1], "sin nombres mudos, la sección va en verde"
