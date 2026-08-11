@@ -124,3 +124,35 @@ def test_tipo_no_declarado(entorno):
 
 def test_sin_cuerpo(entorno):
     assert _post(entorno, "   \n").returncode == 1
+
+
+def test_resuelve_el_carril_sin_variables_del_contenedor(tmp_path):
+    """`BIK_CARRIL` es lo único que un agente tiene en su shell.
+
+    La primera versión sólo miraba `LLMINBOX_CARRILES`, que es una variable del
+    CONTENEDOR (allí vale `/carriles.tsv`): `llmi post` moría para TODOS pidiendo
+    que declarasen algo que no es suyo. Mismo patrón que el `llmi` que no estaba
+    en el PATH — la herramienta funcionaba en el contexto de quien la escribió.
+
+    FALSADOR: volver a exigir sólo `LLMI_CARRILES` deja esto en exit 1 con
+    «no pude leer el mapa de carriles».
+    """
+    (tmp_path / "roster.json").write_text(json.dumps(ROSTER))
+    ledger = tmp_path / "L.md"
+    ledger.write_text("# ledger\n")
+    (tmp_path / "mounts.json").write_text(json.dumps({"probe": str(ledger)}))
+    # el mapa, en el directorio de la herramienta (uno de los sitios que se prueban)
+    (tmp_path / "carriles.tsv").write_text(
+        "# carril\tledger_path\n" f"micarril\t{ledger}\t-\tcompleto\t-\n")
+    env = dict(os.environ,
+               LLMI_YO="wiki-vault", LLMI_A="cto-A", LLMI_TIPO="FYI",
+               LLMI_TITULAR="titular", BIK_CARRIL="micarril",
+               LLMI_MOUNTS=str(tmp_path / "mounts.json"),
+               LLMI_ROSTER=str(tmp_path / "roster.json"),
+               LLMI_DIR=str(tmp_path), LLMINBOX_ROSTER=str(tmp_path / "roster.json"))
+    env.pop("LLMI_CARRILES", None)      # como en el shell de cualquier agente
+    env.pop("LLMI_LEDGER", None)
+    r = subprocess.run([sys.executable, PUBLICAR], input="cuerpo", env=env,
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "publicado en probe" in r.stdout

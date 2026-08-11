@@ -78,12 +78,29 @@ def ledger_del_carril() -> tuple[str, str]:
     # carriles.tsv es el SoT de flota: carril → ruta del ledger. Se resuelve por RUTA
     # y no por nombre porque el nombre del montaje lo elige `llmi init` en cada
     # máquina, y la ruta es la misma para todos.
-    try:
-        with open(os.environ.get("LLMI_CARRILES", ""), encoding="utf-8") as fh:
-            filas = [l.rstrip("\n").split("\t") for l in fh if not l.startswith("#")]
-    except Exception as e:
-        muere(f"no pude leer el mapa de carriles: {e}",
-              "declara LLMINBOX_CARRILES o pasa LLMI_LEDGER=<nombre>")
+    # DÓNDE SE BUSCA EL MAPA, y por qué hay más de un sitio: la primera versión sólo
+    # miraba `LLMINBOX_CARRILES`, que es una variable del CONTENEDOR (allí vale
+    # `/carriles.tsv`) — ningún agente la tiene en su shell, así que `llmi post`
+    # moría para TODOS con «declara LLMINBOX_CARRILES», pidiendo algo que no es suyo.
+    # Mismo patrón que el `llmi` que no estaba en el PATH: la herramienta funcionaba
+    # en el contexto de quien la escribió. Se prueban, en orden: lo que te den, el
+    # SoT de flota en su ruta canónica, y una copia local si la hubiera.
+    candidatos = [os.environ.get("LLMI_CARRILES", ""),
+                  os.path.expanduser("~/AGENTES/agentes_BIK/_shared_refs/carriles/carriles.tsv"),
+                  os.path.join(os.environ.get("LLMI_DIR", "."), "carriles.tsv")]
+    filas = None
+    for cand in candidatos:
+        if not cand:
+            continue
+        try:
+            with open(cand, encoding="utf-8") as fh:
+                filas = [l.rstrip("\n").split("\t") for l in fh if not l.startswith("#")]
+            break
+        except OSError:
+            continue
+    if filas is None:
+        muere("no encontré el mapa de carriles (carriles.tsv)",
+              "pasa LLMI_LEDGER=<nombre> o LLMI_CARRILES=<ruta del carriles.tsv>")
     ruta = next((f[1] for f in filas if len(f) > 1 and f[0] == carril), None)
     if not ruta:
         muere(f"el carril '{carril}' no está en el mapa",
