@@ -108,36 +108,32 @@ paso() {                        # paso <etiqueta> <comando…>
   return 1
 }
 
-# ── escribir en la base del servicio: SIEMPRE desde dentro de un contenedor ──
-# `h.sqlite` lo crea el servicio como uid 1000 en 0644. El runner de Linux es OTRO
-# usuario, así que no puede escribirlo — y `chmod 777` sobre el DIRECTORIO no alcanza
-# al FICHERO. Hasta el 2026-08-11 los pasos que envenenaban y corrompían la base se
-# hacían desde el host: en CI reventaban (`attempt to write a readonly database`,
-# `PermissionError`) y 5 de las 7 puertas del bloque de corrupción certificaban en
-# VERDE una reconstrucción que NUNCA ocurrió. En macOS no se veía porque Docker
-# Desktop virtualiza la propiedad.
-# Por qué `docker run --rm` y no `docker exec`: el daño del camino de ARRANQUE se hace
-# con el contenedor PARADO, y `exec` ahí no existe. Un contenedor efímero escribe igual
-# en las dos plataformas, con el servicio vivo o muerto, y sin pedir `sudo` en el
-# runner. LEER se sigue haciendo desde el host: un 0644 lo lee cualquiera.
+# ── TOCAR la base del servicio: SIEMPRE dentro de un contenedor y como su DUEÑO ──
 #
-# Y el uid con el que escribe NO se elige: SE LEE DEL FICHERO. Las dos elecciones «de
-# sentido común» fallaron, cada una por un lado, y en la máquina de otro:
-#   `-u 0`  → escribe siempre… y SQLite deja `-wal`/`-shm` de root al lado. El servicio
-#             arranca como 1000, se cura bien, y muere en la línea siguiente con
-#             `attempt to write a readonly database` (exit 3). La avería que este
-#             bloque existe para probar, reintroducida por el andamio.
-#   uid 1000 (el `USER` de la imagen) → en este Mac va; en el runner de Linux el mismo
-#             `INSERT` daba `readonly database` con el fichero 0644 delante.
-# Así que se lee `st_uid` de la base y se escribe COMO SU DUEÑO, sea quien sea en esa
-# máquina. Deja de haber una suposición sobre uids que sólo se comprueba en CI.
-# (Y si el dueño resultara ser root, no se disimula: la guarda de propiedad de más
-# abajo declara el bloque NO MEDIDO.)
+# 🔑 SOBRE UNA BASE EN WAL NO EXISTE «SÓLO LEER». Abrirla con `mode=ro` CREA `-wal` y
+# `-shm` al lado, propiedad de QUIEN CONECTA. El test las leía desde el host, así que
+# en el runner quedaban del usuario del runner (uid 1001) pegadas a una base del
+# servicio (uid 1000), y desde ese momento NADIE más podía escribir: el `INSERT` del
+# veneno daba `attempt to write a readonly database` con el 0644 delante, y el arranque
+# siguiente moría con exit 3. Costó TRES corridas de CI porque el síntoma sale tres
+# pasos más allá del acto que lo causa, y porque en macOS no existe: Docker Desktop
+# virtualiza la propiedad y ahí todo se ve del uid de quien mira. Medido:
+#     /datos      modo 0777 uid 1001
+#     h.sqlite    uid=1000  escribible=True
+#     h.sqlite-wal / -shm   uid=1001  escribible=False   ← las dejó una LECTURA
 #
-# Por qué `docker run --rm` y no `docker exec`: el daño del camino de ARRANQUE se hace
-# con el contenedor PARADO, y `exec` ahí no existe. Un contenedor efímero escribe igual
-# en las dos plataformas, con el servicio vivo o muerto, y sin pedir `sudo` en el
-# runner. LEER se sigue haciendo desde el host: un 0644 lo lee cualquiera.
+# De ahí las tres decisiones de esta función, cada una pagada:
+#   ① lectura y escritura pasan las DOS por aquí. No hay operación inocua.
+#   ② `docker run --rm`, no `docker exec`: el daño del camino de ARRANQUE se hace con
+#      el contenedor PARADO, y ahí `exec` no existe.
+#   ③ el uid NO se elige, SE LEE del fichero. Las dos elecciones «de sentido común»
+#      fallaron, cada una por un lado y sólo en la máquina de otro:
+#        `-u 0`   → escribe siempre… y deja los laterales de root: mismo bloqueo, misma
+#                   muerte al arrancar. Tapaba el defecto en vez de arreglarlo.
+#        uid 1000 (el `USER` de la imagen) → verde aquí, `readonly database` en Linux.
+#      Escribiendo como el dueño real deja de haber una suposición sobre uids que sólo
+#      se comprueba en CI. Y si el dueño fuera root, la guarda de propiedad de más
+#      abajo declara el bloque NO MEDIDO en vez de disimularlo.
 en_contenedor() {               # en_contenedor <dir-datos> <programa-python>
   local d="$1" prog="$2" dueno
   dueno=$(docker run --rm -v "$d:/datos" "${IMAGEN:-llminbox:test}" python3 -c \
@@ -148,6 +144,34 @@ en_contenedor() {               # en_contenedor <dir-datos> <programa-python>
 # Quién es dueño de qué y quién puede escribir qué, dicho por un proceso DENTRO del
 # contenedor. Existe porque dos corridas de CI se fueron en adivinarlo desde un Mac
 # que virtualiza la propiedad: aquí este volcado es decorativo, en Linux es la prueba.
+# GUARDA DE PROPIEDAD: junto a la base no puede haber un fichero de otro uid. Si lo
+# hay —lo deja una escritura con el uid equivocado, o simplemente una LECTURA desde el
+# host, que crea `-wal`/`-shm` a nombre de quien conecta—, el servicio no podrá
+# escribirlos y todo lo que siga mide UN ARTEFACTO DEL TEST disfrazado de avería del
+# producto. Es exactamente lo que pasó el 2026-08-11: el informe acusaba al arranque de
+# un `readonly database` que había puesto el andamio. Devuelve 1 y NOMBRA a los
+# intrusos; quien la llama declara el bloque NO MEDIDO, que es lo contrario de acusar.
+# ⚠️ ALCANCE DECLARADO: sobre bind-mounts de macOS es INERTE — Docker Desktop
+# virtualiza la propiedad y todo se ve del uid de quien mira, así que aquí no dirá
+# nada nunca. Muerde en Linux, que es donde vive la avería. Falsada fuera del camino
+# del test, sobre un volumen NOMBRADO (propiedad real, como en el runner): un fichero
+# escrito con `-u 0` sale `de-root(uid=0)`; sin él, `NINGUNO`. Y de paso se vio el
+# mecanismo entero, peor de lo que parecía: con propiedad real root deja el DIRECTORIO
+# suyo y el uid del servicio ya no puede ni crear un fichero dentro.
+ajenos_en_datos() {             # ajenos_en_datos <dir-datos> → 0 limpio · 1 hay intrusos
+  local malos
+  malos=$(docker run --rm -v "$1:/datos" "${IMAGEN:-llminbox:test}" python3 -c "
+import os
+dueno = os.stat('/datos/h.sqlite').st_uid          # el uid del SERVICIO, no el mío
+print(' '.join(f'{n}(uid={os.stat(\"/datos/\"+n).st_uid})'
+                for n in sorted(os.listdir('/datos'))
+                if os.stat('/datos/'+n).st_uid != dueno))" 2>/dev/null)
+  [ -z "$malos" ] && return 0
+  echo "  ⏭️  junto a la base hay ficheros de OTRO uid ($malos): el servicio no podrá"
+  echo "     escribirlos, y lo que siga mediría un artefacto del test, no el producto."
+  return 1
+}
+
 propiedad_datos() {             # propiedad_datos <dir-datos> <etiqueta>
   echo "  ── propiedad de $2 (vista desde dentro del contenedor) ──"
   docker run --rm -v "$1:/datos" "${IMAGEN:-llminbox:test}" python3 -c "
@@ -517,10 +541,18 @@ if [ -z "$LISTO" ]; then
   echo "     es una acusación sin prueba."
 else
 
+# También LEER va por el contenedor, y esto es la causa que costó tres corridas de CI
+# encontrar: abrir en `mode=ro` una base en WAL **ESCRIBE EN EL DISCO** — SQLite crea
+# `-wal` y `-shm` al lado, propiedad de QUIEN CONECTA. Leyéndola desde el host, el
+# runner (uid 1001) las dejaba suyas junto a una base del servicio (uid 1000), y a
+# partir de ahí NADIE más podía escribir: el `INSERT` del veneno daba `readonly
+# database` con el 0644 delante, y el arranque siguiente moría con exit 3. El
+# comentario que había aquí —«leer se hace desde el host: un 0644 lo lee cualquiera»—
+# era la afirmación falsa que sostenía el error. Leer esa base es escribir.
 lee_eid() {   # a qué entrada apunta un cursor, en la base que haya ahora mismo
-  python3 -c "
+  en_contenedor "$D2" "
 import sqlite3
-c=sqlite3.connect('file:$D2/h.sqlite?mode=ro',uri=True,timeout=20)
+c=sqlite3.connect('file:/datos/h.sqlite?mode=ro',uri=True,timeout=20)
 r=c.execute('SELECT eid FROM entries WHERE ledger=\"g\" AND arrival<=? ORDER BY arrival DESC LIMIT 1',($1,)).fetchone()
 print(r[0] if r else 'NINGUNA')" 2>/dev/null
 }
@@ -531,6 +563,11 @@ EID_ANTES=$(lee_eid "$CUR_ANTES")
 # distingue — el de un índice corrupto que viene de una versión anterior.
 MONTADO="sí"
 propiedad_datos "$D2" "la base del servicio, ANTES de tocarla"
+# La guarda va ANTES de envenenar, no sólo después: los ficheros de un uid ajeno los
+# puede dejar una LECTURA (ver `lee_eid`), o sea que pueden estar ahí antes de que este
+# bloque escriba nada. Detectarlo al final decía «no medido» con razón pero tres pasos
+# tarde, y lo que se veía por delante era `readonly database` en el sitio equivocado.
+ajenos_en_datos "$D2" || MONTADO=""
 paso "el envenenado de la huella de esquema" en_contenedor "$D2" "
 import sqlite3
 c=sqlite3.connect('/datos/h.sqlite',timeout=20)
@@ -571,33 +608,8 @@ print(f'  (dañados {(b-a)//1024} KB de {n//1024} KB, franja {a}-{b})')" || MONT
 if [ -z "$MONTADO" ]; then
   echo "  ⏭️  el índice NUNCA se llegó a dañar: lo que sigue NO mide la cura de corrupción."
 fi
-# GUARDA DE PROPIEDAD, y nace de haber roto justo esto: si el daño lo escribe un uid
-# que no es el del servicio, quedan ficheros —la base, su `-wal`, su `-shm`— que el
-# servicio no puede escribir, y a partir de ahí el bloque mide UN ARTEFACTO DEL TEST
-# disfrazado de avería del producto. Pasó el 2026-08-11: escrito como root, el
-# arranque siguiente moría con `readonly database` y el informe lo contaba como
-# defecto del arranque.
-# ⚠️ ALCANCE DECLARADO: sobre bind-mounts de macOS esta guarda es INERTE — Docker
-# Desktop virtualiza la propiedad y TODO se ve del uid de quien mira, así que aquí
-# nunca dirá nada. Muerde en Linux, que es donde vive la avería. Falsada fuera del
-# camino del test, sobre un volumen NOMBRADO (propiedad real, como en el runner):
-# un fichero escrito con `-u 0` sale `de-root(uid=0)`; sin él, `NINGUNO`. Y de paso
-# se vio el mecanismo entero: con propiedad real, root deja el DIRECTORIO suyo y el
-# uid 1000 ya no puede ni crear un fichero dentro.
 if [ -n "$MONTADO" ]; then
-  AJENOS=$(en_contenedor "$D2" "
-import os
-malos=[]
-for n in sorted(os.listdir('/datos')):
-    st=os.stat('/datos/'+n)
-    if st.st_uid != os.getuid():
-        malos.append(f'{n}(uid={st.st_uid})')
-print(' '.join(malos))" 2>/dev/null)
-  if [ -n "$AJENOS" ]; then
-    MONTADO=""
-    echo "  ⏭️  el daño dejó ficheros de OTRO uid ($AJENOS): el servicio no podrá escribirlos"
-    echo "     y lo que siga mediría un artefacto del test, no el producto."
-  fi
+  ajenos_en_datos "$D2" || MONTADO=""
 fi
 # Falsador: sin auto-reparación esto se queda sirviendo 500 —o con el ledger en
 # `rotos`— para siempre, que es literalmente lo que hacía antes.
@@ -702,9 +714,9 @@ HUELLA=$(python3 -c "
 import hashlib,re
 v=re.search(r'^SCHEMA_V = (\d+)', open('$PWD/servicio.py').read(), re.M).group(1)
 print(hashlib.sha256(v.encode()).hexdigest()[:16])")
-GUARDADA=$(python3 -c "
+GUARDADA=$(en_contenedor "$D2" "
 import sqlite3
-c=sqlite3.connect('file:$D2/h.sqlite?mode=ro',uri=True,timeout=20)
+c=sqlite3.connect('file:/datos/h.sqlite?mode=ro',uri=True,timeout=20)
 r=c.execute(\"SELECT v FROM meta WHERE k='schema_v'\").fetchone()
 print(r[0] if r else 'NINGUNA')")
 # Falsador: sin el arreglo aquí saldría `huella-obsoleta`, la que se envenenó arriba.
