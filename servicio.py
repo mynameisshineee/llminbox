@@ -49,7 +49,7 @@ import threading
 import unicodedata
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import secrets
 
@@ -2734,6 +2734,140 @@ def append(p: Post):
             fcntl.flock(fh, fcntl.LOCK_UN)
     return {"ok": True, "ts": ts, "byte_off": off, "bytes": len(texto.encode()),
             "sha": hashlib.sha256(texto.encode()).hexdigest()[:16]}
+
+
+@app.get("/doctor", response_class=PlainTextResponse, dependencies=GATE)
+def doctor(dias: int = Query(7, ge=1, le=90)):
+    """Los tres fallos de USO que este servicio ve y nadie mira.
+
+    Ninguno es un bug: el servicio hace lo que promete en los tres. Son fallos del
+    lado del que escribe y del que lee, y por eso ningún test los caza — pero los
+    datos para verlos llevan meses en tres tablas y no había vista que los sacara.
+    Ese hueco es lo que esto llena.
+
+    ① mira y no drena  ·  ② publica y no dirige  ·  ③ claims que nadie soltó
+
+    ⚠️ LO QUE NO MIDE, dicho aquí y no en un pie de página: nada de esto sabe si el
+    trabajo se hizo. Un agente puede drenar cero y estar haciendo justo lo que toca,
+    y otro dejar la bandeja a cero sin leer una línea. Son señales de HIGIENE del
+    canal, no de rendimiento de nadie, y usarlas como lo segundo enseña a drenar por
+    drenar — que es un tráfico peor que el que hay hoy.
+    """
+    con = db()
+    ahora = datetime.now(timezone.utc)
+    corte = (ahora - timedelta(days=dias)).isoformat(timespec="seconds")
+    out: list[str] = [f"── doctor · ventana de {dias} día(s) · {ahora.isoformat(timespec='seconds')} ──"]
+
+    # ── ① MIRA Y NO DRENA ────────────────────────────────────────────────────
+    # La pregunta que contesta: ¿a quién se le está acumulando correo dirigido que
+    # no ha consumido? Se cuenta EXACTAMENTE como lo cuenta `/inbox` —mismos nombres
+    # escuchados, misma expansión de difusión, mismos ledgers excluidos—, porque un
+    # doctor que cuenta distinto que la bandeja inventa deuda que el agente no ve.
+    # Se agrupa por ROL, no por nombre de sesión, y esto lo cazó su propio test:
+    # `lecturas` guarda el nombre con que se miró (`backend`) y `cursors` guarda la
+    # clave de cursor, que es el ROL (`be`). Uniendo las dos tablas a pelo, la misma
+    # persona salía DOS VECES —una debiendo correo y otra al día—, que es la forma
+    # más rápida de que un informe deje de leerse. El nombre que se enseña es el rol,
+    # porque es el que manda en el cursor; para llamar a `escuchados()` hace falta un
+    # nombre real, así que se guarda un representante por rol.
+    repr_de: dict[str, str] = {}
+    for tabla in ("lecturas", "cursors"):
+        for r in con.execute(f"SELECT DISTINCT agent FROM {tabla}"):
+            repr_de.setdefault(lp.rol_de(r["agent"]), r["agent"])
+    lec = {lp.rol_de(r["agent"]): r for r in con.execute("SELECT * FROM lecturas")}
+    filas = []
+    for rol, a in sorted(repr_de.items()):
+        nombres = list(lp.escuchados(a))
+        for dif in lp.DIFUSION:
+            c = lp.canonico(dif)
+            if c not in nombres:
+                nombres.append(c)
+        marcas = ",".join("?" * len(nombres))
+        pend = 0
+        for name in LEDGERS:
+            if name in INBOX_EXCLUIR:
+                continue
+            c = con.execute("SELECT last_arrival FROM cursors WHERE agent=? AND ledger=?",
+                            (clave_cursor(a), name)).fetchone()
+            pend += con.execute(
+                "SELECT COUNT(*) n FROM entries e "
+                f"WHERE e.ledger=? AND EXISTS (SELECT 1 FROM recipients r WHERE "
+                f"r.ledger=e.ledger AND r.eid=e.eid AND r.who IN ({marcas})) "
+                "AND e.arrival>? AND e.ausente IS NULL",
+                (name, *nombres, c["last_arrival"] if c else -1)).fetchone()["n"]
+        if pend:
+            ult = con.execute("SELECT MAX(updated) u FROM cursors WHERE agent=?",
+                              (clave_cursor(a),)).fetchone()["u"]
+            filas.append((pend, rol, (lec[rol]["ultima"][:16] if rol in lec else "nunca"),
+                          (ult[:16] if ult else "nunca")))
+    filas.sort(reverse=True)
+    out += ["", f"① MIRA Y NO DRENA — {len(filas)} agente(s) con correo dirigido sin consumir",
+            f"   {'agente':<20}{'pendientes':>11}  {'última mirada':<18}último consumo"]
+    for pend, a, mirada, consumo in filas[:20]:
+        # «nunca» en la 1ª columna y pendientes>0 es OTRA cosa: ni siquiera mira.
+        # Se distingue en la propia fila en vez de en una sección aparte — la lista
+        # ya está ordenada por deuda, y separarlas obliga a leer dos veces.
+        out.append(f"   {a:<20}{pend:>11}  {mirada:<18}{consumo}"
+                   + ("   ← NI MIRA" if mirada == "nunca" else ""))
+    if not filas:
+        out.append("   (nadie tiene correo dirigido sin consumir)")
+
+    # ── ② PUBLICA Y NO DIRIGE ────────────────────────────────────────────────
+    # El fallo que hace inútil todo lo demás: una entrada sin destinatario no cae en
+    # ninguna bandeja, así que publicarla equivale a no publicarla — el lector la
+    # encuentra si vuelve a leer el canal entero, que es lo que esto viene a evitar.
+    # Se mira por AUTOR y no en total: «el 96 % no dirige» no le dice a nadie qué
+    # cambiar; «tú, 14 de 15» sí.
+    # La ventana incluye lo que NO TIENE SELLO DE HORA, y esa decisión es la que
+    # separa este número de uno que halaga. Con `ts >= corte` a secas, las entradas
+    # sin fecha —el 14 % del corpus de la flota— desaparecían del informe… y son
+    # exactamente las mismas que suelen venir sin destinatario: quien no pone la hora
+    # tampoco pone la flecha. O sea que el filtro escondía justo el caso que esta
+    # sección existe para contar, y el sesgo iba en la dirección cómoda. Se incluyen,
+    # y se dice cuántas son, porque tampoco se pueden fechar.
+    ventana = "(e.ts>=? OR e.ts IS NULL OR e.ts='')"
+    sin_dir = list(con.execute(
+        "SELECT e.actor, COUNT(*) n, SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM recipients r "
+        "  WHERE r.ledger=e.ledger AND r.eid=e.eid) THEN 1 ELSE 0 END) huerfanas "
+        f"FROM entries e WHERE {ventana} AND e.ausente IS NULL AND e.actor IS NOT NULL "
+        "GROUP BY e.actor HAVING huerfanas>0 ORDER BY huerfanas DESC LIMIT 20", (corte,)))
+    tot = con.execute(f"SELECT COUNT(*) n FROM entries e WHERE {ventana} AND e.ausente IS NULL",
+                      (corte,)).fetchone()["n"]
+    sin_ts = con.execute("SELECT COUNT(*) n FROM entries WHERE (ts IS NULL OR ts='') "
+                         "AND ausente IS NULL").fetchone()["n"]
+    hue = sum(r["huerfanas"] for r in sin_dir)
+    pct = f"{100 * hue // tot}%" if tot else "—"
+    nota_ts = f" · incluye {sin_ts} sin sello de hora (no fechables)" if sin_ts else ""
+    out += ["", f"② PUBLICA Y NO DIRIGE — {hue} de {tot} entradas ({pct}) no nombran a nadie{nota_ts}",
+            f"   {'autor':<20}{'sin dirigir':>12}{'de':>8}"]
+    for r in sin_dir:
+        out.append(f"   {(r['actor'] or '—'):<20}{r['huerfanas']:>12}{r['n']:>8}")
+    if not sin_dir:
+        out.append("   (todo lo publicado en la ventana nombra a alguien)")
+    out.append("   Una entrada sin `→ destinatario` (o sin `@nombre`) no entra en ninguna")
+    out.append("   bandeja: se publica en un canal que ya nadie lee entero.")
+
+    # ── ③ CLAIMS QUE NADIE SOLTÓ ─────────────────────────────────────────────
+    # Vencido NO es abandonado: el TTL sólo dice que otro PUEDE relevarte. Lo que se
+    # lista es lo que está cogido más tiempo del que dura la garantía, para que el
+    # dueño lo cierre o lo diga — no para quitárselo a nadie por la espalda.
+    viejos = [r for r in con.execute(
+        "SELECT tema, rol, agent, abierto FROM claims WHERE cerrado IS NULL "
+        "ORDER BY abierto") if _vencido(r["abierto"])]
+    out += ["", f"③ CLAIMS PASADOS DE TTL ({CLAIM_TTL_H} h) — {len(viejos)} sin cerrar ni relevar",
+            f"   {'tema':<38}{'rol':<9}{'de':<12}horas"]
+    for r in viejos[:20]:
+        try:
+            h = int((ahora - datetime.fromisoformat(r["abierto"])).total_seconds() // 3600)
+        except ValueError:
+            h = -1
+        out.append(f"   {r['tema'][:37]:<38}{r['rol']:<9}{r['agent'][:11]:<12}{h:>5}")
+    if not viejos:
+        out.append("   (ninguno pasado de plazo)")
+    out.append("   Vencido ≠ abandonado: el TTL dice que otro PUEDE relevarte, no que")
+    out.append("   hayas fallado. Ciérralo, o di en el ledger por qué sigue abierto.")
+    con.close()
+    return "\n".join(out) + "\n"
 
 
 @app.get("/lint", response_class=PlainTextResponse, dependencies=GATE)
