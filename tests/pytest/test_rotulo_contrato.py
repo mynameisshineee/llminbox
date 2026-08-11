@@ -76,3 +76,57 @@ def test_el_servicio_emite_un_rotulo_que_la_flota_parsea(cliente):
     linea = next(l for l in texto.splitlines() if l.startswith("── demo-ledger"))
     assert re.search(r"^── demo-ledger · [0-9]+ de [0-9]+ para ti", linea), linea
     assert "carril: demo" in linea      # ⑫ sigue vivo, pero fuera del prefijo contractual
+
+
+# ── Lo que declara @cto (bikeus) que parsea, contestando a mi petición del
+#    2026-08-11. Cada entrada aquí viene de SU mensaje, con su ruta de uso, no de
+#    lo que yo suponga que consume. Si cambia su parse, se cambia aquí con él.
+CONSUMIDORES_DECLARADOS = {
+    # `llmi to` / `llmi q` → JSON de /entries. De 10 claves gatea 5.
+    "cto·claves-json": ["line_no", "ts", "actor", "head", "to"],
+}
+
+
+def test_entries_conserva_las_claves_que_cto_gatea(cliente):
+    """`line_no` es la crítica: la compara contra `grep -n` del fichero para
+    verificar POR LÍNEA que su entrada entró en el índice. Si cambia de nombre
+    o de base (0 vs 1), él creería que el canal le pierde entradas.
+
+    FALSADOR: renombrar o quitar cualquiera de las 5 pone esto rojo.
+    """
+    filas = cliente.get("/entries?limit=1").json()
+    assert filas, "sin datos no se puede afirmar el contrato"
+    for k in CONSUMIDORES_DECLARADOS["cto·claves-json"]:
+        assert k in filas[0], f"@cto gatea '{k}' en llmi to/q — ver su mensaje del 11-08"
+    assert filas[0]["line_no"] >= 1, "line_no es 1-based: él lo cruza con `grep -n`"
+
+
+def test_el_banner_ocupa_exactamente_la_linea_1(cliente):
+    """@cto lee el rótulo con `sed -n '2p'`, o sea ASUME que el aviso de contenido
+    ajeno ocupa la línea 1 y sólo una. Añadir una línea arriba lo rompe en
+    silencio: leería una línea de datos como si fuera el rótulo.
+
+    FALSADOR: meter una segunda línea de banner (o quitarlo) desplaza el rótulo
+    y esta aserción cae.
+    """
+    lineas = cliente.get("/inbox/backend").text.splitlines()
+    assert lineas[0].startswith("⚠️"), "la línea 1 debe ser el banner de contenido ajeno"
+    assert lineas[1].startswith("── "), "la línea 2 debe ser el rótulo: @cto usa sed -n '2p'"
+
+
+def test_adopcion_json_no_depende_de_columnas(cliente):
+    """El parse que @cto declaró como su MÁS FRÁGIL —`grep -E "^   <nombre> "`,
+    tres espacios y ancho fijo— ya se rompe hoy: un nombre de 28 caracteres en una
+    columna de 22 desalinea la fila, su grep devuelve vacío y él lo lee como «ese
+    agente no aparece». Un falso «no existe», silencioso, sobre adopción.
+
+    `formato=json` le da un contrato que no depende de contar espacios.
+    FALSADOR: si el JSON perdiera una clave o cambiara de forma, cae aquí.
+    """
+    d = cliente.get("/adopcion?formato=json").json()
+    assert isinstance(d, list)
+    if d:
+        for k in ("agente", "lecturas", "ultima_lectura", "ledgers_consumidos"):
+            assert k in d[0], f"falta '{k}' en el JSON de adopción"
+    # y el texto sigue existiendo para quien ya lo usa
+    assert "adopción ·" in cliente.get("/adopcion").text

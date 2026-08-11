@@ -82,7 +82,7 @@ llmi — consulta la red de ledgers de la flota sin quemarte la ventana
   llmi lint  [ledger]       deuda de tipado (qué entradas no declaran nada)
   llmi verify               integridad del canon (¿ha desaparecido alguna entrada?)
   llmi canon [n]            cola de destilación: lo dirigido que aún no es página
-  llmi adopcion             quién LEE su bandeja y quién la consume (no es lo mismo)
+  llmi adopcion [--json]    quién LEE su bandeja y quién la consume (no es lo mismo)
   llmi wiki [q]             las páginas de tu wiki, con sus citas al ledger
   llmi wiki citas           ¿cada cita apunta a una entrada que existe? (el gate)
   llmi wiki <ruta.md>       una página entera, con sus citas YA resueltas
@@ -683,7 +683,15 @@ except Exception: print(open(sys.argv[1]).read(), file=sys.stderr)' "$cuerpo_pos
           curl -sf -m 20 "${H[@]}" "$API/lint${1:+?ledger=$1}" ;;
   adopcion|adopción)
           vivo || { sin_servicio; exit 3; }
-          curl -sf -m 20 "${H[@]}" "$API/adopcion" ;;
+          # `--json` para quien PARSEA esto. La tabla de texto tiene columnas de ancho
+          # fijo y hay quien la lee con `grep -E "^   <nombre> "`: un nombre más largo
+          # que la columna desalinea la fila y el grep devuelve vacío, que se lee como
+          # «ese agente no aparece». Pedido por @cto (bikeus) con la medida delante.
+          if [ "${1:-}" = "--json" ]; then
+            curl -sf -m 20 "${H[@]}" "$API/adopcion?formato=json"
+          else
+            curl -sf -m 20 "${H[@]}" "$API/adopcion"
+          fi ;;
   wiki)   vivo || { sin_servicio; exit 3; }
           # `citas` es el gate; una ruta que acaba en .md es una página; lo demás
           # es búsqueda. Sin argumento, la lista entera.

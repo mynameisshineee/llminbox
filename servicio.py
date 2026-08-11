@@ -54,7 +54,8 @@ from datetime import datetime, timedelta, timezone
 import secrets
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
-from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import (FileResponse, JSONResponse, PlainTextResponse,
+                               RedirectResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -2280,9 +2281,18 @@ class Leido(BaseModel):
     hasta: dict[str, int]              # {ledger: última LLEGADA consumida}
 
 
-@app.get("/adopcion", response_class=PlainTextResponse, dependencies=GATE)
-def adopcion():
+@app.get("/adopcion", dependencies=GATE)
+def adopcion(formato: str = Query("texto", pattern="^(texto|json)$")):
     """¿Quién LEE su bandeja, y quién además la consume?
+
+    `formato=json` NO es un adorno: la tabla de texto tiene columnas de ancho fijo
+    y @cto (bikeus) la lee con `grep -E "^   <nombre> "` — tres espacios y
+    alineación. **Ya se rompe hoy**, y él mismo lo midió al contestarme: un nombre
+    largo (`CONTROL-cto-inbox-1786017873`, 28 car. en una columna de 22) desborda y
+    desalinea el resto de la fila. Cuando su grep falla devuelve VACÍO, y él lo lee
+    como «ese agente no aparece» — un falso «no existe», silencioso, sobre una
+    métrica de adopción. Un consumidor que declara su parse merece un contrato que
+    no dependa de contar espacios.
 
     Existe porque el indicador anterior contaba cursores, y el cursor sólo nace al
     CONSUMIR. La forma correcta de leer al arrancar no consume, así que seis agentes
@@ -2299,6 +2309,14 @@ def adopcion():
         "SELECT agent, COUNT(*) n, MAX(updated) u FROM cursors GROUP BY agent")}
     con.close()
     quien = sorted(set(lec) | set(cur))
+    if formato == "json":
+        return JSONResponse([{
+            "agente": a,
+            "lecturas": (lec[a]["veces"] if a in lec else 0),
+            "ultima_lectura": (lec[a]["ultima"][:19] if a in lec else None),
+            "ledgers_consumidos": (cur[a]["n"] if a in cur else 0),
+            "ultimo_consumo": (cur[a]["u"] if a in cur else None),
+        } for a in quien])
     out = [f"── adopción · {len(lec)} han LEÍDO · {len(cur)} han CONSUMIDO ──",
            f"   {'agente':<22}{'lecturas':>9}  {'última lectura':<21}consumo"]
     for a in quien:
