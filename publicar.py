@@ -88,23 +88,32 @@ def ledger_del_carril() -> tuple[str, str]:
     candidatos = [os.environ.get("LLMI_CARRILES", ""),
                   os.path.expanduser("~/AGENTES/agentes_BIK/_shared_refs/carriles/carriles.tsv"),
                   os.path.join(os.environ.get("LLMI_DIR", "."), "carriles.tsv")]
-    filas = None
+    # Se busca EL CARRIL en todos los candidatos, no el primer fichero que abra: si
+    # el primero existe pero no lo contiene, pararse ahí es decir «tu carril no está»
+    # habiendo mirado en un solo sitio. (Lo cazó su propio test, que resolvía contra
+    # el mapa de flota y nunca llegaba al local.)
+    filas = ruta = None
+    vistos = []
     for cand in candidatos:
         if not cand:
             continue
         try:
             with open(cand, encoding="utf-8") as fh:
-                filas = [l.rstrip("\n").split("\t") for l in fh if not l.startswith("#")]
-            break
+                f_cand = [l.rstrip("\n").split("\t") for l in fh if not l.startswith("#")]
         except OSError:
             continue
+        filas = filas or f_cand
+        vistos += [f[0] for f in f_cand if len(f) > 1]
+        r = next((f[1] for f in f_cand if len(f) > 1 and f[0] == carril), None)
+        if r:
+            ruta = r
+            break
     if filas is None:
         muere("no encontré el mapa de carriles (carriles.tsv)",
               "pasa LLMI_LEDGER=<nombre> o LLMI_CARRILES=<ruta del carriles.tsv>")
-    ruta = next((f[1] for f in filas if len(f) > 1 and f[0] == carril), None)
     if not ruta:
         muere(f"el carril '{carril}' no está en el mapa",
-              "carriles conocidos: " + ", ".join(f[0] for f in filas if len(f) > 1))
+              "carriles conocidos: " + ", ".join(sorted(set(vistos))))
     nombre = next((k for k, v in mounts.items() if os.path.realpath(v) == os.path.realpath(ruta)), None)
     if nombre is None:
         muere(f"el carril '{carril}' apunta a {ruta}, que no tienes montado",
