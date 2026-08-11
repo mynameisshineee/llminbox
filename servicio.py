@@ -2676,6 +2676,21 @@ def claims_vivos():
             "ttl_horas": CLAIM_TTL_H, "claims": filas}
 
 
+def _indexable(nombre: str) -> bool:
+    """¿RE_AGENTE reconocerá esto como actor/destinatario al re-indexar?
+
+    Deliberadamente NO usa `canon_identidad()`: esa función resuelve también
+    contra `roles-por-alias.json` (ROLES_ALIAS), que `RE_AGENTE` no consulta —
+    ver `ledger_parse.py:165-169`. Un alta firmada SOLO ahí pasaría un gate
+    basado en `canon_identidad()` y aun así indexaría con actor=None: es
+    exactamente el bug que este gate cierra, reproducido por otra vía. El
+    censo correcto para esta comprobación es `lp.AGENTES` (ya incluye
+    `DIFUSION`, `ledger_parse.py:156`, así que un `to=["FLOTA"]` pasa sin
+    caso especial).
+    """
+    return bool(nombre) and nombre.strip().lower() in {a.lower() for a in lp.AGENTES}
+
+
 class Post(BaseModel):
     ledger: str
     actor: str
@@ -2707,8 +2722,26 @@ def append(p: Post):
     path = LEDGERS.get(p.ledger)
     if not path:
         raise HTTPException(404, f"ledger desconocido: {p.ledger}")
+    # CENSO ANTES DE ESCRIBIR (⑰): `append()` no pasaba `actor`/`to` por ningún
+    # censo — escribía el string crudo. El fail-closed de lectura (①,
+    # `resolver_o_422`) no protege esta ruta porque nunca se llamaba aquí, y
+    # tampoco basta con enchufarlo tal cual: `resolver_o_422`/`canon_identidad`
+    # resuelven contra roles-por-alias.json además de roster.json, y
+    # `RE_AGENTE` (quien re-indexará esto) SOLO conoce roster.json — ver
+    # `_indexable()`. Sin este gate, una firma que "suena a censada" pasaría
+    # y aun así quedaría indexada con actor=None: huérfana, igual que las que
+    # se está cerrando aquí.
+    if not _indexable(p.actor):
+        raise HTTPException(
+            422, f"'{p.actor}' no resuelve en el censo (roster.json: agentes/"
+                 f"humanos/difusión) — date de alta o revisa el nombre")
     if not p.to:
         raise HTTPException(422, "'to' vacío: una entrada sin destinatario no la lee nadie")
+    for malo in p.to:
+        if not _indexable(malo):
+            raise HTTPException(
+                422, f"destinatario '{malo}' no resuelve en el censo — "
+                     f"date de alta o revisa el nombre")
     # LOS MONTAJES DE LEDGER VAN EN SÓLO LECTURA, y es deliberado: hoy ni un servicio
     # con un bug puede corromper 31.207 entradas. Con `:ro`, este endpoint no puede
     # cumplir lo que promete — y hasta hoy lo descubrías con un 500 y una traza de
