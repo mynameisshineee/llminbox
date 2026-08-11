@@ -250,3 +250,42 @@ def test_cerrar_y_relevar_no_se_confunden(cliente, servicio):
     # Y el informe los reparte en vez de sumarlos en un montón.
     s = _seccion(_texto(cliente), 3)
     assert "1 los cerró su dueño" in s and "1 fueron relevos" in s
+
+
+# ── el tablero al coger ──────────────────────────────────────────────────────
+
+def test_al_coger_algo_te_devuelve_lo_que_ya_esta_cogido(cliente, servicio):
+    """El casi-choque del 2026-08-11: iba a abrir un tema sobre trabajo que `qa` ya
+    tenía con otro nombre, y lo que me salvó fue mirar los abiertos por mi cuenta.
+    Esto pone ese tablero delante en el único instante en que sirve: al coger.
+
+    FALSADOR: si `tambien_cogido` se calculara DESPUÉS de insertar sin excluir el
+    tema propio, cada uno se vería a sí mismo y la lista sería ruido creciente.
+    """
+    cliente.post("/claim", json={"tema": "lo_de_qa", "rol": "ejecuta", "agent": "cto-A"})
+    r = cliente.post("/claim", json={"tema": "lo_mio", "rol": "ejecuta", "agent": "backend"})
+    cuerpo = r.json()
+    assert cuerpo["ok"] is True
+    temas = [t["tema"] for t in cuerpo["tambien_cogido"]]
+    assert "lo_de_qa" in temas
+    assert "lo_mio" not in temas, "no puede verse a sí mismo"
+    assert cuerpo["tambien_cogido"][0]["de"] == "cto"      # el rol, no el nombre
+
+
+def test_el_tablero_marca_lo_vencido(cliente, servicio):
+    """Un abierto pasado de plazo es RELEVABLE, y esa es justo la información que
+    convierte «está cogido» en «puedes seguirlo tú». Sin la marca, el tablero dice
+    «ocupado» de algo que lleva dos días parado."""
+    cliente.post("/claim", json={"tema": "parado", "rol": "ejecuta", "agent": "cto-A"})
+    con = servicio.db()
+    con.execute("UPDATE claims SET abierto='2020-01-01T00:00:00+00:00' WHERE tema='parado'")
+    con.commit()
+    con.close()
+    r = cliente.post("/claim", json={"tema": "otro", "rol": "ejecuta", "agent": "backend"})
+    fila = next(t for t in r.json()["tambien_cogido"] if t["tema"] == "parado")
+    assert fila["vencido"] is True
+    # CONTROL: uno recién cogido no puede salir marcado, o la marca no distingue nada.
+    cliente.post("/claim", json={"tema": "fresco", "rol": "revisa", "agent": "cto-A"})
+    r2 = cliente.post("/claim", json={"tema": "otro2", "rol": "ejecuta", "agent": "backend"})
+    fresco = next(t for t in r2.json()["tambien_cogido"] if t["tema"] == "fresco")
+    assert fresco["vencido"] is False

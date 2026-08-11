@@ -2573,6 +2573,30 @@ def _vencido(abierto: str) -> bool:
     return (datetime.now(timezone.utc) - t).total_seconds() > CLAIM_TTL_H * 3600
 
 
+def tablero_abierto(con, salvo: str, tope: int = 12) -> list[dict]:
+    """Lo que está cogido AHORA MISMO, para devolvérselo a quien acaba de coger algo.
+
+    Nace de un casi-choque medido el 2026-08-11: iba a abrir
+    `llminbox_ci_reconstruccion_indice_en_linux` sobre un trabajo que `qa` ya tenía
+    como `llminbox_humo_no_medido`. Lo que me salvó no fue ningún mecanismo: fue
+    mirar los 70 abiertos por mi cuenta.
+
+    ⛔ Y por eso NO hay detector de parecidos, que era lo primero que pedía el cuerpo.
+    Medido sobre ese par exacto: Jaccard 0,111, y el ÚNICO token común es `llminbox`,
+    que lo llevan todos los temas del carril. Un umbral que cace ese caso salta con
+    todos; uno que no salte con todos, no lo caza. Un detector así no habría evitado
+    MI choque y habría añadido ruido a los demás — es la clase de guarda que se
+    instala porque suena bien y luego se ignora.
+    Así que en vez de adivinar el parecido, se pone el tablero delante en el único
+    instante en que sirve: cuando estás cogiendo. La decisión la toma quien lee.
+    """
+    filas = con.execute(
+        "SELECT tema, rol, agent, abierto FROM claims WHERE cerrado IS NULL AND tema<>? "
+        "ORDER BY abierto DESC LIMIT ?", (salvo, tope)).fetchall()
+    return [{"tema": r["tema"], "rol": r["rol"], "de": r["agent"],
+             "vencido": _vencido(r["abierto"])} for r in filas]
+
+
 @app.post("/claim", dependencies=GATE)
 def coger(c_in: ClaimIn):
     """Coge un trabajo (`ejecuta`) o una plaza de revisor (`revisa`).
@@ -2605,7 +2629,8 @@ def coger(c_in: ClaimIn):
             fila = con.execute("SELECT agent, abierto FROM claims WHERE tema=? AND "
                                "rol='ejecuta' AND cerrado IS NULL", (tema,)).fetchone()
             if fila and fila["agent"] == agente:
-                return {"ok": True, "tema": tema, "rol": rol, "nota": "ya era tuyo"}
+                return {"ok": True, "tema": tema, "rol": rol, "nota": "ya era tuyo",
+                        "tambien_cogido": tablero_abierto(con, tema)}
             relevado = None
             if fila:
                 if not _vencido(fila["abierto"]):
@@ -2622,6 +2647,7 @@ def coger(c_in: ClaimIn):
                         (tema, rol, agente, c_in.agent, ahora, c_in.tema))
             con.commit()
             return {"ok": True, "tema": tema, "rol": rol,
+                    "tambien_cogido": tablero_abierto(con, tema),
                     **({"relevaste_a": relevado, "vencido_tras_h": CLAIM_TTL_H} if relevado else {})}
         # rol == 'revisa': el tope se comprueba DENTRO de la sentencia, no antes.
         # Comprobar y luego insertar en dos pasos deja pasar al 4º y al 5º cuando
@@ -2632,7 +2658,8 @@ def coger(c_in: ClaimIn):
             (tema, rol, agente, c_in.agent, ahora, c_in.tema, tema, TOPE_REVISORES))
         con.commit()
         if cur.rowcount:
-            return {"ok": True, "tema": tema, "rol": rol}
+            return {"ok": True, "tema": tema, "rol": rol,
+                    "tambien_cogido": tablero_abierto(con, tema)}
         return {"ok": False, "tema": tema, "tope": TOPE_REVISORES,
                 "motivo": f"la revisión ya está completa ({TOPE_REVISORES}) — lee la suya"}
     except sqlite3.IntegrityError:
