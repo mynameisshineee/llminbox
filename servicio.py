@@ -921,6 +921,19 @@ def reindex(ledger: str, path: str, con) -> dict:
                             (e.actor, e.tipo, ledger, e.sha))
                 for w in e.to:
                     dest.append((ledger, e.sha, w))
+                # LA DIFUSIÓN TAMBIÉN, y su ausencia aquí era DESTRUCTIVA Y RECURRENTE.
+                # ⑩ la añadió sólo en la rama de entradas NUEVAS (abajo), no en ésta.
+                # Como el gate de censo/troceador hace `DELETE FROM recipients` antes
+                # de re-derivar, cada arranque con censo o parser nuevo BORRABA la
+                # difusión de todo el histórico y sólo la recreaba para lo que llegara
+                # después. Medido al destaparlo @cto (bikeus) preguntando por qué su
+                # `/lint` marcaba «sin entregar» una entrada que él SÍ había recibido:
+                # 6.220 entradas del corpus llevan difusión y quedaban 32 filas. No era
+                # una falsa alarma de la métrica — la métrica decía la verdad sobre un
+                # estado que yo había roto: la entrada le llegó AYER, cuando aún tenía
+                # su fila, y hoy ya no la tiene.
+                for w in e.difusion:
+                    dest.append((ledger, e.sha, w))
             continue
         # La ÚLTIMA entrada del fichero es PROVISIONAL: nadie ha escrito todavía la
         # cabecera siguiente, así que su cuerpo puede estar a medias. Se indexa igual

@@ -63,3 +63,49 @@ def test_difusion_se_entrega_en_inbox(tmp_path, monkeypatch):
         r = c.get("/inbox/backend")
         assert r.status_code == 200
         assert "para toda la difusion" in r.text
+
+
+def test_la_difusion_sobrevive_a_una_rederivacion(tmp_path, monkeypatch):
+    """⑩ estaba a medias y su mitad ausente era DESTRUCTIVA: la difusión se
+    persistía al indexar una entrada NUEVA, pero no al RE-DERIVAR una ya
+    conocida. Y el gate de censo/troceador hace `DELETE FROM recipients` antes
+    de re-derivar ⇒ cada arranque con censo o parser nuevo borraba la difusión
+    de TODO el histórico y sólo la recreaba para lo que llegara después.
+
+    Destapado por @cto (bikeus): su `/lint` marcaba «sin entregar» una entrada
+    que él sí había recibido. Medido: 6.220 entradas del corpus llevan difusión
+    y quedaban 32 filas de entrega.
+
+    FALSADOR: sin `for w in e.difusion` en la rama de re-derivación, el segundo
+    arranque deja la entrada sin destinatarios y esto se pone rojo.
+    """
+    import json, os, sqlite3
+    from fastapi.testclient import TestClient
+    s = construir(tmp_path, monkeypatch)
+    mounts = json.load(open(os.environ["LLMINBOX_MOUNTS_JSON"]))
+    with open(mounts["demo-ledger"], "a") as fh:
+        fh.write("### [cto-A → equipo · AVISO] entrada de difusion\ncuerpo\n")
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        assert "entrada de difusion" in c.get("/inbox/backend").text
+
+    # SEGUNDO arranque forzando la re-derivación, igual que hace el gate de censo
+    con = sqlite3.connect(os.environ["LLMINBOX_DB"])
+    con.execute("DELETE FROM recipients")
+    con.execute("DELETE FROM files")
+    con.execute("UPDATE meta SET v='huella-vieja' WHERE k='roster_v'")
+    con.commit(); con.close()
+
+    # ⚠️ `construir()` REESCRIBE los ficheros de ledger, así que hay que volver a
+    # sembrar la entrada: si no, el segundo arranque no la encuentra en el fichero
+    # y el test mediría «desapareció del markdown», no «se perdió su difusión».
+    # (La primera versión de este test fallaba por esto, no por el código.)
+    s2 = construir(tmp_path, monkeypatch)
+    with open(mounts["demo-ledger"], "a") as fh:
+        fh.write("### [cto-A → equipo · AVISO] entrada de difusion\ncuerpo\n")
+    with TestClient(s2.app) as c:
+        s2.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        assert "entrada de difusion" in c.get("/inbox/backend").text, (
+            "la re-derivación se comió la difusión del histórico")
