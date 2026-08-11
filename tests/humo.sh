@@ -116,12 +116,20 @@ paso() {                        # paso <etiqueta> <comando…>
 # `PermissionError`) y 5 de las 7 puertas del bloque de corrupción certificaban en
 # VERDE una reconstrucción que NUNCA ocurrió. En macOS no se veía porque Docker
 # Desktop virtualiza la propiedad.
-# Por qué `docker run --rm -u 0` y no `docker exec`: el daño del camino de ARRANQUE
-# se hace con el contenedor PARADO, y `exec` ahí no existe. Un contenedor efímero
-# escribe igual en las dos plataformas, con el servicio vivo o muerto, y sin pedir
-# `sudo` en el runner. LEER se sigue haciendo desde el host: un 0644 lo lee cualquiera.
+# Por qué `docker run --rm` y no `docker exec`: el daño del camino de ARRANQUE se hace
+# con el contenedor PARADO, y `exec` ahí no existe. Un contenedor efímero escribe igual
+# en las dos plataformas, con el servicio vivo o muerto, y sin pedir `sudo` en el
+# runner. LEER se sigue haciendo desde el host: un 0644 lo lee cualquiera.
+#
+# Y corre con el USUARIO POR DEFECTO de la imagen —`llmi`, uid 1000, el mismo que el
+# servicio—, NO con `-u 0`. Escribir esto como root parecía lo seguro y costó una
+# corrida entera de CI: SQLite crea `-wal` y `-shm` junto a la base, root los deja
+# suyos, y al arrancar el servicio se encuentra una base que NO PUEDE ESCRIBIR —
+# `attempt to write a readonly database` en `lifespan`, contenedor muerto con exit 3.
+# El uid del servicio escribe su propio 0644 sin ese daño colateral. Un privilegio que
+# no hace falta no es «por si acaso»: es una avería que sólo aparece en la otra máquina.
 en_contenedor() {               # en_contenedor <dir-datos> <programa-python>
-  docker run --rm -u 0 -v "$1:/datos" "${IMAGEN:-llminbox:test}" python3 -c "$2"
+  docker run --rm -v "$1:/datos" "${IMAGEN:-llminbox:test}" python3 -c "$2"
 }
 
 printf '# t\n\n### [alice-backend → bob-reviewer · REQUEST] primera\ncuerpo uno\n' > "$TMP/l.md"
@@ -533,6 +541,34 @@ print(f'  (dañados {(b-a)//1024} KB de {n//1024} KB, franja {a}-{b})')" || MONT
 # mal» de «no llegó a medirse», y esa distinción no la arregla ningún permiso.
 if [ -z "$MONTADO" ]; then
   echo "  ⏭️  el índice NUNCA se llegó a dañar: lo que sigue NO mide la cura de corrupción."
+fi
+# GUARDA DE PROPIEDAD, y nace de haber roto justo esto: si el daño lo escribe un uid
+# que no es el del servicio, quedan ficheros —la base, su `-wal`, su `-shm`— que el
+# servicio no puede escribir, y a partir de ahí el bloque mide UN ARTEFACTO DEL TEST
+# disfrazado de avería del producto. Pasó el 2026-08-11: escrito como root, el
+# arranque siguiente moría con `readonly database` y el informe lo contaba como
+# defecto del arranque.
+# ⚠️ ALCANCE DECLARADO: sobre bind-mounts de macOS esta guarda es INERTE — Docker
+# Desktop virtualiza la propiedad y TODO se ve del uid de quien mira, así que aquí
+# nunca dirá nada. Muerde en Linux, que es donde vive la avería. Falsada fuera del
+# camino del test, sobre un volumen NOMBRADO (propiedad real, como en el runner):
+# un fichero escrito con `-u 0` sale `de-root(uid=0)`; sin él, `NINGUNO`. Y de paso
+# se vio el mecanismo entero: con propiedad real, root deja el DIRECTORIO suyo y el
+# uid 1000 ya no puede ni crear un fichero dentro.
+if [ -n "$MONTADO" ]; then
+  AJENOS=$(en_contenedor "$D2" "
+import os
+malos=[]
+for n in sorted(os.listdir('/datos')):
+    st=os.stat('/datos/'+n)
+    if st.st_uid != os.getuid():
+        malos.append(f'{n}(uid={st.st_uid})')
+print(' '.join(malos))" 2>/dev/null)
+  if [ -n "$AJENOS" ]; then
+    MONTADO=""
+    echo "  ⏭️  el daño dejó ficheros de OTRO uid ($AJENOS): el servicio no podrá escribirlos"
+    echo "     y lo que siga mediría un artefacto del test, no el producto."
+  fi
 fi
 # Falsador: sin auto-reparación esto se queda sirviendo 500 —o con el ledger en
 # `rotos`— para siempre, que es literalmente lo que hacía antes.
