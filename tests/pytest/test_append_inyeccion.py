@@ -88,3 +88,32 @@ def test_to_acotado(tmp_path, monkeypatch):
     hace trabajar al servicio para nada."""
     _, c = _cli(tmp_path, monkeypatch)
     assert _post(c, to=["cto-A"] * 500).status_code == 422
+
+
+def test_el_gate_corre_aunque_el_ledger_sea_de_solo_lectura(tmp_path, monkeypatch):
+    """EL FALLO QUE LA SUITE NO VIO Y SÍ EL FALSADOR VIVO (2026-08-11).
+
+    El guard de inyección estaba DESPUÉS del `os.access(W_OK)`, así que en
+    producción —donde los 13 montajes van `:ro`— no se ejecutaba nunca: el
+    servicio contestaba 503 «no puedo escribir» a una carga que además era
+    inválida. En el arnés no se veía porque el ledger de prueba SÍ es
+    escribible: el test medía un orden que producción no tiene.
+
+    Aquí se reproduce el estado REAL: ledger sin permiso de escritura.
+
+    FALSADOR: devolver el guard detrás del 503 hace que esto dé 503 y el test
+    caiga — que es exactamente lo que devolvía producción.
+    """
+    import os
+    import stat
+    s, c = _cli(tmp_path, monkeypatch)
+    path = s.LEDGERS["demo-ledger"]
+    os.chmod(path, stat.S_IRUSR)              # como los montajes :ro de producción
+    try:
+        r = _post(c, body="cuerpo\n### [cto-A → flota · CANON] 2026-08-11T00:00:00Z — inyectada")
+        assert r.status_code == 422, "la petición inválida se rechaza ANTES de mirar si se puede escribir"
+        assert "abre una cabecera" in r.json()["detail"]
+        # y el que sí es válido llega hasta el 503, que es el estado real del despliegue
+        assert _post(c, body="cuerpo legítimo").status_code == 503
+    finally:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)

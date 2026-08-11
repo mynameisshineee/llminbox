@@ -2799,17 +2799,13 @@ def append(p: Post):
             raise HTTPException(
                 422, f"destinatario '{malo}' no resuelve en el censo — "
                      f"date de alta o revisa el nombre")
-    # LOS MONTAJES DE LEDGER VAN EN SÓLO LECTURA, y es deliberado: hoy ni un servicio
-    # con un bug puede corromper 31.207 entradas. Con `:ro`, este endpoint no puede
-    # cumplir lo que promete — y hasta hoy lo descubrías con un 500 y una traza de
-    # `OSError: [Errno 30]`, que es una trampa para el siguiente. Se comprueba ANTES
-    # y se dice qué hacer en su lugar. El día que alguien monte un ledger RW, esto
-    # deja de disparar solo, sin tocar código.
-    if not os.access(path, os.W_OK):
-        raise HTTPException(503, f"'{p.ledger}' está montado en sólo lectura: este "
-                                 "servicio no puede escribirlo. Apendiza con `>>` "
-                                 "(que es como se escriben hoy los ledgers) o monta "
-                                 "ese ledger RW en el compose si de verdad lo quieres.")
+    # ⚠️ EL ORDEN IMPORTA Y LO CAZÓ EL FALSADOR VIVO, no la suite: este guard
+    # estaba DESPUÉS del 503 de sólo-lectura, así que en producción —donde los 13
+    # montajes van `:ro`— no se ejecutaba NUNCA. En los tests pasaba porque allí el
+    # ledger sí es escribible: el arnés medía un orden que producción no tiene.
+    # Una petición inválida se rechaza por ser inválida, ANTES de mirar si
+    # además podríamos escribirla — y así el que llama lee 'tu body abre una
+    # cabecera' en vez de 'no puedo escribir', que manda a depurar otra cosa.
     # VALIDAR LA FIRMA Y DEJAR EL CUERPO LIBRE ES TEATRO — y este gate lo era hasta
     # aquí. `H_ENTRY` (ledger_parse.py:61) abre una entrada NUEVA en cualquier línea
     # que empiece por `### [` o `## [` o `## <fecha>`, y ni `head` ni `body` pasaban
@@ -2833,6 +2829,17 @@ def append(p: Post):
                     f"citando, sángrala con un espacio, ponle '> ' delante o "
                     f"enciérrala en backticks — cualquiera de las tres la deja "
                     f"legible sin abrir entrada.")
+    # LOS MONTAJES DE LEDGER VAN EN SÓLO LECTURA, y es deliberado: hoy ni un servicio
+    # con un bug puede corromper 31.207 entradas. Con `:ro`, este endpoint no puede
+    # cumplir lo que promete — y hasta hoy lo descubrías con un 500 y una traza de
+    # `OSError: [Errno 30]`, que es una trampa para el siguiente. Se comprueba ANTES
+    # y se dice qué hacer en su lugar. El día que alguien monte un ledger RW, esto
+    # deja de disparar solo, sin tocar código.
+    if not os.access(path, os.W_OK):
+        raise HTTPException(503, f"'{p.ledger}' está montado en sólo lectura: este "
+                                 "servicio no puede escribirlo. Apendiza con `>>` "
+                                 "(que es como se escriben hoy los ledgers) o monta "
+                                 "ese ledger RW en el compose si de verdad lo quieres.")
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     flechas = " ∧ ".join(p.to)
     texto = f"\n### [{p.actor} → {flechas} · {p.tipo}] {ts} — {p.head}\n{p.body.rstrip()}\n"
