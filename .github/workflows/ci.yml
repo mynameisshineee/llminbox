@@ -18,6 +18,13 @@ jobs:
       - uses: actions/checkout@v5
       - name: Construir la imagen
         run: docker build -t llminbox:test .
+      # ANTES del humo, y a propósito: si las guardas del arnés no saben decir que no,
+      # lo que diga el humo a continuación no vale nada. Ocho de sus puertas estuvieron
+      # dos días en verde sobre algo que no ocurría. Tarda <1 min y no levanta servicio.
+      - name: Las guardas del arnés saben decir que no
+        run: IMAGEN=llminbox:test ./tests/guardas.sh
+      - name: Y ninguna se puede romper sin que se note
+        run: IMAGEN=llminbox:test ./tests/mutantes-arnes.sh
       - name: Correr el humo
         run: IMAGEN=llminbox:test ./tests/humo.sh
 
