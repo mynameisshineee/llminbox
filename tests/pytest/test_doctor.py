@@ -157,3 +157,67 @@ def test_el_doctor_no_escribe_nada(cliente, servicio):
     antes = foto()
     _texto(cliente)
     assert foto() == antes
+
+
+def test_los_nombres_fuera_del_censo_no_compiten_con_los_de_dentro(tmp_path, monkeypatch):
+    """La primera corrida contra la flota real sacó 11 `zzz-*` entre los 20 primeros,
+    cada uno con 433 pendientes, empujando fuera a los agentes de verdad: `lecturas`
+    apunta a CUALQUIER nombre que alguien consulte, y la difusión le da bandeja a
+    cualquiera, así que los fantasmas acumulan deuda por diseño. Van aparte y
+    CONTADOS, no listados — enumerarlos les devolvería el sitio que se les quita.
+    """
+    from fastapi.testclient import TestClient
+    s_mod = construir(tmp_path, monkeypatch)
+    # Una difusión: le llega a todo el mundo, censado o no. Es lo que le daba 433
+    # pendientes a cada `zzz-*` en la flota real.
+    (tmp_path / "DEMO-LEDGER.md").write_text(
+        "### [cto-A → equipo · FYI] para todos\ncuerpo\n"
+    )
+    con = __import__("sqlite3").connect(str(tmp_path / "llminbox.sqlite"))
+    with TestClient(s_mod.app) as c:
+        s_mod.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        c.get("/inbox/backend")          # uno del censo
+        # El fantasma se SIEMBRA en `lecturas`, no se pide por HTTP: hoy la puerta de
+        # identidad es fail-closed y `/inbox/zzz-fantasma` da 422. Los 11 `zzz-*` de
+        # la flota real son residuo ANTERIOR a esa puerta — la tabla los conserva y
+        # el informe se los encontraba delante.
+        con2 = s_mod.db()
+        con2.execute("INSERT OR REPLACE INTO lecturas(agent,primera,ultima,veces) "
+                     "VALUES('zzz-fantasma','2020-01-01','2020-01-01',1)")
+        con2.commit(); con2.close()
+        s_mod.barrido()
+        sec = _seccion(_texto(c), 1)
+    con.close()
+    assert "1 agente(s) del censo" in sec       # sólo `be`; el fantasma no compite
+    assert "FUERA DEL CENSO" in sec and "zzz-fantasma" in sec
+    # FALSADOR: si el fantasma entrara en el ranking sería una FILA con su columna de
+    # pendientes. Sólo puede salir en la nota de abajo, y sin número propio.
+    assert not any(l.strip().startswith("zzz-fantasma ") for l in sec.splitlines())
+
+
+def test_un_alias_de_difusion_va_marcado(tmp_path, monkeypatch):
+    """Los tres primeros puestos de la primera corrida real eran un humano y dos
+    alias de difusión. Nadie drena esas bandejas, así que su deuda no es deuda de
+    nadie — y sin la marca, quien lee empieza a arreglar por arriba lo que no existe.
+    FALSADOR: si la marca se pusiera a todos, no distinguiría; `be` no puede llevarla.
+    """
+    from fastapi.testclient import TestClient
+    s_mod = construir(tmp_path, monkeypatch)
+    (tmp_path / "DEMO-LEDGER.md").write_text(
+        "### [cto-A -> equipo · FYI] para todos\ncuerpo\n".replace("->", "\u2192")
+    )
+    with TestClient(s_mod.app) as c:
+        s_mod.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        c.get("/inbox/backend")
+        con = s_mod.db()
+        con.execute("INSERT OR REPLACE INTO lecturas(agent,primera,ultima,veces) "
+                    "VALUES('equipo','2020-01-01','2020-01-01',1)")
+        con.commit(); con.close()
+        s_mod.barrido()
+        sec = _seccion(_texto(c), 1)
+    equipo = next(l for l in sec.splitlines() if l.strip().startswith("equipo "))
+    assert "alias de difusión" in equipo
+    be = next(l for l in sec.splitlines() if l.strip().startswith("be "))
+    assert "alias de difusión" not in be and "humano" not in be

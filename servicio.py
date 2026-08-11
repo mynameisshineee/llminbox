@@ -2798,19 +2798,68 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
         if pend:
             ult = con.execute("SELECT MAX(updated) u FROM cursors WHERE agent=?",
                               (clave_cursor(a),)).fetchone()["u"]
+            # Se guarda si el REPRESENTANTE está censado, no el rol: `CANON` tiene
+            # nombres (`backend`, `qa-2`) y aquí se agrupa por rol (`be`, `qa`), así
+            # que preguntar por el rol contestaba «fuera del censo» a TODO el mundo.
+            # La clase se decide con el REPRESENTANTE (`a`), nunca con el rol: ni
+            # `CANON` ni `DUENO` contienen roles, así que preguntarles por `be`
+            # contesta «no está» a los dos y marca al backend como humano fuera del
+            # censo. Mismo filo, dos veces en el mismo endpoint: **el nombre que
+            # enseño no es la clave con la que resuelvo.**
             filas.append((pend, rol, (lec[rol]["ultima"][:16] if rol in lec else "nunca"),
-                          (ult[:16] if ult else "nunca")))
+                          (ult[:16] if ult else "nunca"), a.lower() in lp.CANON,
+                          "difusion" if a.lower() in lp.DIFSET
+                          else "humano" if a.lower() not in lp.DUENO else "agente"))
+    # Los nombres FUERA DEL CENSO van aparte, y no es cosmética: la primera corrida
+    # contra la flota real sacó 11 `zzz-*` —restos de pruebas de otros— entre los 20
+    # primeros, cada uno con su deuda de 433, empujando fuera a los agentes de verdad.
+    # Son residuo ANTERIOR a la puerta fail-closed de identidad: hoy `/inbox/<lo que
+    # sea>` da 422, pero `lecturas` conserva lo que se apuntó cuando no la había, y la
+    # difusión les sigue dando bandeja. Un ranking que los mezcla no es una lista de
+    # morosos: es una lista de lo que alguien tecleó alguna vez.
+    fantasmas = [f for f in filas if not f[4]]
+    filas = [f for f in filas if f[4]]
     filas.sort(reverse=True)
-    out += ["", f"① MIRA Y NO DRENA — {len(filas)} agente(s) con correo dirigido sin consumir",
+    out += ["", f"① MIRA Y NO DRENA — {len(filas)} agente(s) del censo con correo dirigido sin consumir",
             f"   {'agente':<20}{'pendientes':>11}  {'última mirada':<18}último consumo"]
-    for pend, a, mirada, consumo in filas[:20]:
+    for pend, a, mirada, consumo, _, clase_de in filas[:20]:
         # «nunca» en la 1ª columna y pendientes>0 es OTRA cosa: ni siquiera mira.
         # Se distingue en la propia fila en vez de en una sección aparte — la lista
         # ya está ordenada por deuda, y separarlas obliga a leer dos veces.
-        out.append(f"   {a:<20}{pend:>11}  {mirada:<18}{consumo}"
-                   + ("   ← NI MIRA" if mirada == "nunca" else ""))
+        #
+        # Y se marca lo que NO es un agente, porque los tres primeros puestos de la
+        # primera corrida real eran un humano (`ALBERT`, 6.587) y dos alias de
+        # difusión (`flota`, `TODOS`): nadie drena la bandeja de un humano ni la de
+        # un alias, así que su deuda no es deuda de nadie. Sin la marca, quien lea
+        # esto empieza a arreglar por arriba y arregla lo que no existe.
+        if clase_de == "difusion":
+            clase = "  (alias de difusión — no lo drena nadie)"
+        elif clase_de == "humano":
+            clase = "  (humano — su bandeja no la drena un agente)"
+        elif mirada == "nunca":
+            clase = "   ← NI MIRA"
+        else:
+            clase = ""
+        out.append(f"   {a:<20}{pend:>11}  {mirada:<18}{consumo}{clase}")
     if not filas:
         out.append("   (nadie tiene correo dirigido sin consumir)")
+    # ⚠️ EL PENDIENTE CRUZA CARRILES Y EL CONSUMO NO, y sin decirlo esta sección
+    # acusa a la flota de cumplir su propia regla: «un carril, una ledger por sesión»
+    # significa que una sesión consume SÓLO su carril, mientras aquí se suma el correo
+    # de los 12 ledgers. Por eso hay agentes con consumo de hace diez minutos y 300
+    # pendientes, y no están haciendo nada mal. Lo que esta columna localiza bien es
+    # lo otro: consumo «nunca» con cientos esperando.
+    out.append("   El pendiente suma TODOS los ledgers; el consumo va por carril. Un número")
+    out.append("   alto con consumo reciente es la regla funcionando, no deuda.")
+    if fantasmas:
+        # No se listan uno a uno: son ruido, y enumerarlos aquí sería darles el sitio
+        # que se les acaba de quitar. Se dice cuántos hay y de dónde salen, porque un
+        # número que desaparece sin explicación es lo que hace desconfiar del informe.
+        out.append(f"   ⓘ y {len(fantasmas)} nombre(s) FUERA DEL CENSO con bandeja "
+                   f"(p.ej. {', '.join(sorted(f[1] for f in fantasmas)[:3])}): residuo")
+        out.append("     ANTERIOR a la puerta fail-closed de identidad — hoy pedir esa bandeja da")
+        out.append("     422, pero `lecturas` conserva lo apuntado antes y la difusión les sigue")
+        out.append("     dando correo. No son deuda de nadie; se cuentan y no se listan.")
 
     # ── ② PUBLICA Y NO DIRIGE ────────────────────────────────────────────────
     # El fallo que hace inútil todo lo demás: una entrada sin destinatario no cae en
