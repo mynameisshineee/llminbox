@@ -1906,8 +1906,19 @@ def entries(respuesta: Response,ledger: str | None = None, to: str | None = None
         # buscador que dice «no está» sobre algo que está es peor que no tenerlo.
         # Se aplanan los saltos EN LA COLUMNA y se colapsan los espacios DEL TÉRMINO,
         # que es lo que hace que las dos mitades vuelvan a tocarse.
+        # …y NO BASTA CON APLANAR: el corte real trae DOS saltos («nunca ocurría\n\n
+        # **CI VERDE**»), que aplanados dan dos espacios y siguen sin casar contra un
+        # término de un espacio. La primera versión de esto sembraba un solo `\n` en
+        # el test —un caso más fácil que la realidad— y pasaba en verde mientras
+        # producción seguía devolviendo 0. Así que además se COLAPSAN los espacios,
+        # con el `REPLACE(x,'  ',' ')` anidado que es como se hace esto en SQLite sin
+        # regex. TECHO DECLARADO: 4 niveles ⇒ hasta 16 espacios consecutivos; más que
+        # eso ya no es un salto de párrafo, es arte ASCII, y no se busca así.
         termino = " ".join(q.split())
-        w.append("REPLACE(REPLACE(e.body, char(13), ' '), char(10), ' ') LIKE ?")
+        col = "REPLACE(REPLACE(e.body, char(13), ' '), char(10), ' ')"
+        for _ in range(4):
+            col = f"REPLACE({col}, '  ', ' ')"
+        w.append(f"{col} LIKE ?")
         p.append(f"%{termino}%")
     join = ""
     if to:

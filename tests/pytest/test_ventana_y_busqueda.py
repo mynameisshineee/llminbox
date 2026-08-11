@@ -72,10 +72,14 @@ def test_q_encuentra_frases_que_cruzan_el_salto_de_linea(cliente, servicio):
     con.execute("INSERT OR REPLACE INTO entries (ledger,eid,arrival,seq,line_no,byte_off,"
                 "ts,actor,tipo,head,body,visto,ausente,provisional) VALUES"
                 "('demo-ledger','ffff03',7,3,3,0,'2026-08-11T11:00:00','cto-A',NULL,"
-                "'### [cto-A → backend] envuelta','una frase que cruza\nel salto de linea',"
+                "'### [cto-A → backend] envuelta','una frase que cruza\n\nel salto de linea',"
                 "NULL,NULL,NULL)")
     con.commit()
     con.close()
+    # DOBLE salto a propósito: es lo que trae el corpus real (fin de párrafo). La
+    # primera versión de este test sembraba UNO solo —más fácil que la realidad— y
+    # pasaba en verde mientras producción seguía devolviendo 0 sobre la frase que
+    # motivó el arreglo. Un test más benévolo que el mundo certifica un fix a medias.
     assert len(cliente.get("/entries?q=cruza%20el%20salto").json()) == 1
     # y el término con espacios de más también, que es como se teclea al copiar
     assert len(cliente.get("/entries?q=cruza%20%20%20el%20salto").json()) == 1
