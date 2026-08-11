@@ -103,6 +103,12 @@ SALUD: dict = {"ultimo_ok": 0.0, "error": None, "fallos": 0,
 # ledger roto no es un servicio roto: los demás siguen indexándose y sirviéndose.
 ROTOS: dict = {}
 
+# El índice no se deja ESCRIBIR (volumen de sólo lectura, permisos, disco lleno) y el
+# arranque decidió degradar en vez de morir — ver `lifespan`. Se sirven las lecturas;
+# los cursores no avanzan y no se reindexa. Vive fuera de SALUD porque no es un estado
+# del barrido sino de la base, y `/health` tiene que poder distinguirlos.
+SOLO_LECTURA: dict = {"activo": False, "motivo": None}
+
 # Marca de contenido no confiable. Los ledgers los escriben LLMs con texto libre y
 # `/inbox` es el ÚNICO punto donde ese texto se entrega automáticamente a OTRO LLM
 # sin que nadie lo ojee — que es justo lo que la regla 16 de la casa (el contenido
@@ -242,6 +248,24 @@ CAMBIO_DE_BASE = threading.Lock()
 
 def db():
     with CAMBIO_DE_BASE:
+        # Con el índice degradado a sólo lectura (ver `lifespan`) se abre `mode=ro` y
+        # SIN LOS PRAGMAS: `journal_mode=WAL` ES UNA ESCRITURA, así que la conexión de
+        # siempre estalla al NACER y se lleva por delante también las lecturas — que
+        # son justo lo que el modo degradado existe para conservar. Sin esta rama,
+        # «arranco degradado» sería «arranco para devolver 500 a todo el mundo».
+        if SOLO_LECTURA["activo"]:
+            # `immutable=1`, y no sólo `mode=ro`: una base en WAL necesita escribir su
+            # `-shm` para que la LEAN, así que `mode=ro` a secas seguía dando «attempt
+            # to write a readonly database» en un SELECT (medido en el test del
+            # arranque degradado). `immutable=1` le dice a SQLite que nadie va a tocar
+            # el fichero, y entonces lee sin shm.
+            # ⚠️ EL PRECIO, declarado: con `immutable=1` el `-wal` NO se aplica, así
+            # que lo que quedara sin checkpoint no se ve. Es correcto para lo que este
+            # modo es —el volumen está de sólo lectura: nadie va a escribir ese WAL
+            # nunca— y sigue siendo mejor que el estado anterior, que era no arrancar.
+            c = sqlite3.connect(f"file:{DB}?mode=ro&immutable=1", uri=True, timeout=30)
+            c.row_factory = sqlite3.Row
+            return c
         c = sqlite3.connect(DB, timeout=30)
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA journal_mode=WAL")
@@ -1401,31 +1425,16 @@ def barrido():
         con.close()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    os.makedirs(os.path.dirname(DB), exist_ok=True)
-    # ANTES DE TOCAR NADA: si el índice que quedó en disco no se deja leer, se
-    # reconstruye aquí. En el incidente del 2026-08-01 el servicio arrancó sobre una
-    # base ya corrupta y siguió catorce horas sirviendo lo que podía; la sonda que
-    # lo habría cazado cuesta 0,05 s. Va antes de la migración de esquema a
-    # propósito: `executescript` sobre una base corrupta falla, y entonces el
-    # contenedor sale con error en un sitio que no explica nada.
-    if os.path.exists(DB):
-        mal = indice_ilegible()
-        if mal:
-            print(f"[arranque] el índice en disco no se puede leer — {mal}", flush=True)
-            # Con su red: si la cura revienta aquí, el arranque sigue y el fallo de
-            # la base saldrá por donde salía antes (la migración de esquema falla y
-            # el contenedor sale con error, que es la conducta que este fichero ya
-            # eligió). Sin la red, un fallo de la CURA —disco lleno, permisos— tumba
-            # el arranque por un camino nuevo que no explica nada, y la flota se
-            # queda sin servicio por el arreglo, no por la avería.
-            try:
-                reconstruir_indice(mal)
-            except Exception as e:
-                print(f"[arranque] la cura reventó ({type(e).__name__}: {e}) — "
-                      f"sigo y que hable la migración", flush=True)
-    con = db()
+def _preparar_indice(con: sqlite3.Connection) -> None:
+    """Esquema, ALTERs, migración de cursores y huellas: TODO lo que el arranque
+    ESCRIBE, junto y en una sola función.
+
+    Vive fuera del `lifespan` para que su llamador pueda envolverla entera. Antes
+    estaba en línea y las primeras escrituras (`CREATE TABLE meta`, los `ALTER` de
+    columna) caían FUERA de cualquier red: con el índice de sólo lectura estallaban
+    ahí —servicio.py:1469, medido— y el contenedor salía con `Application startup
+    failed`. Un contador de versión no puede tumbar el servicio de la flota.
+    """
     # MIGRACIÓN antes que nada. `CREATE TABLE IF NOT EXISTS` no altera una tabla que
     # ya existe: al cambiar el esquema, las tablas viejas sobrevivían intactas y el
     # índice sobre la columna nueva petaba con `no such column`. El contenedor salió
@@ -1514,6 +1523,73 @@ async def lifespan(app: FastAPI):
         REDERIVAR.update(LEDGERS)
     con.execute("INSERT OR REPLACE INTO meta VALUES ('parser_v', ?)", (str(lp.PARSER_V),))
     con.commit()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    os.makedirs(os.path.dirname(DB), exist_ok=True)
+    # ¿SE DEJA ESCRIBIR EL ÍNDICE? Se pregunta LO PRIMERO, porque la respuesta cambia
+    # cómo se abre cada conexión: `db()` hace `PRAGMA journal_mode=WAL`, que es una
+    # ESCRITURA, así que sobre un volumen de sólo lectura estalla al NACER la conexión
+    # —antes de la sonda de corrupción, antes de la migración— y se lleva por delante
+    # también las lecturas. Detectarlo aquí es lo que convierte «arranco degradado»
+    # en algo que de verdad sirve bandejas.
+    if os.path.exists(DB):
+        try:
+            _sonda_rw = sqlite3.connect(DB, timeout=5)
+            _sonda_rw.execute("PRAGMA journal_mode=WAL")
+            _sonda_rw.close()
+        except sqlite3.OperationalError as e:
+            SOLO_LECTURA["activo"] = True
+            SOLO_LECTURA["motivo"] = f"{type(e).__name__}: {e}"
+    # ANTES DE TOCAR NADA: si el índice que quedó en disco no se deja leer, se
+    # reconstruye aquí. En el incidente del 2026-08-01 el servicio arrancó sobre una
+    # base ya corrupta y siguió catorce horas sirviendo lo que podía; la sonda que
+    # lo habría cazado cuesta 0,05 s. Va antes de la migración de esquema a
+    # propósito: `executescript` sobre una base corrupta falla, y entonces el
+    # contenedor sale con error en un sitio que no explica nada.
+    # La cura de corrupción ESCRIBE (base nueva, rescate de cursores): con el índice
+    # de sólo lectura no puede correr, y su fallo no debe disfrazarse de avería nueva.
+    if os.path.exists(DB) and not SOLO_LECTURA["activo"]:
+        mal = indice_ilegible()
+        if mal:
+            print(f"[arranque] el índice en disco no se puede leer — {mal}", flush=True)
+            # Con su red: si la cura revienta aquí, el arranque sigue y el fallo de
+            # la base saldrá por donde salía antes (la migración de esquema falla y
+            # el contenedor sale con error, que es la conducta que este fichero ya
+            # eligió). Sin la red, un fallo de la CURA —disco lleno, permisos— tumba
+            # el arranque por un camino nuevo que no explica nada, y la flota se
+            # queda sin servicio por el arreglo, no por la avería.
+            try:
+                reconstruir_indice(mal)
+            except Exception as e:
+                print(f"[arranque] la cura reventó ({type(e).__name__}: {e}) — "
+                      f"sigo y que hable la migración", flush=True)
+    con = db()
+    try:
+        if SOLO_LECTURA["activo"]:
+            raise sqlite3.OperationalError(SOLO_LECTURA["motivo"])
+        _preparar_indice(con)
+    except sqlite3.OperationalError as e:
+        # NINGUNA ESCRITURA DE ARRANQUE PUEDE MATAR EL ARRANQUE. Cazado por el arnés
+        # de humo de @qa (run 31481815502, 2026-08-11): con el índice dañado el
+        # servicio SE CURA —«base nueva en su sitio · 1 cursores rescatados»— y moría
+        # a continuación en `INSERT … meta('parser_v')` con `attempt to write a
+        # readonly database` ⇒ `Application startup failed. Exiting` ⇒ contenedor
+        # `exited` y la flota sin bandeja. Es el mismo error que este fichero ya tiene
+        # documentado y curado para `anota_lectura` («un dato accesorio no puede ser
+        # más frágil que el principal»); en el arranque faltaba. Un volumen que se
+        # queda en sólo lectura no es hipotético: disco lleno, permisos, FS remontado.
+        SOLO_LECTURA["activo"] = True
+        SOLO_LECTURA["motivo"] = SOLO_LECTURA["motivo"] or f"{type(e).__name__}: {e}"
+        try:
+            con.rollback()
+        except sqlite3.Error:
+            pass
+        print(f"[arranque] ⚠️ no puedo ESCRIBIR en el índice ({e}) — arranco en SÓLO "
+              f"LECTURA: sirvo bandejas con lo indexado, pero no avanzo cursores ni "
+              f"reindexo. /health lo dice. El markdown sigue siendo el canon.",
+              flush=True)
     con.close()
     t = asyncio.create_task(vigilante())
     yield
@@ -1681,9 +1757,17 @@ def health():
     # apagar, sobre un servicio que acaba de arreglarse. `ok` responde «¿se puede
     # servir el canon AHORA?»; la ventana que la reconstrucción no cubre es una
     # pregunta de integridad y la contesta `verify`, que la canta ledger a ledger.
-    return {"ok": sano and not ROTOS, "auth": bool(TOKEN),
+    # SÓLO LECTURA NO ES VERDE. El servicio está VIVO y sirve bandejas —por eso
+    # arranca en vez de morir— pero no puede avanzar un cursor ni reindexar: quien
+    # lea `ok:true` daría por drenado lo que no se drenó. Vivo ≠ sano, y el
+    # healthcheck del contenedor lo enseña sin tumbar a nadie.
+    return {"ok": sano and not ROTOS and not SOLO_LECTURA["activo"], "auth": bool(TOKEN),
             "ledgers": len(LEDGERS), "rotos": ROTOS or None,
-            "aviso": None if LEDGERS else
+            "solo_lectura": SOLO_LECTURA["motivo"],
+            "aviso": ("índice de SÓLO LECTURA: sirvo lo indexado, pero los cursores NO "
+                      "avanzan y no reindexo — revisa permisos/espacio del volumen"
+                      ) if SOLO_LECTURA["activo"] else
+                     None if LEDGERS else
                      "CERO ledgers configurados: no estoy mirando nada. Corre `./llmi init`.",
             "reconstrucciones": inc,
             "reconstruccion_sin_estado": SALUD.get("sin_estado") or None,
