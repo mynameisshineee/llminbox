@@ -77,12 +77,21 @@ contar() {                      # contar <patrón> <args-de-curl…>
 # `for … curl -sf … && break; sleep 1; done` sin brazo de `||`: si el servicio no
 # llega, el bucle se agota EN SILENCIO y todo lo que viene después mide un
 # servicio que no está — y lo reporta como valores incorrectos del producto.
-esperar_salud() {               # esperar_salud <url-base> <intentos> <etiqueta>
-  local u="$1" n="${2:-40}" et="${3:-el servicio}" i=0
+esperar_salud() {               # esperar_salud <url-base> <intentos> <etiqueta> [contenedor]
+  local u="$1" n="${2:-40}" et="${3:-el servicio}" cont="${4:-}" i=0
   while [ "$i" -lt "$n" ]; do
     curl -sf -m 2 "$u/health" >/dev/null 2>&1 && return 0
     i=$((i+1)); sleep 1
   done
+  # DIAGNÓSTICO, porque «no contestó» tiene causas opuestas —murió al arrancar,
+  # o sigue vivo indexando— y sin distinguirlas cada corrida de CI es otra ronda
+  # de adivinar desde un Mac donde esto no se reproduce. El estado del contenedor
+  # separa las dos en una línea.
+  if [ -n "$cont" ]; then
+    echo "  ── diagnóstico de «$et» ──"
+    docker inspect -f '     estado={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} arrancado={{.State.StartedAt}}' "$cont" 2>&1 | tail -1
+    docker logs --tail 15 "$cont" 2>&1 | sed 's/^/     /'
+  fi
   no_medido "$et" "no contestó a /health en $n intentos — lo que siga NO mide el producto"
   return 1
 }
@@ -97,6 +106,22 @@ paso() {                        # paso <etiqueta> <comando…>
   if "$@"; then return 0; fi
   no_medido "$et" "el PASO DE PREPARACIÓN falló — lo que dependía de él no se ha medido"
   return 1
+}
+
+# ── escribir en la base del servicio: SIEMPRE desde dentro de un contenedor ──
+# `h.sqlite` lo crea el servicio como uid 1000 en 0644. El runner de Linux es OTRO
+# usuario, así que no puede escribirlo — y `chmod 777` sobre el DIRECTORIO no alcanza
+# al FICHERO. Hasta el 2026-08-11 los pasos que envenenaban y corrompían la base se
+# hacían desde el host: en CI reventaban (`attempt to write a readonly database`,
+# `PermissionError`) y 5 de las 7 puertas del bloque de corrupción certificaban en
+# VERDE una reconstrucción que NUNCA ocurrió. En macOS no se veía porque Docker
+# Desktop virtualiza la propiedad.
+# Por qué `docker run --rm -u 0` y no `docker exec`: el daño del camino de ARRANQUE
+# se hace con el contenedor PARADO, y `exec` ahí no existe. Un contenedor efímero
+# escribe igual en las dos plataformas, con el servicio vivo o muerto, y sin pedir
+# `sudo` en el runner. LEER se sigue haciendo desde el host: un 0644 lo lee cualquiera.
+en_contenedor() {               # en_contenedor <dir-datos> <programa-python>
+  docker run --rm -u 0 -v "$1:/datos" "${IMAGEN:-llminbox:test}" python3 -c "$2"
 }
 
 printf '# t\n\n### [alice-backend → bob-reviewer · REQUEST] primera\ncuerpo uno\n' > "$TMP/l.md"
@@ -469,30 +494,43 @@ EID_ANTES=$(lee_eid "$CUR_ANTES")
 # más abajo pasaría con el arreglo puesto Y sin él. El veneno crea el caso que sí
 # distingue — el de un índice corrupto que viene de una versión anterior.
 MONTADO="sí"
-paso "el envenenado de la huella de esquema" python3 -c "
+paso "el envenenado de la huella de esquema" en_contenedor "$D2" "
 import sqlite3
-c=sqlite3.connect('$D2/h.sqlite',timeout=20)
-c.execute(\"INSERT OR REPLACE INTO meta VALUES ('schema_v','huella-obsoleta')\"); c.commit(); c.close()" || MONTADO=""
+c=sqlite3.connect('/datos/h.sqlite',timeout=20)
+c.execute(\"INSERT OR REPLACE INTO meta VALUES ('schema_v','huella-obsoleta')\"); c.commit()
+r=c.execute(\"SELECT v FROM meta WHERE k='schema_v'\").fetchone(); c.close()
+# CONTROL POSITIVO, y es el que faltaba: salir con 0 dice que el programa no
+# reventó, NO que el dato haya aterrizado. Se relee lo escrito o esto no vale.
+assert r and r[0] == 'huella-obsoleta', f'el veneno no aterrizo: {r}'
+print('  (huella envenenada)')" || MONTADO=""
 # Se daña la FRANJA CENTRAL (25 %–65 %), no la cabecera ni la cola, y la elección
 # tiene motivo: así se reproduce la forma REAL del incidente —páginas de una tabla
 # grande ilegibles con el resto intacto, que es lo que permitió rescatar 5 cursores
 # y 13 lecturas de la base rota—. Reventar la cabecera haría irrecuperable el estado
 # por construcción y el brazo del cursor fallaría por culpa del test, no del código.
-paso "el daño a la franja central del índice" python3 -c "
+paso "el daño a la franja central del índice" en_contenedor "$D2" "
 import os
-f='$D2/h.sqlite'
+f='/datos/h.sqlite'
 for resto in (f+'-wal', f+'-shm'):
     try: os.unlink(resto)
     except FileNotFoundError: pass
 n=os.path.getsize(f); a=int(n*0.25); b=int(n*0.65)
+basura=os.urandom(b-a)
 with open(f,'r+b') as h:
-    h.seek(a); h.write(os.urandom(b-a))
+    h.seek(a); h.write(basura); h.flush(); os.fsync(h.fileno())
+    h.seek(a); leido=h.read(b-a)
+# Mismo control que arriba: se relee la franja escrita. Sin esto, un fallo de
+# permisos que no levante excepción dejaría el bloque midiendo una base sana.
+assert leido == basura, 'la basura no aterrizo en el fichero'
 print(f'  (dañados {(b-a)//1024} KB de {n//1024} KB, franja {a}-{b})')" || MONTADO=""
-# ⚠️ EL PASO 0 DE TODO ESTE BLOQUE. En Linux los DOS pasos de arriba fallan
-# —`h.sqlite` lo crea el contenedor como uid 1000 en 0644, y `chmod 777` sobre el
-# DIRECTORIO no alcanza al FICHERO— y hasta hoy el bloque seguía corriendo: 5 de
-# sus 7 puertas certificaban en VERDE una reconstrucción que nunca ocurrió. En
-# macOS no se ve porque Docker Desktop virtualiza la propiedad.
+# ⚠️ EL PASO 0 DE TODO ESTE BLOQUE. Hasta el 2026-08-11 los DOS pasos de arriba
+# escribían desde el host y en Linux fallaban los dos —`h.sqlite` lo crea el
+# contenedor como uid 1000 en 0644, y `chmod 777` sobre el DIRECTORIO no alcanza al
+# FICHERO—: 5 de las 7 puertas de este bloque certificaban en VERDE una
+# reconstrucción que nunca ocurrió, y en macOS no se veía porque Docker Desktop
+# virtualiza la propiedad. Ahora escriben con `en_contenedor` (ver su cabecera) y
+# releen lo escrito. Esta guarda se queda igual: es la que separa «midió y salió
+# mal» de «no llegó a medirse», y esa distinción no la arregla ningún permiso.
 if [ -z "$MONTADO" ]; then
   echo "  ⏭️  el índice NUNCA se llegó a dañar: lo que sigue NO mide la cura de corrupción."
 fi
@@ -612,7 +650,7 @@ else
   comp "la base nueva lleva la huella de esquema de AHORA" "$HUELLA" "$GUARDADA"
 fi
 docker restart "$NOM2" >/dev/null 2>&1
-esperar_salud "$V" 60 "el contenedor tras 'docker restart'"
+esperar_salud "$V" 60 "el contenedor tras 'docker restart'" "$NOM2"
 sleep 3
 # Falsador: si el arranque hubiera entrado por la rama de «esquema cambiado», esto
 # volvería a -1 — que es el número exacto del defecto que este repo ya arregló una vez.
@@ -638,15 +676,18 @@ fi
 # día del servicio es justo el que no se puede dejar sin probar.
 docker stop "$NOM2" >/dev/null 2>&1
 MONTADO2="sí"
-paso "el daño al índice ANTES del arranque" python3 -c "
+paso "el daño al índice ANTES del arranque" en_contenedor "$D2" "
 import os
-f='$D2/h.sqlite'
+f='/datos/h.sqlite'
 for resto in (f+'-wal', f+'-shm'):
     try: os.unlink(resto)
     except FileNotFoundError: pass
 n=os.path.getsize(f); a=int(n*0.25); b=int(n*0.65)
+basura=os.urandom(b-a)
 with open(f,'r+b') as h:
-    h.seek(a); h.write(os.urandom(b-a))" || MONTADO2=""
+    h.seek(a); h.write(basura); h.flush(); os.fsync(h.fileno())
+    h.seek(a); leido=h.read(b-a)
+assert leido == basura, 'la basura no aterrizo en el fichero'" || MONTADO2=""
 docker start "$NOM2" >/dev/null 2>&1
 ARR=""
 for _ in $(seq 1 60); do
