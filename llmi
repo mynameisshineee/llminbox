@@ -797,9 +797,21 @@ if resto > 0:
           # local, con el mismo censo (`roster.json`) que usa el indexador.
           [ $# -ge 3 ] || { echo "uso: llmi post <yo> <dest[,dest2]> <TIPO> \"<titular>\"   (cuerpo por stdin)" >&2
                             echo "     el ledger sale de BIK_CARRIL; o pásalo con LLMI_LEDGER=<nombre>" >&2; exit 2; }
+          # Se RESPETA lo que traiga quien llama y sólo se rellena lo que falte. Estaba al
+          # revés —el envoltorio pisaba `LLMI_MOUNTS`, `LLMI_ROSTER` y `LLMI_CARRILES`— y
+          # con eso la herramienta no se podía apuntar a ningún sitio que no fuera el de
+          # esta máquina: su prueba de arranque le pasaba un mapa de carriles propio y
+          # resolvía igual contra el del operador, o sea que era IMPOSIBLE probarla
+          # end-to-end sin escribir en el canon de verdad. Cazado por esa prueba en su
+          # primera corrida. No abre ningún agujero: `cat >>` escribe donde quiera
+          # igualmente — esto valida, no es una frontera de seguridad.
+          #
+          # ⚠️ Y las asignaciones van SEGUIDAS: un `\` de continuación con un comentario
+          # detrás corta el comando, y `python3` acababa corriendo SIN las variables
+          # (`KeyError: LLMI_YO`). Me lo hice yo escribiendo el comentario de arriba.
           LLMI_YO="$1" LLMI_A="$2" LLMI_TIPO="$3" LLMI_TITULAR="${4:-}" \
-          LLMI_MOUNTS="$MOUNTS" LLMI_ROSTER="$DIR/roster.json" LLMI_DIR="$DIR" \
-          LLMI_CARRILES="${LLMINBOX_CARRILES:-}" \
+          LLMI_MOUNTS="${LLMI_MOUNTS:-$MOUNTS}" LLMI_ROSTER="${LLMI_ROSTER:-$DIR/roster.json}" \
+          LLMI_DIR="$DIR" LLMI_CARRILES="${LLMI_CARRILES:-${LLMINBOX_CARRILES:-}}" \
           python3 "$DIR/publicar.py"
           exit $? ;;
     up)     [ -r "$TOKFILE" ] || { python3 -c "import secrets;print(secrets.token_urlsafe(32))" > "$TOKFILE"

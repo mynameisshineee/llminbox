@@ -149,6 +149,42 @@ grep -q '^✓ publicado' <<<"$S" \
   || mal "publica sin servicio" "✓ publicado" "$S"
 [ -n "$VIVO" ] && echo "     (el contenedor estaba vivo: lo que prueba esto es que NO lo usa)"
 
+echo "── ARRANQUE: invocada como la invoca un agente, no como la invoca este test ──"
+# EL AGUJERO POR EL QUE CAYERON TRES DEFECTOS SEGUIDOS (2026-08-11, los tres cazados
+# por otra sesión, ninguno por mis 13 falsadores):
+#   · pedía `LLMINBOX_CARRILES`, que es una variable del CONTENEDOR — ningún agente la
+#     tiene en su shell, así que moría para TODOS pidiendo algo que no es suyo;
+#   · se paraba en el primer mapa de carriles que conseguía abrir, en vez de buscar EL
+#     CARRIL en todos;
+#   · puesto en el PATH por un enlace, se buscaba a sí mismo en el destino del enlace.
+# Los tres son la misma avería: **la herramienta funcionaba en el contexto de quien la
+# escribió**. Y mis pruebas la llamaban `python3 publicar.py` con las `LLMI_*` ya
+# cocinadas por el propio arnés — o sea que el arnés APORTABA justo el contexto que
+# faltaba. Una prueba que monta el entorno que el usuario no tiene no prueba el
+# arranque: prueba la lógica de dentro.
+# Esto la invoca COMO SE INVOCA: el CLI (no el python), desde OTRO directorio, por un
+# ENLACE, y con lo único que un agente tiene de verdad — su carril.
+T2="$(mktemp -d)"; mkdir -p "$T2/bin"
+printf '# ledger de aceptación\n' > "$T2/A.md"
+printf 'carril\truta\n' > "$T2/carriles.tsv"
+printf 'aceptacion\t%s/A.md\n' "$T2" >> "$T2/carriles.tsv"
+python3 -c "import json,sys; json.dump({'acept': sys.argv[1]+'/A.md'}, open(sys.argv[1]+'/m.json','w'))" "$T2"
+ln -s "$PWD/llmi" "$T2/bin/llmi"          # por ENLACE, que es como acaba en el PATH
+S="$( cd "$T2" && printf 'cuerpo\n' | \
+      PATH="$T2/bin:$PATH" BIK_CARRIL=aceptacion \
+      LLMI_CARRILES="$T2/carriles.tsv" LLMI_MOUNTS="$T2/m.json" \
+      LLMINBOX_ROSTER="$T/censo.json" \
+      llmi post cto-A qa FYI "desde fuera del repo" 2>&1 )"
+grep -q '^✓ publicado' <<<"$S" \
+  && bien "arranca desde otro directorio, por un enlace, con sólo su carril" \
+  || mal "arranque como agente" "✓ publicado" "$S"
+# Y que lo escrito sea LO SUYO: un arranque que publique en el ledger equivocado pasa
+# esta prueba por el sitio y falla por el fondo.
+grep -q '^### \[cto-A → qa · FYI\]' "$T2/A.md" \
+  && bien "y escribe en el ledger de SU carril, no en otro" \
+  || mal "escribe en su carril" "cabecera en A.md" "$(tail -2 "$T2/A.md")"
+rm -rf "$T2"
+
 echo
 [ "$MALOS" -eq 0 ] && echo "publicar: TODO VERDE" || echo "publicar: $MALOS fallo(s)"
 exit $((MALOS > 0))
