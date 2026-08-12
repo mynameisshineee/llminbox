@@ -14,6 +14,10 @@ puede pasar es que el formato cambie sin que nadie lo note.
 from __future__ import annotations
 
 import re
+from pathlib import Path
+
+REPO_DIR = Path(__file__).resolve().parents[2]
+REPO_LLMI = str(REPO_DIR / "llmi")
 
 # (etiqueta, patrón tal cual lo usa el script, fichero de origen)
 PATRONES_DE_LA_FLOTA = [
@@ -160,3 +164,34 @@ def test_una_cabecera_corta_no_se_toca():
     import servicio
     corta = "### [cto-A → backend · FYI] 2026-08-11T00:00:00Z — titular breve"
     assert servicio.titular_visible(corta) == corta
+
+
+def test_llmi_resuelve_su_repo_a_traves_de_un_symlink(tmp_path):
+    """`llmi` tiene que funcionar invocado por un SYMLINK en el PATH — que es la
+    única forma de que el manual («llmi post …») sea cierto para la flota.
+
+    `dirname $BASH_SOURCE` a secas devuelve dónde está el ENLACE, así que al poner
+    `~/.local/bin/llmi -> ~/llminbox/llmi` el script buscaba `publicar.py`,
+    `roster.json` y `.llmi-mounts.json` en `~/.local/bin`: `llmi post` moría con
+    «can't open publicar.py» y `stat` anunciaba una deriva de montaje FALSA.
+    Medido en el momento de crear el enlace (2026-08-12).
+
+    Se prueba el EFECTO, no la variable: a través del enlace tiene que llegar a la
+    validación de `publicar.py` (que rechazará por censo, y bien), en vez de morir
+    porque no encuentra el fichero.
+
+    FALSADOR: volver a `DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"` hace
+    que la salida traiga «can't open ... publicar.py» y esto se pone rojo.
+    """
+    import os
+    import subprocess
+    enlace = tmp_path / "llmi"
+    os.symlink(REPO_LLMI, enlace)
+    r = subprocess.run([str(enlace), "post", "agente-que-no-existe-zz", "cto", "FYI", "t"],
+                       input="cuerpo", capture_output=True, text=True, timeout=30,
+                       env=dict(os.environ, BIK_CARRIL="llminbox"))
+    junto = r.stdout + r.stderr
+    assert "publicar.py" not in junto or "can't open" not in junto, (
+        f"no encontró publicar.py a través del symlink: {junto[:200]}")
+    assert "no está en el censo" in junto, (
+        f"debería haber llegado a la validación de censo: {junto[:200]}")

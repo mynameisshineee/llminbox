@@ -16,7 +16,22 @@
 set -uo pipefail
 
 API="${LLMINBOX_API:-http://127.0.0.1:8077}"
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# EL DIRECTORIO ES EL DEL REPO, NO EL DEL SYMLINK. `dirname $BASH_SOURCE` a secas
+# devuelve dónde está el ENLACE, así que en cuanto alguien pone `llmi` en su PATH con
+# un symlink —que es justo lo que hay que hacer para que el manual valga— el script
+# busca `publicar.py`, `roster.json` y `.llmi-mounts.json` en `~/.local/bin` y no los
+# encuentra: `llmi post` muere con «can't open publicar.py» y `stat` anuncia una
+# deriva de montaje FALSA. Medido en el momento de crear el enlace (2026-08-12).
+# `readlink -f` no vale: es GNU, y en macOS no existe. Este bucle es el idiom
+# portable — sigue la cadena de enlaces hasta el fichero real.
+_SRC="${BASH_SOURCE[0]}"
+while [ -L "$_SRC" ]; do
+  _D="$(cd -P "$(dirname "$_SRC")" && pwd)"
+  _SRC="$(readlink "$_SRC")"
+  case "$_SRC" in /*) ;; *) _SRC="$_D/$_SRC" ;; esac
+done
+DIR="$(cd -P "$(dirname "$_SRC")" && pwd)"
 
 # El token NO es opcional. Publicar en 127.0.0.1 no aísla en Docker Desktop para
 # macOS: comprobado en vivo, un contenedor de otra red llega por
@@ -82,7 +97,8 @@ llmi — consulta la red de ledgers de la flota sin quemarte la ventana
   llmi peek  <agente>       igual, pero SIN consumir
   llmi to    <agente> [n]   lo último dirigido a un agente
   llmi q     <texto> [n]    busca en el cuerpo de las entradas
-  llmi stat                 estado por ledger + DETECTOR DE DERIVA de montaje
+  llmi stat [--json]        estado por ledger + DETECTOR DE DERIVA de montaje
+                            (--json: sólo JSON por stdout, la deriva por stderr)
   llmi lint  [ledger]       deuda de tipado (qué entradas no declaran nada)
   llmi verify               integridad del canon (¿ha desaparecido alguna entrada?)
   llmi canon [n]            cola de destilación: lo dirigido que aún no es página
@@ -752,9 +768,22 @@ if resto > 0:
           out="$(curl -sf -m 60 "${H[@]}" "$API/chain/verify")"; echo "$out"
           grep -q '✗' <<<"$out" && exit 1 || exit 0 ;;
   stat)   vivo || { sin_servicio; exit 3; }
-          curl -sf -m 10 "${H[@]}" "$API/stat" | python3 -m json.tool
-          echo "── deriva de montaje (host vs contenedor) ──"
-          if deriva; then echo "  ✓ los montajes miran al mismo inodo que el host"; fi ;;
+          # ⑥ `--json`: hasta hoy esto imprimía el JSON del servicio Y DETRÁS el
+          # bloque de texto de la deriva de montaje, en el MISMO stdout — así que
+          # `llmi stat | jq` (o cualquier json.load) petaba con «Extra data». El
+          # ítem llevaba días marcado BLOQUEADO-SIN-DEFINICIÓN porque nadie lo había
+          # pedido con esa forma; lo desbloquea haberlo pisado yo al crear el symlink
+          # de `llmi` y ver reventar mi propio parseo. Con `--json` sale SÓLO el JSON
+          # y la deriva se va a stderr, que es donde puede convivir con una tubería.
+          if [ "${1:-}" = "--json" ]; then
+            curl -sf -m 10 "${H[@]}" "$API/stat" | python3 -m json.tool
+            { echo "── deriva de montaje (host vs contenedor) ──"
+              if deriva; then echo "  ✓ los montajes miran al mismo inodo que el host"; fi; } >&2
+          else
+            curl -sf -m 10 "${H[@]}" "$API/stat" | python3 -m json.tool
+            echo "── deriva de montaje (host vs contenedor) ──"
+            if deriva; then echo "  ✓ los montajes miran al mismo inodo que el host"; fi
+          fi ;;
   post)   # PUBLICAR. Existe porque la puerta estaba puesta donde nadie pasa: medido
           # 2026-08-11, `POST /append` llevaba 47 llamadas contra 103.257 entradas
           # indexadas — el 0,05 %. Ese endpoint YA rechaza lo que no nombra a nadie
