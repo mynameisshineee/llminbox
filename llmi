@@ -52,6 +52,70 @@ ROSTER="$DIR/roster.json"
 # nuestros. Formato: JSON `{"nombre": "/ruta/host/al/fichero.md", ...}`.
 MOUNTS="$DIR/.llmi-mounts.json"
 
+# ── IDENTIDAD DERIVADA DE LA SESIÓN, no tecleada ──────────────────────────────
+# Las 45 sesiones de la flota se llaman EXACTAMENTE `<rol>-<carril>`
+# (`backend-64bis`, `cfo-guardian-PM`, `wiki-vault-bikeus`…), y eso es una
+# identidad ESTABLE: sobrevive al reinicio de la sesión de Claude, al contrario
+# que la dirección de peer (`cto-biklabs-97`), cuyo sufijo cambia cada vez.
+#
+# Por qué importa: todo error de identidad de esta semana nació de TECLEAR —
+# `sdet` publicando 5 h al vacío, 149 nombres para 15 roles, un carril tecleado
+# con el nombre del ledger que drenaba los 12 cursores. Lo que no se teclea no
+# se equivoca. Se DERIVA y se puede desactivar (`BIK_CARRIL`/argumento explícito
+# mandan siempre, por si alguien sabe lo que hace).
+#
+# El corte NO es por el primer guión: hay roles con guión (`cfo-guardian-64bis`,
+# `db-migrations-PM`). Se casa el SUFIJO contra los carriles conocidos, que los
+# sirve el propio servicio en `/carriles` (y si no responde, el `carriles.tsv`
+# de flota) — el mismo SoT que usa el ámbito de carril, no una copia.
+_sesion_tmux() {
+  [ -n "${TMUX:-}" ] || return 1
+  tmux display-message -p '#S' 2>/dev/null | grep -qE '.' || return 1
+  tmux display-message -p '#S' 2>/dev/null
+}
+
+_carriles_conocidos() {
+  curl -sf -m 3 "${H[@]}" "$API/carriles" 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print("\n".join(json.load(sys.stdin)))
+except Exception: pass' 2>/dev/null && return 0
+  local tsv="$HOME/AGENTES/agentes_BIK/_shared_refs/carriles/carriles.tsv"
+  [ -r "$tsv" ] && awk -F'\t' '!/^#/ && NF>1 {print $1}' "$tsv"
+}
+
+# rol y carril de ESTA sesión, o nada si no se puede derivar con certeza.
+_yo_y_carril() {
+  local ses car rol
+  ses="$(_sesion_tmux)" || return 1
+  while IFS= read -r car; do
+    [ -n "$car" ] || continue
+    case "$ses" in
+      *-"$car")
+        rol="${ses%-$car}"
+        [ -n "$rol" ] && { printf '%s\t%s\n' "$rol" "$car"; return 0; } ;;
+    esac
+  done < <(_carriles_conocidos)
+  return 1
+}
+
+# Rellena `$1` (nombre de agente) y `$carril` desde la sesión cuando no vienen, y
+# AVISA —sin bloquear— cuando lo tecleado no casa con la sesión. El aviso es la
+# mitad que de verdad cierra el error: leer la bandeja de otro es legítimo (lo hago
+# yo al depurar), pero hacerlo SIN DARTE CUENTA es lo que costó 5 h a `sdet` y 12
+# cursores drenados a quien tecleó un nombre de ledger como carril.
+_aviso_identidad() {   # $1 = nombre tecleado (o vacío)
+  local par rol car
+  par="$(_yo_y_carril)" || return 0        # sin tmux resoluble, todo sigue igual
+  rol="${par%%$'\t'*}"; car="${par##*$'\t'}"
+  YO_DERIVADO="$rol"; CARRIL_DERIVADO="$car"
+  if [ -n "${1:-}" ] && [ "$1" != "$rol" ]; then
+    echo "· ojo: tu sesión es «$rol-$car» y estás usando «$1» — si es a propósito, ignora esto" >&2
+  fi
+  if [ -n "${BIK_CARRIL:-}" ] && [ "$BIK_CARRIL" != "$car" ]; then
+    echo "· ojo: BIK_CARRIL=«$BIK_CARRIL» pero tu sesión es del carril «$car»" >&2
+  fi
+}
+
 vivo() { curl -sf -m 3 "$API/health" >/dev/null 2>&1; }
 
 # GET /inbox/$1: 200 → cuerpo por stdout, rc=0. 422 → censo rechaza el nombre:
@@ -59,10 +123,10 @@ vivo() { curl -sf -m 3 "$API/health" >/dev/null 2>&1; }
 # 5xx) → sin_servicio, rc=3. `-f` no distingue 422 de "no hay nadie escuchando":
 # los dos vuelven no-cero y sin cuerpo. `-w`+`-o` conservan el código real y el
 # cuerpo aparte, para poder mirar los dos.
-_get_inbox_o_422() {  # $1=agente $2=limit
+_get_inbox_o_422() {  # $1=agente $2=limit $3=ledger (opcional: acota la bandeja con only=)
   local cuerpo cod
   cuerpo="$(mktemp)"
-  cod="$(curl -s -m 10 "${H[@]}" -o "$cuerpo" -w '%{http_code}' "$API/inbox/$1?limit=$2")" \
+  cod="$(curl -s -m 10 "${H[@]}" -o "$cuerpo" -w '%{http_code}' "$API/inbox/$1?limit=$2${3:+&only=$3}")" \
     || { rm -f "$cuerpo"; sin_servicio; return 3; }
   case "$cod" in
     200) cat "$cuerpo"; rm -f "$cuerpo"; return 0 ;;
@@ -611,8 +675,11 @@ cmd="${1:-}"; shift 2>/dev/null || true
 case "$cmd" in
   init)   for a in "$@"; do [ "$a" = "--demo" ] && export LLMINBOX_DEMO=1; done
           hacer_init ;;
-  inbox)  [ $# -ge 1 ] || { uso; exit 2; }
-          carril="${BIK_CARRIL:-}"; args=()
+  inbox)  YO_DERIVADO=""; CARRIL_DERIVADO=""
+          _aviso_identidad "${1:-}"
+          # sin argumento, eres TÚ: el nombre sale de la sesión, no del teclado
+          [ $# -ge 1 ] || { [ -n "$YO_DERIVADO" ] && set -- "$YO_DERIVADO" || { uso; exit 2; }; }
+          carril="${BIK_CARRIL:-$CARRIL_DERIVADO}"; args=()
           while [ $# -gt 0 ]; do
             case "$1" in
               # `$2` sin comprobar revienta bajo `set -u` con "unbound variable"
@@ -631,7 +698,26 @@ case "$cmd" in
           # incluido un <img src> en una página abierta en el Mac. Y si esta sesión
           # se cae entre leer y marcar, el correo sigue ahí: pierde un ciclo, no un
           # mensaje.
-          out="$(_get_inbox_o_422 "$1" "${2:-30}")"; rc=$?
+          # PARED DE CARRIL EN LA BANDEJA (vision-canon 2026-08-14, MARK:vision-canon-
+          # la-bandeja-entrega-ocho-ledgers-y-el-hook-no-lo-ve): con carril declarado
+          # el GET pasa only=<ledger> — 8 ledgers servidos y 7 ajenos era la puerta
+          # abierta que el hook (filesystem) no ve porque esto es HTTP. SIN carril
+          # declarado no se filtra nada: los vigías que necesitan la vista completa
+          # simplemente no lo pasan (la adjudicación previa de «no cambiar lo que se
+          # sirve» queda honrada por esa vía). Si /carriles no resuelve, bandeja SIN
+          # filtrar y se DICE: un muro que falla en silencio afirmaría lo contrario.
+          mio_only=""
+          if [ -n "$carril" ]; then
+            mio_only="$(curl -sf -m 10 "${H[@]}" "$API/carriles" 2>/dev/null \
+                   | python3 -c 'import json,sys;print(json.load(sys.stdin).get(sys.argv[1],""))' "$carril" 2>/dev/null || true)"
+            [ -n "$mio_only" ] || echo "· ⚠️ no pude resolver el ledger del carril «${carril}»: bandeja SIN filtrar (secciones ajenas a la vista)" >&2
+          else
+            # caída ⒝ (security 2026-08-15, MARK:sec-la-ausencia-no-puede-ser-el-caso-permisivo):
+            # la vista completa es legítima (vigías la necesitan) pero NO puede ser MUDA —
+            # el aviso vivía DENTRO del if y la ausencia era el caso permisivo Y callado.
+            echo "· ⚠️ SIN carril declarado (BIK_CARRIL vacío): bandeja COMPLETA de flota, sin filtrar — si esperabas tu carril, decláralo" >&2
+          fi
+          out="$(_get_inbox_o_422 "$1" "${2:-30}" "$mio_only")"; rc=$?
           [ $rc -eq 0 ] || exit $rc
           printf '%s\n' "$out"
           # El pie del servicio es `marcar leído — pega esto tal cual:` + una línea
@@ -650,7 +736,11 @@ case "$cmd" in
             # servidor un `curl -sf` mudo lo convertía en «no pasó nada» — las dos
             # mentiras opuestas sobre el mismo error.
             cuerpo_post="$(mktemp)"
-            cod="$(curl -s -m 10 "${Hc[@]}" -H 'Content-Type: application/json' -d "$json" \
+            # -m 30, no 10: el INSERT del cursor espera el lock de sqlite hasta 30 s
+            # (timeout del servicio) y un -m 10 lo convertia en «HTTP sin respuesta»
+            # con el servicio SANO — el reintento del mismo hasta funcionaba porque
+            # el lock ya se habia soltado (diagnostico del leido-500, 13-ago).
+            cod="$(curl -s -m 30 "${Hc[@]}" -H 'Content-Type: application/json' -d "$json" \
                  -o "$cuerpo_post" -w '%{http_code}' "$API/inbox/$1/leido")" || cod=""
             case "$cod" in
               200) echo "· cursor avanzado ${carril:+(carril: $carril) }→ $(cat "$cuerpo_post")"
@@ -663,8 +753,11 @@ except Exception: print(open(sys.argv[1]).read(), file=sys.stderr)' "$cuerpo_pos
                    echo "· leído NO marcado (HTTP ${cod:-sin respuesta}) — el cursor no avanzó" >&2 ;;
             esac
           fi ;;
-  peek)   [ $# -ge 1 ] || { uso; exit 2; }; vivo || { sin_servicio; exit 3; }
-          carril="${BIK_CARRIL:-}"; args=()
+  peek)   YO_DERIVADO=""; CARRIL_DERIVADO=""
+          _aviso_identidad "${1:-}"
+          [ $# -ge 1 ] || { [ -n "$YO_DERIVADO" ] && set -- "$YO_DERIVADO" || { uso; exit 2; }; }
+          vivo || { sin_servicio; exit 3; }
+          carril="${BIK_CARRIL:-$CARRIL_DERIVADO}"; args=()
           while [ $# -gt 0 ]; do
             case "$1" in
               --carril) [ $# -ge 2 ] || { echo "· --carril necesita un valor (p.ej. --carril 64bis)" >&2; uso; exit 2; }
@@ -674,7 +767,26 @@ except Exception: print(open(sys.argv[1]).read(), file=sys.stderr)' "$cuerpo_pos
           done
           set -- "${args[@]}"
           [ $# -ge 1 ] || { uso; exit 2; }
-          out="$(_get_inbox_o_422 "$1" "${2:-30}")"; rc=$?
+          # PARED DE CARRIL EN LA BANDEJA (vision-canon 2026-08-14, MARK:vision-canon-
+          # la-bandeja-entrega-ocho-ledgers-y-el-hook-no-lo-ve): con carril declarado
+          # el GET pasa only=<ledger> — 8 ledgers servidos y 7 ajenos era la puerta
+          # abierta que el hook (filesystem) no ve porque esto es HTTP. SIN carril
+          # declarado no se filtra nada: los vigías que necesitan la vista completa
+          # simplemente no lo pasan (la adjudicación previa de «no cambiar lo que se
+          # sirve» queda honrada por esa vía). Si /carriles no resuelve, bandeja SIN
+          # filtrar y se DICE: un muro que falla en silencio afirmaría lo contrario.
+          mio_only=""
+          if [ -n "$carril" ]; then
+            mio_only="$(curl -sf -m 10 "${H[@]}" "$API/carriles" 2>/dev/null \
+                   | python3 -c 'import json,sys;print(json.load(sys.stdin).get(sys.argv[1],""))' "$carril" 2>/dev/null || true)"
+            [ -n "$mio_only" ] || echo "· ⚠️ no pude resolver el ledger del carril «${carril}»: bandeja SIN filtrar (secciones ajenas a la vista)" >&2
+          else
+            # caída ⒝ (security 2026-08-15, MARK:sec-la-ausencia-no-puede-ser-el-caso-permisivo):
+            # la vista completa es legítima (vigías la necesitan) pero NO puede ser MUDA —
+            # el aviso vivía DENTRO del if y la ausencia era el caso permisivo Y callado.
+            echo "· ⚠️ SIN carril declarado (BIK_CARRIL vacío): bandeja COMPLETA de flota, sin filtrar — si esperabas tu carril, decláralo" >&2
+          fi
+          out="$(_get_inbox_o_422 "$1" "${2:-30}" "$mio_only")"; rc=$?
           [ $rc -eq 0 ] || exit $rc
           printf '%s\n' "$out"
           # CON CARRIL DECLARADO, EL SILENCIO SOBRE EL TUYO SE DICE. La bandeja
@@ -809,7 +921,9 @@ if resto > 0:
           # ⚠️ Y las asignaciones van SEGUIDAS: un `\` de continuación con un comentario
           # detrás corta el comando, y `python3` acababa corriendo SIN las variables
           # (`KeyError: LLMI_YO`). Me lo hice yo escribiendo el comentario de arriba.
+          YO_DERIVADO=""; CARRIL_DERIVADO=""; _aviso_identidad "$1"
           LLMI_YO="$1" LLMI_A="$2" LLMI_TIPO="$3" LLMI_TITULAR="${4:-}" \
+          BIK_CARRIL="${BIK_CARRIL:-$CARRIL_DERIVADO}" \
           LLMI_MOUNTS="${LLMI_MOUNTS:-$MOUNTS}" LLMI_ROSTER="${LLMI_ROSTER:-$DIR/roster.json}" \
           LLMI_DIR="$DIR" LLMI_CARRILES="${LLMI_CARRILES:-${LLMINBOX_CARRILES:-}}" \
           python3 "$DIR/publicar.py"

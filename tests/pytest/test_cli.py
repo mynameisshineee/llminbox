@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import http.server
 import json
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -182,3 +183,57 @@ def test_carril_invalido_el_cli_lo_dice_y_exit_4(stub, tmp_path):
               f"http://127.0.0.1:{stub.server_port}")
     assert r.returncode == 4
     assert "novale" in r.stderr
+
+
+# ── identidad derivada de la sesión tmux ─────────────────────────────────────
+# Las 45 sesiones de la flota se llaman `<rol>-<carril>` (`backend-64bis`,
+# `cfo-guardian-PM`…). Es la identidad ESTABLE: sobrevive al reinicio de Claude,
+# al contrario que la dirección de peer (`cto-biklabs-97`), cuyo sufijo cambia.
+# Todo error de identidad de la semana nació de TECLEAR; esto lo deriva.
+
+def _yo_y_carril(sesion, carriles=("64bis", "PM", "cfocockpit", "bikeus",
+                                   "biklabs-landing", "llminbox")):
+    """Réplica EXACTA del corte del CLI, para poder falsarlo aquí: el sufijo se
+    casa contra los carriles conocidos, NO por el primer guión — hay roles con
+    guión (`cfo-guardian-64bis`, `db-migrations-PM`) y cortar por el primero
+    devolvería rol='cfo' carril='guardian-64bis'."""
+    for c in carriles:
+        if sesion.endswith("-" + c):
+            return sesion[: -len(c) - 1], c
+    return None
+
+
+@pytest.mark.parametrize("sesion,rol,carril", [
+    ("backend-64bis", "backend", "64bis"),
+    ("cfo-guardian-PM", "cfo-guardian", "PM"),          # rol CON guión
+    ("db-migrations-64bis", "db-migrations", "64bis"),  # rol con guión, otro carril
+    ("wiki-vault-bikeus", "wiki-vault", "bikeus"),
+    ("sdet-PM", "sdet", "PM"),
+])
+def test_la_sesion_da_rol_y_carril(sesion, rol, carril):
+    """Los cinco casos son nombres REALES de `tmux list-sessions` (2026-08-16).
+
+    FALSADOR: cortar por el primer guión da `cfo`/`guardian-PM` y este test lo ve.
+    """
+    assert _yo_y_carril(sesion) == (rol, carril)
+
+
+def test_una_sesion_que_no_es_de_carril_no_resuelve():
+    """CONTROL NEGATIVO: si el nombre no acaba en un carril conocido, NO se
+    inventa identidad — se devuelve nada y el CLI pide el argumento de siempre.
+    Adivinar la identidad es exactamente lo que produce huérfanas."""
+    assert _yo_y_carril("una-sesion-cualquiera") is None
+    assert _yo_y_carril("64bis") is None          # sin rol delante
+
+
+def test_sin_tmux_el_cli_no_cambia_de_conducta(stub, tmp_path):
+    """Fuera de tmux (cron, `claude --bg`, un shell suelto) la derivación no
+    aplica y `peek` sin argumento sigue dando uso + rc=2, como siempre.
+
+    FALSADOR: si la derivación se colara con `$TMUX` vacío, esto daría rc≠2."""
+    env = dict(os.environ)
+    env.pop("TMUX", None)
+    r = subprocess.run([LLMI, "peek"], capture_output=True, text=True, timeout=30,
+                       env={**env, "HOME": str(tmp_path), "PATH": "/usr/bin:/bin",
+                            "LLMINBOX_API": f"http://127.0.0.1:{stub.server_port}"})
+    assert r.returncode == 2

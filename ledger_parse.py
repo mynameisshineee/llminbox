@@ -102,7 +102,7 @@ def _censo():
             d = json.load(fh)
     except Exception as e:                    # sin censo se sigue, pero se DICE
         print(f"[censo] no pude leer {ruta}: {e} — el extractor no reconocerá a nadie")
-        return [], {}, [], {}
+        return [], {}, [], {}, {}
     nombres = [a["nombre"] for a in d.get("agentes", [])]
     for h in d.get("humanos", []):
         nombres.append(h["nombre"])
@@ -118,10 +118,22 @@ def _censo():
     # este producto promete no hacer).
     escucha = {a["nombre"].lower(): list(a.get("escucha", []))
                for a in d.get("agentes", []) if a.get("escucha")}
-    return nombres, dueno, d.get("difusion", []), escucha
+    # ESCUCHA_AUTOR — el espejo del anterior, y NO es el mismo campo con otro nombre.
+    # `escucha` entrega lo dirigido A alguien (filtra `recipients.who`); esto entrega
+    # lo ESCRITO POR alguien (filtra `entries.actor`). La diferencia es la que separa
+    # «me entero de lo que le piden al CPO» de «me entero de lo que el CPO decide», y
+    # sólo el segundo sirve para que QA valide contra el criterio de producto en vez
+    # de contra lo que el implementador entendió (orden de Albert, 2026-08-13).
+    #
+    # Y baja el fan-out en lugar de subirlo: la alternativa era que el CPO pusiera a
+    # QA en copia de todo. Medido el 2026-08-13 sobre el despliegue real, el CPO ya
+    # iba a 6,62 destinatarios por envío — suscribirse cuesta cero destinatarios.
+    escucha_autor = {a["nombre"].lower(): list(a.get("escucha_autor", []))
+                     for a in d.get("agentes", []) if a.get("escucha_autor")}
+    return nombres, dueno, d.get("difusion", []), escucha, escucha_autor
 
 
-AGENTES, DUENO, DIFUSION, ESCUCHA = _censo()
+AGENTES, DUENO, DIFUSION, ESCUCHA, ESCUCHA_AUTOR = _censo()
 
 
 def _roles():
@@ -225,6 +237,36 @@ def _cargar_roles_por_alias():
 ROLES_ALIAS = _cargar_roles_por_alias()
 
 
+def _cargar_jerarquia() -> dict:
+    """`rol → {reporta_a, capa, gatea, criterios_de}` del mismo fichero firmado.
+
+    Vive junto a `rol_por_alias` porque es el mismo dato firmado por el mismo
+    responsable, y **es rol→rol**, que es la forma correcta: `alias → rol` es
+    muchos-a-uno y no puede sostener una jerarquía, igual que no puede sostener
+    el mapa `rol × carril → bandeja` que ORGANIGRAMA.md §4 ya declara que no cabe
+    aquí. Son tres datos con tres formas distintas; sólo dos comparten fichero.
+
+    Diccionario vacío = no montado. Es una AUSENCIA que hay que decir en voz alta,
+    no un organigrama plano: un agente que lee «no reportas a nadie» concluye lo
+    contrario de la verdad. Quien sirva esto tiene que distinguir los dos casos.
+    """
+    import json as _json
+    import os as _os
+    ruta = _os.environ.get("LLMINBOX_ROLES_ALIAS", "")
+    if not ruta:
+        return {}
+    try:
+        with open(ruta, encoding="utf-8") as fh:
+            return {k.lower(): v for k, v in _json.load(fh).get("jerarquia", {}).items()}
+    except Exception as e:
+        print(f"[jerarquia] no pude leer {ruta}: {e} — se sirve vacía y se avisa",
+              flush=True)
+        return {}
+
+
+JERARQUIA = _cargar_jerarquia()
+
+
 def canon_identidad(nombre: str) -> str | None:
     """Forma canónica de `nombre` para identidad de cursor, o None si no resuelve.
 
@@ -316,6 +358,42 @@ def escuchados(agent: str) -> list[str]:
         if c.lower() not in vistos:
             vistos.add(c.lower())
             fuera.append(c)
+    return fuera
+
+
+def firmas_del_rol(nombre: str) -> list[str]:
+    """Todas las firmas censadas de un ROL. Si no es un rol, el nombre canónico.
+
+    Existe porque en esta casa un rol NO firma con un nombre. Medido el
+    2026-08-13 sobre los ledgers vivos: `cpo` firma como `cpo` (778),
+    `cpo-biklabs` (265) y `cpo-cfo-cockpit` (84); `cto` con CINCO, y la más
+    frecuente no es `cto` sino `cto-A`. Resolver una suscripción por el nombre
+    literal entrega el 69 % del flujo y pierde un carril entero — sin error,
+    sin hueco visible, con la bandeja en verde. Ese es justo el fallo que no se
+    detecta leyendo la salida.
+    """
+    objetivo = (nombre or "").lower()
+    firmas = [canonico(n) for n, r in ROL_DE.items() if str(r).lower() == objetivo]
+    return firmas or [canonico(nombre)]
+
+
+def escuchados_autor(agent: str) -> list[str]:
+    """Los AUTORES a los que `agent` está suscrito, expandidos por rol.
+
+    Se devuelve canónico porque `entries.actor` guarda lo que el parser resolvió
+    contra el censo, no lo que tecleó quien firmó: comparar sin canonizar dejaría
+    fuera a un `CPO` en mayúsculas y la suscripción no entregaría nada, en silencio.
+
+    A diferencia de `escuchados()`, el propio agente NO se incluye: uno no se
+    suscribe a sí mismo, y meterlo aquí duplicaría cada entrada suya que ya le
+    llega por destinatario.
+    """
+    fuera, vistos = [], set()
+    for n in ESCUCHA_AUTOR.get(agent.lower(), []):
+        for c in firmas_del_rol(n):
+            if c.lower() not in vistos:
+                vistos.add(c.lower())
+                fuera.append(c)
     return fuera
 # Se ordenan de más largo a más corto para que `alice-backend` gane a `cto`.
 AGENTES.sort(key=len, reverse=True)

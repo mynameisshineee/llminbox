@@ -1407,6 +1407,57 @@ def vuelca_coste(con) -> None:
         print(f"[coste] volcado aplazado: {exc}", flush=True)
 
 
+def siega_vencidos(con) -> None:
+    """Cierra los claims cuyo TTL pasó y que nadie ha reclamado.
+
+    Sin esto, «vencido» sólo se resolvía si OTRO agente peleaba el mismo tema: si
+    nadie lo quería, el claim seguía «abierto» para siempre. Medido el 2026-08-13:
+    69 abiertos, LOS 69 vencidos, de entre 3,2 y 4,8 días, ninguno reclamado.
+
+    El daño no es la cifra fea, es concreto: `tablero_abierto()` pone los 12 últimos
+    temas cogidos delante de quien va a coger algo, y es la ÚNICA guarda que esta
+    casa midió que funciona (el casi-choque del 08-11). Con los muertos acumulándose,
+    esos 12 dejan de ser señal de choque y pasan a ser ruido — se degrada la guarda
+    buena por no barrer.
+
+    ⚠️ VA EN EL BARRIDO, NO EN EL GET, y la diferencia costó caro una vez: una fila
+    de telemetría escrita desde una lectura tumbó 212 peticiones el 2026-08-08 con
+    la base ocupada. Aquí la conexión es la del barrido, que acaba de soltar el
+    indexador y no compite con nadie — mismo sitio y mismo motivo que
+    `vuelca_lecturas`.
+
+    Cierra, NO borra, y con `motivo` propio: `relevo` es «te lo quitó alguien»,
+    `cierro` es «lo terminó su dueño» y `ttl_expirado` es «se murió solo». Fundirlos
+    haría que la tasa de cierre premiara el abandono igual que el trabajo hecho.
+    """
+    # Se reutiliza `_vencido()`, el MISMO predicado que pinta el flag, en vez de
+    # escribir la condición otra vez en SQL. Un primer intento comparaba cadenas
+    # (`abierto < corte`) y discrepaba del flag: los sellos se guardan truncados a
+    # SEGUNDOS, así que un claim de la misma hora exacta salía «vencido» para el
+    # flag y «vivo» para la siega. Dos definiciones de lo mismo divergen en cuanto
+    # una de las dos toca un borde, y aquí el borde es un segundo entero.
+    ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        muertos = [r["id"] for r in con.execute(
+            "SELECT rowid AS id, abierto FROM claims WHERE cerrado IS NULL")
+            if _vencido(r["abierto"])]
+        if not muertos:
+            return
+        con.executemany(
+            "UPDATE claims SET cerrado=?, motivo='ttl_expirado' WHERE rowid=?",
+            [(ahora, i) for i in muertos])
+        n = len(muertos)
+        con.commit()
+    except sqlite3.Error as e:
+        # Best-effort, como el resto del volcado: la siega es higiene, y una higiene
+        # que tumba el barrido cuesta más de lo que limpia.
+        print(f"[siega] no pude cerrar vencidos: {e}", flush=True)
+        return
+    if n:
+        print(f"[siega] {n} claim(s) cerrados por TTL ({CLAIM_TTL_H} h) — nadie los "
+              f"reclamó. Siguen en la tabla con motivo='ttl_expirado'.", flush=True)
+
+
 def barrido():
     """Un ledger roto NO puede parar a los demás.
 
@@ -1476,6 +1527,7 @@ def barrido():
         # la conexión se cierre igual si el volcado revienta.
         vuelca_lecturas(con)
         vuelca_coste(con)
+        siega_vencidos(con)
     finally:
         con.close()
 
@@ -2120,6 +2172,26 @@ def inbox(agent: str, limit: int = Query(30, le=200), only: str | None = None):
         if c not in nombres:
             nombres.append(c)
     marcas = ",".join("?" * len(nombres))
+    # Suscripción por AUTOR (censo: `escucha_autor`). Va en un OR aparte y no
+    # dentro del EXISTS a propósito: `recipients` responde «¿a quién iba?» y
+    # `entries.actor` «¿quién lo escribió?». Meter lo segundo en la subconsulta
+    # de lo primero da una respuesta que parece bien y mezcla dos preguntas.
+    #
+    # La rama vacía NO es cosmética: `e.actor IN ()` es un error de sintaxis en
+    # SQLite, así que sin ella el día que nadie esté suscrito se cae la bandeja
+    # ENTERA de todo el mundo — el camino de lectura de la flota, por una lista
+    # vacía. Se construye la cláusula, no se concatena a ciegas.
+    autores = lp.escuchados_autor(agent)
+    if autores:
+        marcas_autor = ",".join("?" * len(autores))
+        quien_sql = (f"(EXISTS (SELECT 1 FROM recipients r WHERE r.ledger=e.ledger "
+                     f"AND r.eid=e.eid AND r.who IN ({marcas})) "
+                     f"OR e.actor IN ({marcas_autor}))")
+        quien_par: tuple = (*nombres, *autores)
+    else:
+        quien_sql = (f"EXISTS (SELECT 1 FROM recipients r WHERE r.ledger=e.ledger "
+                     f"AND r.eid=e.eid AND r.who IN ({marcas}))")
+        quien_par = (*nombres,)
     out, tope = [], {}
     excluidos = []
     for name in ([only] if only else LEDGERS):
@@ -2134,8 +2206,7 @@ def inbox(agent: str, limit: int = Query(30, le=200), only: str | None = None):
             # EXISTS, no JOIN: con dos nombres escuchados, una entrada dirigida a los
             # dos sale DUPLICADA por el JOIN. El EXISTS la cuenta una vez y sigue
             # usando el índice `i_who`.
-            f"WHERE e.ledger=? AND EXISTS (SELECT 1 FROM recipients r WHERE "
-            f"r.ledger=e.ledger AND r.eid=e.eid AND r.who IN ({marcas})) "
+            f"WHERE e.ledger=? AND {quien_sql} "
             "AND e.arrival>? AND e.ausente IS NULL "
             # Lo MÁS RECIENTE primero, y se le da la vuelta abajo para leer en orden.
             # Con `ORDER BY arrival` a secas, un agente que estrena cursor recibe sus
@@ -2143,18 +2214,23 @@ def inbox(agent: str, limit: int = Query(30, le=200), only: str | None = None):
             # empezando por junio—. La bandeja es "lo que me he perdido", y lo que uno
             # se ha perdido se lee del final hacia atrás, no del principio.
             "ORDER BY e.arrival DESC LIMIT ?",
-            (name, *nombres, last, limit)).fetchall()
+            (name, *quien_par, last, limit)).fetchall()
         if not rows:
             continue
         rows = list(reversed(rows))       # cronológico dentro del bloque
         atras = con.execute(
             "SELECT COUNT(*) n FROM entries e "
-            f"WHERE e.ledger=? AND EXISTS (SELECT 1 FROM recipients r WHERE "
-            f"r.ledger=e.ledger AND r.eid=e.eid AND r.who IN ({marcas})) "
+            f"WHERE e.ledger=? AND {quien_sql} "
             "AND e.arrival>? AND e.ausente IS NULL",
-            (name, *nombres, last)).fetchone()["n"]
+            (name, *quien_par, last)).fetchone()["n"]
         cola = f" · {atras - len(rows)} más atrás" if atras > len(rows) else ""
-        escucha = (" · escuchando " + ", ".join(nombres[1:])) if len(nombres) > 1 else ""
+        # Se dice a quién se escucha Y por qué lado, porque son dos cosas distintas:
+        # un nombre suelto es «lo dirigido a él», `lo que escribe X` es su autoría.
+        # Sin distinguirlo, quien lee su bandeja no puede saber por qué le ha
+        # llegado una entrada que no le nombra — y una entrega inexplicable se
+        # interpreta como fuga, no como suscripción.
+        etiquetas = list(nombres[1:]) + [f"lo que escribe {a}" for a in autores]
+        escucha = (" · escuchando " + ", ".join(etiquetas)) if etiquetas else ""
         # El rótulo dice también el CARRIL — quien declara ámbito teclea lo que ve
         # aquí, y lo que veía era el nombre del LEDGER (de ahí el 422 de fe·bikeus,
         # 2026-08-10T17:17Z). PERO VA AL FINAL, Y ESO NO ES ESTÉTICA: `── <ledger> ·`
@@ -2624,6 +2700,29 @@ INBOX_EXCLUIR = {x.strip() for x in os.environ.get("LLMINBOX_INBOX_EXCLUIR", "")
 CUERPO_MAX_FILAS = int(os.environ.get("LLMINBOX_CUERPO_MAX_FILAS", "10"))
 CUERPO_MAX_BYTES = int(os.environ.get("LLMINBOX_CUERPO_MAX_BYTES", "200000"))
 TOPE_REVISORES = int(os.environ.get("LLMINBOX_TOPE_REVISORES", "3"))
+# Cuántos temas puede tener UN ROL cogidos a la vez para EJECUTAR. Nace de una
+# medición del 2026-08-13 sobre el despliegue real: 69 claims abiertos, **los 69
+# vencidos**, `contratos` acaparando 21 y `design` 14. El reparto era un candado
+# sin llave — con todo vencido, cualquiera podía coger cualquier cosa.
+#
+# ⚠️ Cuenta los VIVOS, nunca los vencidos, y esa distinción es la que evita que
+# esta guarda haga daño: contando vencidos, este despliegue arrancaría con todos
+# los roles bloqueados por trabajo que nadie está haciendo. Un tope que se cobra
+# sobre trabajo muerto no reparte, ladrillea.
+#
+# ⛔ Y NO mira el TEXTO del tema para decidir si «es de tu coto». Se probó la idea
+# y la rechaza con medición el propio `tablero_abierto()` de más abajo: sobre el
+# par real que casi chocó, Jaccard 0,111 y el único token común era el nombre del
+# carril. Un umbral que cace ese caso salta con todos. El coto se defiende
+# contando lo que tienes abierto, que es un hecho, no adivinando de qué va.
+TOPE_EJECUTA = int(os.environ.get("LLMINBOX_TOPE_EJECUTA", "3"))
+# Cuándo arrancó ESTE proceso, que es cuándo se leyó el fichero firmado. `JERARQUIA`
+# y `ROLES_ALIAS` se cargan a nivel de módulo y no hay reload ni file-watch: un edit
+# al censo NO se sirve hasta reiniciar el contenedor. La cicatriz que lo enseñó es la
+# plaza 15 — el fichero firmado convivió con un servicio que seguía rechazando el
+# nombre, y el lint en verde al mismo tiempo. Sin este sello, «¿estoy sirviendo el
+# organigrama de hoy?» es indecidible para quien pregunta; con él es una resta.
+ARRANCADO_EN = datetime.now(timezone.utc).isoformat(timespec="seconds")
 # Un agente que coge trabajo y se muere dejaría el tema tomado PARA SIEMPRE, y el
 # reparto se convertiría en un candado. Pasado el plazo, el claim se puede tomar —
 # pero NUNCA en silencio: la respuesta dice a quién se lo quitaste, porque un relevo
@@ -2732,6 +2831,21 @@ def coger(c_in: ClaimIn):
                             "WHERE tema=? AND rol='ejecuta' AND cerrado IS NULL",
                             (ahora, agente, tema))
                 relevado = fila["agent"]
+            # EL COTO. Se comprueba DESPUÉS del relevo —para no cobrarle al que
+            # rescata un trabajo abandonado— y ANTES de insertar.
+            mios = [r for r in con.execute(
+                "SELECT tema, abierto FROM claims WHERE agent=? AND rol='ejecuta' "
+                "AND cerrado IS NULL AND tema<>?", (agente, tema)).fetchall()
+                if not _vencido(r["abierto"])]
+            if len(mios) >= TOPE_EJECUTA:
+                # Se devuelve LA LISTA, no sólo el número: un «no» que no dice qué
+                # tienes abierto obliga a otra llamada para poder obedecerlo, y un
+                # tope que cuesta dos llamadas se rodea en vez de cumplirse.
+                return {"ok": False, "tema": tema, "tope": TOPE_EJECUTA,
+                        "abiertos": [r["tema"] for r in mios],
+                        "motivo": f"'{agente}' ya tiene {len(mios)} temas VIVOS para "
+                                  f"ejecutar (tope {TOPE_EJECUTA}) — cierra uno con "
+                                  f"POST /claim/cierro antes de coger otro"}
             con.execute("INSERT INTO claims(tema,rol,agent,agent_bruto,abierto,bruto) "
                         "VALUES(?,?,?,?,?,?)",
                         (tema, rol, agente, c_in.agent, ahora, c_in.tema))
@@ -2798,20 +2912,80 @@ def mirar_claim(tema: str):
             "puedes_cogerlo": eje is None or _vencido(eje["abierto"]), "historial": filas}
 
 
+@app.get("/organigrama", dependencies=GATE)
+def organigrama():
+    """A quién reportas, qué gateas y de quién recibes criterios — como DATO.
+
+    Existe porque el organigrama vivía sólo en prosa (`ORGANIGRAMA.md`, 18 KB) y
+    la prosa que hay que ir a abrir no gobierna a nadie: el propio fichero lo
+    dice de sí mismo. Un agente que quiere saber a quién escalar hace una
+    llamada, no una lectura de 300 líneas.
+
+    Sin el fichero firmado montado devuelve `{}` **con aviso**. Servir una
+    jerarquía vacía en silencio sería peor que no tener endpoint: el agente
+    leería «no reporto a nadie», que es lo contrario de la verdad.
+    """
+    j = lp.JERARQUIA
+    if not j:
+        return {"jerarquia": {}, "roles": 0, "cargado_en": ARRANCADO_EN,
+                "aviso": "jerarquía NO montada (LLMINBOX_ROLES_ALIAS vacío o "
+                         "ilegible) — esto NO significa que no reportes a nadie, "
+                         "significa que este servicio no lo sabe. Fuente en prosa: "
+                         "_shared_refs/ORGANIGRAMA.md"}
+    return {"jerarquia": j, "roles": len(j), "cargado_en": ARRANCADO_EN, "aviso": None}
+
+
 @app.get("/claims", dependencies=GATE)
-def claims_vivos():
+def claims_vivos(agent: str | None = None):
     """Lo que hay cogido ahora mismo. Es la tabla que convierte la disciplina en
-    métrica: sin ella, «no dupliquéis» es un deseo que nadie puede auditar."""
+    métrica: sin ella, «no dupliquéis» es un deseo que nadie puede auditar.
+
+    `agent=<x>` acota a lo tuyo — «¿qué tengo cogido?», que es la pregunta que un
+    empleado se hace sola y que aquí no tenía respuesta barata. Va como PARÁMETRO
+    y no como endpoint nuevo: el resto de lo que se querría enseñar ahí (quién
+    eres, a quién reportas, a qué te suscribes) YA se imprime en cada arranque, y
+    duplicarlo en un GET que hay que acordarse de teclear pierde contra lo que ya
+    está en pantalla. Adjudicado por `cpo` el 2026-08-13 con la escalera en la mano.
+
+    Se filtra por ROL, no por firma, porque es como `POST /claim` guarda: pedirlo
+    con cualquiera de los alias del rol tiene que devolver lo mismo, o la respuesta
+    dependería de con cuál de tus tres nombres preguntaste.
+
+    ⚠️ Nombre fuera del censo ⇒ 422, NO una lista vacía. «No tienes nada cogido» y
+    «te has escrito mal el nombre» son la misma pantalla, y el segundo te deja
+    creyendo que estás libre. Misma doctrina que `/inbox` con un ledger que no
+    existe.
+    """
+    filtro, par = "", ()
+    if agent is not None:
+        # `resolver_o_422`, el MISMO resolutor que usa /inbox — no una comprobación
+        # propia contra la lista de NOMBRES. Ese fue el bug: `contratosbik` (nombre
+        # censado) resolvía y `contratos` (su ROL, que es como la tabla lo guarda)
+        # daba 422, o sea que preguntar por tu propio trabajo con la palabra correcta
+        # te decía que no existes. Un endpoint que acepta una de las dos caras de una
+        # identidad de doble cara está roto para la mitad de quien pregunte.
+        filtro, par = " AND agent=?", (lp.rol_de(resolver_o_422(agent)),)
     con = db()
     try:
         filas = [dict(r) for r in con.execute(
-            "SELECT tema, rol, agent, abierto, bruto FROM claims WHERE cerrado IS NULL "
-            "ORDER BY abierto DESC")]
+            "SELECT tema, rol, agent, abierto, bruto FROM claims WHERE cerrado IS NULL"
+            f"{filtro} ORDER BY abierto DESC", par)]
     finally:
         con.close()
     for f in filas:
         f["vencido"] = _vencido(f["abierto"])
-    return {"abiertos": len(filas), "tope_revisores": TOPE_REVISORES,
+    # `ejecuta` y `revisa` SEPARADOS, y no es cosmética: sumarlos en un solo número
+    # hizo tropezar a TRES agentes el 2026-08-13 —`wiki` contó 21, `cpo` contó 23, y
+    # `cto` comparó los dos y publicó un crecimiento que no había ocurrido (los 23 de
+    # `contratos` son del 8, 9 y 10 de agosto; cero abiertos ese día). Tener 21 temas
+    # EN PROPIEDAD y ocupar 2 plazas de REVISIÓN no son la misma situación: la primera
+    # es acaparar, la segunda es justo la conducta que la casa quiere. Un agregado que
+    # mezcla las dos no informa, invita al error — y lo invitó tres veces en un día.
+    eje = [f for f in filas if f["rol"] == "ejecuta"]
+    rev = [f for f in filas if f["rol"] == "revisa"]
+    return {"abiertos": len(filas), "ejecuta": len(eje), "revisa": len(rev),
+            "vencidos": sum(1 for f in filas if f["vencido"]),
+            "tope_revisores": TOPE_REVISORES, "tope_ejecuta": TOPE_EJECUTA,
             "ttl_horas": CLAIM_TTL_H, "claims": filas}
 
 
@@ -3348,6 +3522,107 @@ def lint(ledger: str | None = None, limit: int = Query(10, le=100)):
                            f"actor/destinatario ({razon}) — ¿es un nombre o una palabra?")
         else:
             out.append("── censo: ningún nombre parece vocabulario corriente ──")
+
+    # ── ⑤ COPIA (fan-out) — el contador que le faltaba a una regla que YA existía ──
+    #
+    # ORGANIGRAMA §5ter lleva desde el 2026-08-08 diciendo «al nombrar, nombra a UNO»,
+    # con su propia medición al lado («el 52 % de los titulares nombra a 5-6»). El
+    # 2026-08-13 la media real era 6,38 destinatarios por entrada dirigida: 8.775
+    # entradas → 56.026 entregas a bandeja. La regla no se incumplía por desacuerdo,
+    # se incumplía porque NADIE LA CONTABA. Una regla sin instrumento no es una regla,
+    # es una opinión con buena prensa.
+    #
+    # Por qué CONTAR y no BLOQUEAR: el camino canónico de append es `>>` (PROTOCOL §8).
+    # Un gate aquí lo esquiva cualquiera con un `printf`, así que bloquear daría la
+    # sensación de control sobre el único camino que NO es el principal. Contar sí
+    # funciona: se cuenta lo escrito, venga por donde venga.
+    #
+    # La difusión NO cuenta como destinatario, y es deliberado: `→ FLOTA` es UN destino
+    # que la entrega expande, y es exactamente la conducta que queremos premiar frente
+    # a teclear catorce nombres. Si difundir puntuara igual que un CC de 14, el contador
+    # empujaría justo hacia lo que intenta corregir.
+    dif = {d.lower() for d in lp.DIFUSION}
+    marcas_dif = ",".join("?" * len(dif)) if dif else "''"
+    filas = con.execute(
+        "SELECT e.actor AS a, COUNT(*) AS dest, COUNT(DISTINCT e.ledger||e.eid) AS ents "
+        "FROM recipients r JOIN entries e ON e.ledger=r.ledger AND e.eid=r.eid "
+        f"WHERE e.ausente IS NULL AND e.actor IS NOT NULL AND lower(r.who) NOT IN ({marcas_dif}) "
+        "GROUP BY e.actor", tuple(dif)).fetchall()
+    por_rol: dict[str, list[int]] = {}
+    for f in filas:
+        acc = por_rol.setdefault(lp.rol_de(f["a"]), [0, 0])
+        acc[0] += f["dest"]
+        acc[1] += f["ents"]
+    tot_d = sum(v[0] for v in por_rol.values())
+    tot_e = sum(v[1] for v in por_rol.values())
+    out.append("")
+    if not tot_e:
+        out.append("── COPIA: ninguna entrada dirigida a un nombre propio ──")
+    else:
+        out.append(f"── COPIA: {tot_d / tot_e:.2f} destinatarios de media por entrada "
+                   f"dirigida ({tot_e} entradas → {tot_d} entregas a bandeja) ──")
+        out.append("   La regla es nombrar a UNO (ORGANIGRAMA §5ter). Cada nombre de más")
+        out.append("   es una bandeja más que lo lee y lo paga. Si va para todos, di FLOTA:")
+        out.append("   es UN destino que la entrega expande, no catorce nombres tecleados.")
+        # Se ordena por media DESCENDENTE y se listan todos: sin umbral que marque en
+        # rojo. Este endpoint ya fabricó tres falsos positivos una vez comparando lo
+        # que no tocaba; aquí el dato se pone delante y la lectura la hace quien lee.
+        for rol, (d, e) in sorted(por_rol.items(), key=lambda x: -x[1][0] / max(1, x[1][1])):
+            out.append(f"   {d / e:5.2f}  {rol:<16} ({e} entradas dirigidas)")
+
+    # ── ⑥ ¿La siega se está llevando trabajo VIVO? ────────────────────────────
+    #
+    # `CLAIM_TTL_H` era un parámetro DORMIDO —sólo pintaba un flag— y el 2026-08-13
+    # se hizo PORTANTE: `siega_vencidos()` cierra de verdad. La evidencia de que 4 h
+    # bastan son CINCO claims cerrados por su dueño, el más largo de 0,44 h. Cinco no
+    # es una muestra, y un parámetro que ahora decide no puede quedarse sin señal.
+    #
+    # La pista, y no hace falta telemetría nueva: si el dueño de un claim PUBLICÓ
+    # después de abrirlo y aun así se lo segamos, ese claim no estaba muerto.
+    #
+    # ⚠️ El cruce va por ROL: `claims.agent` guarda el rol (`be`) y `entries.actor`
+    # la firma (`backend`). Comparado en crudo daría CERO SIEMPRE — un cero
+    # tranquilizador sobre una guarda que ya está actuando en producción, que es la
+    # peor forma de fallar que tiene un instrumento.
+    calientes: dict[str, int] = {}
+    for r in con.execute("SELECT agent, abierto, cerrado FROM claims "
+                         "WHERE motivo='ttl_expirado' AND cerrado IS NOT NULL"):
+        # LA VENTANA SON LAS `TTL` HORAS ANTERIORES A LA SIEGA, no [abierto, cerrado].
+        # Primera versión usaba el intervalo completo y dio 69 de 69 en rojo: para un
+        # claim abierto el día 8 y segado el 13, preguntar «¿publicó su dueño en esos
+        # cinco días?» tiene UNA sola respuesta y no informa de nada. La pregunta útil
+        # es si seguía activo JUSTO ANTES de que le quitáramos el tema.
+        try:
+            fin = datetime.fromisoformat(r["cerrado"])
+            ini = (fin - timedelta(hours=CLAIM_TTL_H)).isoformat(timespec="seconds")
+        except ValueError:
+            continue
+        # `substr(...,1,19)` en AMBOS lados: `claims.*` se guarda con offset
+        # (`...T22:50:00+00:00`) y `entries.ts` sin él. Comparadas en crudo, el `+`
+        # decide el orden y la ventana no casa nunca — el mismo fallo de dos formatos
+        # que ya me costó una definición doble de «vencido» esta misma noche.
+        suyas = con.execute(
+            "SELECT DISTINCT actor FROM entries WHERE actor IS NOT NULL AND ts IS NOT NULL "
+            "AND substr(ts,1,19) > substr(?,1,19) AND substr(ts,1,19) <= substr(?,1,19)",
+            (ini, r["cerrado"])).fetchall()
+        if any(lp.rol_de(a["actor"]) == r["agent"] for a in suyas):
+            calientes[r["agent"]] = calientes.get(r["agent"], 0) + 1
+    out.append("")
+    if not calientes:
+        out.append("── SIEGA: ningún claim segado tenía a su dueño publicando ──")
+        out.append(f"   (TTL {CLAIM_TTL_H} h) Lo segado estaba muerto. Es la guarda")
+        out.append("   funcionando, no su ausencia: esta línea sale de mirar, no de suponer.")
+    else:
+        out.append(f"── ⚠️ SEGADO EN CALIENTE: {sum(calientes.values())} claim(s) cerrados por "
+                   f"TTL cuyo dueño seguía ACTIVO en las {CLAIM_TTL_H} h previas ──")
+        out.append(f"   Señal de que el TTL de {CLAIM_TTL_H} h puede estar corto.")
+        out.append("   ⚠️ ES UN PROXY, NO UN VEREDICTO, y el límite es duro: mide que el rol")
+        out.append("   PUBLICÓ ALGO, no que estuviera trabajando en ESE tema — `entries` no")
+        out.append("   guarda a qué tema pertenece una entrada. Un rol ocupado en otra cosa")
+        out.append("   cuenta igual. Sirve para SOSPECHAR del TTL, nunca para afirmar que se")
+        out.append("   mató un trabajo concreto: eso hay que ir a mirarlo tema a tema.")
+        for rol, n in sorted(calientes.items(), key=lambda x: -x[1]):
+            out.append(f"   {n:>4}  {rol}")
     con.close()
     return "\n".join(out) + "\n"
 
