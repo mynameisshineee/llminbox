@@ -166,6 +166,9 @@ llmi — consulta la red de ledgers de la flota sin quemarte la ventana
   llmi lint  [ledger]       deuda de tipado (qué entradas no declaran nada)
   llmi verify               integridad del canon (¿ha desaparecido alguna entrada?)
   llmi canon [n]            cola de destilación: lo dirigido que aún no es página
+  llmi doctor [días]        los fallos de USO que el servicio ve y nadie mira:
+                            quién no drena · quién publica sin dirigir · claims
+                            sin cerrar · censo firmado vs censo del servicio
   llmi adopcion [--json]    quién LEE su bandeja y quién la consume (no es lo mismo)
   llmi wiki [q]             las páginas de tu wiki, con sus citas al ledger
   llmi wiki citas           ¿cada cita apunta a una entrada que existe? (el gate)
@@ -813,6 +816,13 @@ except Exception: print(open(sys.argv[1]).read(), file=sys.stderr)' "$cuerpo_pos
           curl -sf -m 20 "${H[@]}" --get --data-urlencode "q=$1" "$API/entries?limit=${2:-20}" | python3 -m json.tool ;;
   lint)   vivo || { sin_servicio; exit 3; }
           curl -sf -m 20 "${H[@]}" "$API/lint${1:+?ledger=$1}" ;;
+  doctor) vivo || { sin_servicio; exit 3; }
+          # `/doctor` existía en el servicio desde el 11-08 y el CLI no lo exponía:
+          # un endpoint que sólo se alcanza con curl y token no lo mira nadie. Lo
+          # descubrí al verificar la tarjeta de uso que iba a repartir — que lo
+          # anunciaba. Documentar un comando que no existe es la misma clase de
+          # fallo que documentar `llmi` cuando no estaba en el PATH.
+          curl -sf -m 20 "${H[@]}" "$API/doctor${1:+?dias=$1}" ;;
   adopcion|adopción)
           vivo || { sin_servicio; exit 3; }
           # `--json` para quien PARSEA esto. La tabla de texto tiene columnas de ancho
