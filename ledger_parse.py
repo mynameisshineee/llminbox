@@ -346,18 +346,36 @@ def canonico(nombre):
 
 
 def escuchados(agent: str) -> list[str]:
-    """Los nombres cuyo correo cae en la bandeja de `agent`: el suyo y los que escuche.
+    """Los nombres cuyo correo cae en la bandeja de `agent`: el suyo, los que
+    escuche, y TODAS las firmas censadas de sus roles (2026-08-16).
 
     Canónicos y sin repetir, con el propio SIEMPRE primero. Un nombre que el censo no
     conoce se devuelve tal cual: alguien puede tener bandeja antes de estar dado de
     alta, y negársela por eso sería esconder correo que existe.
+
+    La expansión por rol cierra la asimetría que midió infra (MARK:infra-el-
+    cursor-va-por-rol-y-el-emparejado-por-alias…): el CURSOR ya colapsa por rol
+    (`migrar_alias_a_rol`), pero este match iba por literal — así que drenar por
+    un alias adelantaba el cursor del ROL por encima de entradas que sólo se
+    veían desde el alias hermano, sin error visible. Daño medido en vivo: a cto
+    su alias estrecho le enseñaba 3 de 6 pendientes, y @backend le había
+    contestado a una pregunta que nunca vio. Es el mismo arreglo que
+    `escuchados_autor()` lleva desde el 08-13 vía `firmas_del_rol()`, y en la
+    MISMA capa (una, no cada emisor — la condición de infra). Dirección de
+    fallo: un rol ve MÁS de su propio correo, jamás menos, y `firmas_del_rol`
+    filtra por rol exacto, así que jamás el de otro rol.
     """
     fuera, vistos = [], set()
+
+    def mete(nombre: str) -> None:
+        if nombre.lower() not in vistos:
+            vistos.add(nombre.lower())
+            fuera.append(nombre)
+
     for n in [agent] + list(ESCUCHA.get(agent.lower(), [])):
-        c = canonico(n)
-        if c.lower() not in vistos:
-            vistos.add(c.lower())
-            fuera.append(c)
+        mete(canonico(n))                      # el propio literal, SIEMPRE antes
+        for firma in firmas_del_rol(rol_de(n)):  # …y sus hermanos de rol
+            mete(firma)
     return fuera
 
 

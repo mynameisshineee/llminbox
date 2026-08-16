@@ -161,6 +161,21 @@ def _cargar_carriles() -> dict[str, str]:
 
 CARRIL_LEDGER = _cargar_carriles()
 
+# ⑱ CARRIL OBLIGATORIO PARA CONSUMIR — APAGADO POR DEFECTO, y el defecto es el
+# hallazgo, no una precaución genérica. Medido antes de encenderlo (2026-08-16):
+# de las ~20 herramientas de la flota que hacen `POST /leido`, **sólo 2 mandan la
+# cabecera** (las de infra). El resto —el vigía compartido `ledger-vigia.sh`, los
+# monitores de cfo/cto/cpo/qa/security, el drenador de vision-canon— no la manda,
+# y casi todas usan `curl -sf`, que se TRAGA el 422 sin cuerpo: encenderlo de golpe
+# las dejaría sin consumir **en silencio**, que es justo la clase de fallo que este
+# carril lleva la semana cerrando. Un cambio de contrato con 18 consumidores no se
+# activa, se MIGRA.
+#
+# Se enciende con `LLMINBOX_CARRIL_OBLIGATORIO=1` cuando la migración esté hecha —
+# y la señal para encenderlo la da `/doctor` ⑤, que cuenta cuántos consumos llegan
+# ya con carril. Mientras tanto el aviso sigue saliendo en el JSON, como hasta hoy.
+CARRIL_OBLIGATORIO = os.environ.get("LLMINBOX_CARRIL_OBLIGATORIO", "") == "1"
+
 # El inverso, para la vista `actor@carril` (⑫, idea de Albert vía el hub
 # 2026-08-10T18:08Z). El carril de una entrada NO se teclea ni se censa: se
 # DERIVA de su fichero, porque con una-ledger-por-proyecto el carril de una
@@ -2611,6 +2626,27 @@ def marcar_leido(agent: str, l: Leido,
     # valor equivocado es fácil de teclear: el rótulo de sección de la bandeja
     # (`── bik-marketing-web ──`) es el nombre del LEDGER, no del carril. Quien
     # declara ámbito y se equivoca recibe un 422 que nombra el fix, no un drenaje.
+    # ⑱ EL CARRIL ES OBLIGATORIO PARA CONSUMIR. Antes, sin cabecera se drenaban los
+    # 12 cursores con un `aviso` en el JSON — y un aviso que hay que parsear después
+    # de leer `ok:true` no protege a nadie: es la misma clase de fallo silencioso que
+    # el carril inválido, que ya se cerró con 422. Decisión de Albert 2026-08-16
+    # («no paso un error más sobre esto») tras descartar separar el servicio por
+    # flota: de los 7 fallos reales de la semana la separación sólo cerraba éste, y
+    # cuesta 6 índices, 6 tokens y perder las vistas que cazaron lo demás. Esto lo
+    # cierra donde ocurre —el consumo— y por diez líneas.
+    #
+    # ⚠️ SÓLO afecta a CONSUMIR. `/inbox` sigue MOSTRANDO todas las secciones (esa
+    # decisión es del handoff original y no se toca): se puede leer la red entera;
+    # lo que no se puede es vaciarle la bandeja a otra flota sin decir de cuál eres.
+    # `LLMINBOX_CARRIL_OPCIONAL=1` devuelve la conducta vieja para un despliegue sin
+    # mapa de carriles, que si no quedaría sin poder marcar leído nada.
+    if not x_llminbox_carril and CARRIL_LEDGER and CARRIL_OBLIGATORIO:
+        raise HTTPException(
+            422,
+            "sin carril declarado no se consume: di de qué carril eres y sólo se "
+            f"moverá TU cursor (válidos: {sorted(CARRIL_LEDGER)}). Con `llmi` sale "
+            "solo de tu sesión; a mano, cabecera X-Llminbox-Carril. Leer NO exige "
+            "carril: `llmi peek` te enseña la red entera sin tocar cursores.")
     carril_ledger = None
     if x_llminbox_carril:
         carril_ledger = CARRIL_LEDGER.get(x_llminbox_carril)
@@ -2670,6 +2706,7 @@ def marcar_leido(agent: str, l: Leido,
     # (fail-closed de ③ — antes degradaba a drenar todo con un aviso que nadie lee).
     aviso = None
     if not x_llminbox_carril:
+        # Sólo se llega aquí con el escape puesto o sin mapa montado (ver ⑱).
         aviso = "sin carril: consumes TODOS los cursores"
     return {"ok": bool(aplicados), "agent": canon, "pediste": agent,
             "aplicados": aplicados,

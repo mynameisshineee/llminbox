@@ -139,3 +139,72 @@ def test_carril_con_nombre_de_ledger_ensena_el_carril(cliente):
     assert r.status_code == 422
     assert "es un nombre de LEDGER" in r.json()["detail"]
     assert "'demo'" in r.json()["detail"]
+
+
+def test_sin_carril_no_se_consume(tmp_path, monkeypatch):
+    """⑱ El carril es OBLIGATORIO para consumir (decisión de Albert 2026-08-16,
+    tras descartar separar el servicio por flota).
+
+    Antes, sin cabecera se drenaban TODOS los cursores con un `aviso` en el JSON
+    — y un aviso que hay que parsear después de leer `ok:true` no protege a
+    nadie. Ahora es 422 y no se mueve un cursor.
+
+    FALSADOR: sin el gate, esto devuelve 200 y `cursors` acaba con filas.
+    """
+    from fastapi.testclient import TestClient
+    s = construir(tmp_path, monkeypatch,
+                  extra_env={"LLMINBOX_CARRIL_OBLIGATORIO": "1"})
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        r = c.post("/inbox/backend/leido",
+                   json={"hasta": {"demo-ledger": 1, "otro-ledger": 0}})
+    servicio = s
+    assert r.status_code == 422
+    d = r.json()["detail"]
+    assert "sin carril declarado" in d
+    assert "demo" in d, "el error enumera los carriles válidos"
+    assert "peek" in d, "y recuerda que LEER no exige carril"
+    con = db_directa(servicio)
+    n = con.execute("SELECT COUNT(*) c FROM cursors WHERE agent='be'").fetchone()["c"]
+    con.close()
+    assert n == 0, "no puede haber movido cursores"
+
+
+def test_leer_sigue_sin_exigir_carril(cliente):
+    """La otra mitad, y es la que evita que ⑱ sea un muro: `/inbox` MUESTRA la red
+    entera sin carril. Se puede leer todo; lo que no se puede es vaciarle la
+    bandeja a otra flota sin decir de cuál eres."""
+    r = cliente.get("/inbox/backend")
+    assert r.status_code == 200
+    assert "── demo-ledger" in r.text
+
+
+def test_apagado_por_defecto_la_conducta_no_cambia(cliente):
+    """EL DEFECTO ES EL HALLAZGO: sólo 2 de ~20 herramientas de la flota mandan la
+    cabecera hoy, y casi todas usan `curl -sf`, que se traga el 422 sin cuerpo.
+    Encenderlo de golpe las dejaría sin consumir EN SILENCIO. Así que apagado por
+    defecto: mismo `ok:true` y mismo aviso que hasta hoy.
+
+    FALSADOR: invertir el default deja este test en 422 — y con él, 18 vigías."""
+    r = cliente.post("/inbox/backend/leido", json={"hasta": {"demo-ledger": 1}})
+    assert r.status_code == 200
+    assert r.json()["aviso"] == "sin carril: consumes TODOS los cursores"
+
+
+def test_sin_mapa_de_carriles_se_puede_consumir(tmp_path, monkeypatch):
+    """Un despliegue SIN `carriles.tsv` no tiene carril que declarar: si el gate
+    aplicara ahí, se quedaría sin poder marcar leído nada. El default del compose
+    es exactamente ése, así que este camino es el de cualquiera que clone esto.
+
+    FALSADOR: quitar `and CARRIL_LEDGER` de la condición deja este caso en 422 y
+    rompe el despliegue limpio."""
+    from fastapi.testclient import TestClient
+    s = construir(tmp_path, monkeypatch,
+                  extra_env={"LLMINBOX_CARRILES": "", "LLMINBOX_MOUNTS_JSON": ""})
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        r = c.post("/inbox/backend/leido", json={"hasta": {"demo-ledger": 1}})
+        assert r.status_code == 200
+        assert r.json()["aviso"] == "sin carril: consumes TODOS los cursores"
