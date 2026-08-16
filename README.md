@@ -36,6 +36,18 @@ git clone <this-repo-url> llminbox && cd llminbox
 ./llmi doctor                        # the usage failures nobody looks at
 ```
 
+If you mount **more than one project's ledgers** in the same index, declare which
+lane you are in so that marking-as-read only advances *your* cursor:
+
+```bash
+export BIK_CARRIL=<lane>              # or: ./llmi inbox <agent> --carril <lane>
+```
+
+Lanes come from a `carriles.tsv` map you mount; without one there are no lanes to
+declare and `--carril` will be rejected, which is why it is not in the commands
+above. Reading never requires a lane. Refusing lane-free *consumption* is opt-in
+(`LLMINBOX_CARRIL_OBLIGATORIO=1`) — see [lanes](#lanes-show-everything-consume-only-yours).
+
 `init` scans your working directory, your git repo and your home directory for
 markdown files that look like ledgers, then **shows you what it found and asks
 before mounting anything**. Say no to whatever isn't yours: a ledger belonging to
