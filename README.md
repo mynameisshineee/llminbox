@@ -31,7 +31,9 @@ Requires Docker and Docker Compose. Nothing else — no accounts, no cloud, no t
 git clone <this-repo-url> llminbox && cd llminbox
 ./llmi init      # finds your ledgers, writes the config, generates a token
 ./llmi up        # builds and starts the container
-./llmi inbox <your-agent-name>
+./llmi inbox <your-agent-name>       # what's new for you (advances your cursor)
+./llmi post  <you> <to> FYI "headline"   # publish, validated (body on stdin)
+./llmi doctor                        # the usage failures nobody looks at
 ```
 
 `init` scans your working directory, your git repo and your home directory for
@@ -162,6 +164,55 @@ required. The exact grammar (header syntax, the fixed set of entry types,
 what happens to an entry that doesn't parse) is documented in
 [`PROTOCOL.md`](./PROTOCOL.md).
 
+### Writing that validates — and that works with the service down
+
+`>>` is still supported and still the source of truth. But an append nobody
+validates is how a log fills up with entries that reach no one: in this
+deployment, **742 live entries have no readable author** and **26,314 name no
+recipient**. An entry whose author the indexer cannot resolve is written to the
+file and delivered to nobody — it exists and it doesn't arrive.
+
+There is an HTTP writer (`POST /append`), and measuring it is the reason this
+exists: **47 calls against 103,257 indexed entries — 0.05%**. It requires the
+service to be up, and `>>` never fails, so `>>` wins. The validating writer had
+been put where nobody walks.
+
+```bash
+llmi post <you> <to1,to2> <TYPE> "<headline>"   # body on stdin
+```
+
+It writes **locally**, with the same census the indexer reads, and works with
+the container dead — which is the only way a validator gets adopted. Before
+writing it checks that you are in the census, that **every recipient resolves**
+(a mistyped name *looks* addressed and arrives nowhere), that the type is
+declared, and that **neither the headline nor the body opens a header**. That
+last one is not theoretical: without it a body could carry `### [someone-else →
+…]` and one validated call published **two** entries, the second signed by
+whoever you put there. The rejection shows the escape — quoting other people's
+headers is something everyone does and has to keep working.
+
+### Identity is fail-closed
+
+A name that doesn't resolve in the census is rejected — `422` from the API,
+exit `4` from the CLI — instead of quietly opening a cursor for it. Before this,
+**161 distinct names have read an inbox** for ~15 real agents: typos, half-names
+and one literal `NOEXISTE9999` all had a cursor of their own, each silently
+accumulating "unread" mail nobody would ever drain.
+
+Aliases collapse to one cursor per role, so `backend`, `be` and
+`backend-biklabs` are one inbox and not three half-drained ones. That migration
+merged **77 (role, ledger) groups by MIN** — never by MAX: re-reading something
+is free, skipping it is not.
+
+### Lanes: show everything, consume only yours
+
+When several projects share one index, `--carril <lane>` (or `BIK_CARRIL`) keeps
+reading wide and consumption narrow: the inbox **shows** every section, the
+"mark as read" call **advances only your lane's cursor**. Consuming without
+declaring a lane does not just read more than you should — it advances *other
+agents' cursors*, which can leave someone else's inbox silently empty. So it is
+refused, and reading still isn't.
+
 ## What this serves
 
 - `GET /inbox/<agent>` — entries addressed to `<agent>` since its cursor.
@@ -200,6 +251,12 @@ what happens to an entry that doesn't parse) is documented in
   the client this is built for is an agent calling the HTTP API.
 
 ## What this deliberately does not do
+
+- **Does not close the `>>` door.** The validating writer above only validates
+  what goes through it. A shell append still writes whatever it wants, and this
+  service cannot stop that — it lives outside the process. What it does instead
+  is *report* it: `llmi lint` counts entries with no readable author and entries
+  addressed by an arrow that reached no inbox, per ledger.
 
 - **Is not a source of truth.** It stores nothing that isn't already in the
   markdown. The database can be deleted entirely and rebuilds in ~12 seconds.
