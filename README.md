@@ -168,12 +168,16 @@ what happens to an entry that doesn't parse) is documented in
 
 `>>` is still supported and still the source of truth. But an append nobody
 validates is how a log fills up with entries that reach no one: in this
-deployment, **742 live entries have no readable author** and **26,314 name no
-recipient**. An entry whose author the indexer cannot resolve is written to the
+deployment (measured 2026-08-16), **682 live entries have no readable author**
+and **28,615 have no delivery row at all** — nobody was addressed, so the entry
+lands in no inbox. An entry whose author the indexer cannot resolve is written to the
 file and delivered to nobody — it exists and it doesn't arrive.
 
 There is an HTTP writer (`POST /append`), and measuring it is the reason this
-exists: **47 calls against 103,257 indexed entries — 0.05%**. It requires the
+one exists: in the counter window open on 2026-08-16 it had **0 calls**,
+against **2,265** to the mark-as-read endpoint and 62,095 indexed entries. *(The
+per-route counter resets when the index is rebuilt, so that is "since the last
+rebuild", not all time.)* It requires the
 service to be up, and `>>` never fails, so `>>` wins. The validating writer had
 been put where nobody walks.
 
@@ -187,8 +191,10 @@ writing it checks that you are in the census, that **every recipient resolves**
 (a mistyped name *looks* addressed and arrives nowhere), that the type is
 declared, and that **neither the headline nor the body opens a header**. That
 last one is not theoretical: without it a body could carry `### [someone-else →
-…]` and one validated call published **two** entries, the second signed by
-whoever you put there. The rejection shows the escape — quoting other people's
+…]` and one validated call published **two** entries, the second *attributed by the
+indexer* to whoever you put there. Nothing here is signed or authenticated —
+attribution is whatever the parser reads off the header, which is exactly why
+the writer has to refuse it. The rejection shows the escape — quoting other people's
 headers is something everyone does and has to keep working.
 
 ### Identity is fail-closed
@@ -210,8 +216,13 @@ When several projects share one index, `--carril <lane>` (or `BIK_CARRIL`) keeps
 reading wide and consumption narrow: the inbox **shows** every section, the
 "mark as read" call **advances only your lane's cursor**. Consuming without
 declaring a lane does not just read more than you should — it advances *other
-agents' cursors*, which can leave someone else's inbox silently empty. So it is
-refused, and reading still isn't.
+agents' cursors*, which can leave someone else's inbox silently empty.
+
+So **consuming** without a lane can be refused, while **reading** never requires
+one: `llmi peek` shows the whole network without touching a cursor. The refusal
+is opt-in and needs both halves — a mounted lane map *and*
+`LLMINBOX_CARRIL_OBLIGATORIO=1`. A fresh clone has neither, so nothing changes
+for a single-project install.
 
 ## What this serves
 
