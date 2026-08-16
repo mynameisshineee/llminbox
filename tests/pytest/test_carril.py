@@ -208,3 +208,35 @@ def test_sin_mapa_de_carriles_se_puede_consumir(tmp_path, monkeypatch):
         r = c.post("/inbox/backend/leido", json={"hasta": {"demo-ledger": 1}})
         assert r.status_code == 200
         assert r.json()["aviso"] == "sin carril: consumes TODOS los cursores"
+
+
+def test_doctor_dice_si_se_puede_exigir_carril(tmp_path, monkeypatch):
+    """⑱-b El número que decide CUÁNDO encender el gate, contando POST reales.
+
+    Existe porque al ir a activarlo estimé la migración grepeando los scripts de
+    la flota y el grep contó MENCIONES, no consumos: dio 18 donde había ~10 (la
+    misma clase de error que el `LIKE '%contratos%'` que infló un recuento a 69
+    cuando eran 0). Encender un gate con una estimación deja vigías mudos.
+
+    FALSADOR: si `anota_consumo` no distinguiera con/sin carril, un rol que sólo
+    consume sin cabecera no aparecería en la lista de mudos y el doctor diría que
+    se puede encender.
+    """
+    from fastapi.testclient import TestClient
+    s = construir(tmp_path, monkeypatch)
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        # 'backend' consume SIN carril; nadie más consume
+        c.post("/inbox/backend/leido", json={"hasta": {"demo-ledger": 1}})
+        d = c.get("/doctor").text
+        assert "⑤" in d
+        assert "1 consumo(s) CON carril" not in d
+        assert "consumen SIEMPRE sin carril" in d
+        assert "be" in d.split("⑤")[1], "debe nombrar al rol que consume sin carril"
+        # y ahora el mismo rol CON carril: deja de estar mudo
+        c.post("/inbox/backend/leido", json={"hasta": {"demo-ledger": 2}},
+               headers={"X-Llminbox-Carril": "demo"})
+        d2 = c.get("/doctor").text.split("⑤")[1]
+        assert "consumen SIEMPRE sin carril" not in d2
+        assert "se puede plantear" in d2

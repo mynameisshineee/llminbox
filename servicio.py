@@ -1331,6 +1331,24 @@ async def vigilante():
 LECTURAS: dict[str, list] = {}          # agent -> [primera_iso, ultima_iso, veces]
 LECTURAS_LOCK = threading.Lock()
 
+# ⑱-b ¿CUÁNTOS CONSUMOS LLEGAN YA CON CARRIL? Es el número que decide CUÁNDO se
+# puede encender `LLMINBOX_CARRIL_OBLIGATORIO`, y no lo teníamos: al ir a activarlo
+# el 2026-08-16 tuve que estimarlo grepeando los scripts de la flota — y el grep
+# contó MENCIONES, no consumos (dio 18 donde había ~10, la misma clase de error que
+# el `LIKE '%contratos%'` que infló un recuento de huérfanas a 69 cuando eran 0).
+# Encender un gate con una estimación es lo que deja a 10 vigías mudos en silencio.
+# Esto cuenta los POST de verdad, en memoria como `LECTURAS` —el camino de consumo
+# no puede pagar una escritura más— y lo publica `/doctor`.
+CONSUMOS: dict[str, list] = {}          # rol -> [con_carril, sin_carril, ultimo_iso]
+CONSUMOS_LOCK = threading.Lock()
+
+
+def anota_consumo(rol: str, con_carril: bool, ahora_iso: str) -> None:
+    with CONSUMOS_LOCK:
+        v = CONSUMOS.setdefault(rol, [0, 0, ahora_iso])
+        v[0 if con_carril else 1] += 1
+        v[2] = ahora_iso
+
 
 def anota_lectura(agent: str, ahora_iso: str) -> None:
     with LECTURAS_LOCK:
@@ -2619,6 +2637,8 @@ def marcar_leido(agent: str, l: Leido,
     # falta que la respuesta traiga el ANTES y el DESPUÉS, y que nombre lo ignorado.
     agent = resolver_o_422(agent)                  # ① — antes de tocar nada más
     canon = clave_cursor(agent)                     # ② — la clave es el ROL, no el nombre
+    anota_consumo(canon, bool(x_llminbox_carril),
+                  datetime.now(timezone.utc).isoformat(timespec="seconds"))
     # ③ fail-closed TAMBIÉN para el carril (hallazgo de fe·bikeus 2026-08-10T17:17Z):
     # una cabecera que no resuelve devolvía `ok:true` y DEGRADABA a consumir TODOS
     # los cursores — justo lo que la cabecera existe para evitar — con la única seña
@@ -3411,6 +3431,30 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
                 out.append(f"      {m}{aviso}")
             out.append("   ⇒ alta en `roster.json` (censo del servicio) y reinicio: el arranque")
             out.append("      re-deriva y sus entradas recuperan actor y destinatarios.")
+
+    # ── ⑤ ¿SE PUEDE YA EXIGIR CARRIL PARA CONSUMIR? ──────────────────────────
+    # El gate ⑱ está APAGADO esperando a que los consumidores manden la cabecera.
+    # Esto dice cuántos la mandan DE VERDAD —contando POST, no grepeando scripts—
+    # porque el grep con el que lo estimé contó menciones y dio 18 donde había ~10.
+    out.append("")
+    out.append("── ⑤ ¿listo para exigir carril al consumir? ──")
+    with CONSUMOS_LOCK:
+        foto = {k: list(v) for k, v in CONSUMOS.items()}
+    if not foto:
+        out.append("   (sin consumos desde el último arranque: nada que medir todavía)")
+    else:
+        con_c = sum(v[0] for v in foto.values())
+        sin_c = sum(v[1] for v in foto.values())
+        mudos = sorted(k for k, v in foto.items() if v[1] and not v[0])
+        out.append(f"   {con_c} consumo(s) CON carril · {sin_c} SIN · "
+                   f"{len(foto)} rol(es) activos desde el arranque")
+        if mudos:
+            out.append(f"   🔴 consumen SIEMPRE sin carril: {', '.join(mudos)}")
+            out.append("      encender el gate hoy los dejaría mudos EN SILENCIO "
+                       "(curl -sf se traga el 422)")
+        else:
+            out.append("   ✓ ningún rol consume sólo sin carril — se puede plantear "
+                       "encender LLMINBOX_CARRIL_OBLIGATORIO=1")
     con.close()
     return "\n".join(out) + "\n"
 
