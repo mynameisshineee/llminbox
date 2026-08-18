@@ -10,8 +10,10 @@ Eso rompe dos cosas a la vez: `lint` los cuenta como «no declaran nada» cuando
 declaran de sobra, y cualquier instrumento que clasifique tráfico por tipo mide
 sobre un corpus mutilado.
 
-**Sólo preservación, no interpretación** (ruling del operador): se guarda el texto
-literal. `canonical_kind` y `kind_registry_rev` se crean YA pero quedan NULL —
+**Sólo preservación, no interpretación** (ruling del operador): se guarda el
+lexema escrito en una posición COMPATIBLE CON LA GRAMÁTICA DE TIPO — que no es
+«todo lo escrito», y el nombre lo dice: `bikeus→security ∧ Albert` también estaba
+ahí y no es un tipo. El literal íntegro no se pierde: vive en `head`. `canonical_kind` y `kind_registry_rev` se crean YA pero quedan NULL —
 existen para que el día que se interprete quede registrado CON QUÉ revisión del
 registro se hizo. Sin ese campo, cambiar la taxonomía cambiaría en silencio las
 métricas históricas.

@@ -525,12 +525,13 @@ class Entrada:
     # rompe a quien solo mire `.to`.
     difusion: list[str] = field(default_factory=list)
     tipo: str | None = None
-    # El texto que estaba ESCRITO en la posición del tipo, entienda el sistema esa
-    # palabra o no. `tipo` es lo que el sistema INTERPRETA; `raw_tipo` es lo que la
-    # flota ESCRIBIÓ. Existen los dos porque medí que no coinciden: 641 entradas del
-    # ledger piloto (8,2 %) declaran un tipo en posición canónica que este parser
-    # tiraba —MEDIDO, MEASURED, ADJUDICADO, VEREDICTO…—, y `lint` las contaba como
-    # «no declaran nada» cuando declaran de sobra. Nada de lo escrito se descarta.
+    # El lexema escrito en una posición COMPATIBLE CON LA GRAMÁTICA DE TIPO — no
+    # «todo lo escrito», que es distinto y se documenta en `raw_tipo_de`. `tipo` es
+    # lo que el sistema INTERPRETA de él. Existen los dos porque medí que no
+    # coinciden: 641 entradas del ledger piloto (8,2 %) declaran un tipo en posición
+    # canónica que este parser tiraba —MEDIDO, MEASURED, ADJUDICADO, VEREDICTO…—, y
+    # `lint` las contaba como «no declaran nada» cuando declaran de sobra.
+    # El literal íntegro no se pierde: `head` se guarda entero.
     raw_tipo: str | None = None
 
     @property
@@ -539,7 +540,31 @@ class Entrada:
 
 
 def raw_tipo_de(head: str) -> str | None:
-    """El lexema escrito en la posición del tipo, o None. UNA sola fuente.
+    """El lexema escrito en una posición COMPATIBLE CON LA GRAMÁTICA DE TIPO.
+
+    El nombre importa: esto no es «todo lo que había escrito». Es el último campo
+    de la cabecera **si además tiene forma de token de tipo** (ver
+    `_es_token_de_tipo`), que ya es una clasificación SINTÁCTICA — no semántica,
+    pero clasificación. Llamarlo «el literal, sin más» sería afirmar de más:
+    `bikeus→security ∧ Albert` también estaba escrito ahí y aquí devuelve None.
+
+    El literal COMPLETO no se pierde: vive en `head`, que se guarda entero y
+    permite reproducir esta clasificación en cualquier momento. Por eso no hace
+    falta una columna más para conservarlo.
+
+    Las capas, para que nadie las mezcle:
+
+        head            lo escrito, íntegro
+          ↓
+        último campo    candidato tras el `·`
+          ↓ forma
+        raw_tipo        el candidato SI tiene forma de tipo (esto)
+          ↓ registro versionado
+        canonical_kind  semántica del Agent OS   (+ kind_registry_rev)
+
+        tipo            aparte: el vocabulario legacy que este servicio reconoce
+
+    UNA sola fuente para la primera flecha.
 
     Se expone aparte de `_campos` porque el backfill del corpus ya indexado lo
     necesita **sin volver a leer el fichero**: `head` está guardado en la base, y

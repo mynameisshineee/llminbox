@@ -465,8 +465,17 @@ def huella_censo() -> str:
     return hashlib.sha256(",".join(sorted(lp.AGENTES)).encode()).hexdigest()[:16]
 
 
-RAW_TIPO_V = "1"          # súbela si cambia CÓMO se deriva `raw_tipo` del head;
-                          # subirla RECALCULA el corpus entero (ver la función)
+# Versión del DERIVADOR de `raw_tipo`. Súbela si cambia CÓMO se deriva del head —
+# incluida la guarda de forma (`_es_token_de_tipo`), que es parte de la derivación:
+# una regla nueva puede convertir en NULL lo que antes fue un falso positivo, y una
+# migración que sólo rellene huecos no lo arreglaría. Subirla RECALCULA el corpus
+# entero en las dos direcciones (ver la función).
+#
+# Se queda en "1" a propósito: verificado contra la base viva el 2026-08-19, la
+# columna `raw_tipo` NO EXISTE y no hay sello — ninguna versión del derivador ha
+# llegado nunca a producción, así que "1" puede representar la implementación final
+# de esta rama. Si alguna hubiera corrido, esto tendría que ser "2".
+RAW_TIPO_V = "1"
 
 
 def migrar_raw_tipo(con) -> None:
