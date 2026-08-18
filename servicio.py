@@ -711,8 +711,7 @@ def _rescatar(ruta: str) -> dict:
     RELEE, y en la otra SE SALTA correo dirigido a él sin que nada lo diga. El
     `eid` es identidad por contenido y sobrevive a la renumeración.
     """
-    out: dict = {"cursors": [], "lecturas": [], "claims": [], "coste": [],
-                 "incidencias": [], "meta": [], "anclas": {},
+    out: dict = {"cursors": [], "lecturas": [], "meta": [], "anclas": {},
                  "entradas": {}, "leido": []}
     try:
         con = sqlite3.connect(f"file:{ruta}?mode=ro", uri=True, timeout=15)
@@ -3615,21 +3614,35 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
         # cursor y no contra el contador. Sin esto la alarma acusaba a quien había
         # consumido hace un rato por otra vía (su cursor se movió DESPUÉS del arranque):
         # rebotar y estar parado no son lo mismo, y mezclarlos quema la alarma.
-        parados, rebotando = [], []
+        # Tres estados, no dos. «Lleva parado >N h» es una afirmación FECHADA, y sólo
+        # se puede hacer sobre quien tiene un sello que fecharla: sin fila en `cursors`
+        # —o con `updated` NULL— no hay antigüedad que atribuir, hay ausencia. Meterlos
+        # en el mismo saco era la tercera vez que esta alarma afirmaba más de lo que el
+        # dato sostiene (las dos primeras, `infra` y `cpo`, en producción).
+        parados, rebotando, nunca = [], [], []
         if mudos:
             fresco = (datetime.now(timezone.utc)
                       - timedelta(hours=MUDO_H)).isoformat(timespec="seconds")
-            movidos = {r for (r,) in con.execute(
-                "SELECT agent FROM cursors WHERE agent IN (%s) GROUP BY agent "
-                "HAVING MAX(updated) > ?" % ",".join("?" * len(mudos)),
-                (*mudos, fresco))}
-            parados = [r for r in mudos if r not in movidos]
-            rebotando = [r for r in mudos if r in movidos]
+            sello = {r: u for r, u in con.execute(
+                "SELECT agent, MAX(updated) FROM cursors WHERE agent IN (%s) "
+                "GROUP BY agent" % ",".join("?" * len(mudos)), tuple(mudos))}
+            for r in mudos:
+                u = sello.get(r)
+                if not u:
+                    nunca.append(r)
+                elif u > fresco:
+                    rebotando.append(r)
+                else:
+                    parados.append(r)
         if parados:
             out.append(f"   🔴 RECHAZADO SIEMPRE y sin drenar desde hace >{MUDO_H:g} h: "
                        f"{', '.join(parados)}")
             out.append("      su cursor lleva parado ese tiempo mientras rebota. Si llama "
                        "con `curl -sf` no ve el 422 y se cree al día.")
+        if nunca:
+            out.append(f"   🔴 RECHAZADO SIEMPRE y nunca ha drenado: {', '.join(nunca)}")
+            out.append("      no tiene ni fila de cursor: no es que se haya parado, es que "
+                       "no ha llegado a empezar.")
         if rebotando:
             out.append(f"   ⚠️ rebota sin carril pero SÍ drena por otra vía: "
                        f"{', '.join(rebotando)} — tiene una herramienta sin migrar")

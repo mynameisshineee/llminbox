@@ -45,12 +45,12 @@ def test_la_puerta_puesta_se_nombra_en_el_informe(tmp_path, monkeypatch):
     No basta con que el texto sea distinto: con la puerta puesta NO puede seguir
     apareciendo el consejo de encenderla.
     """
-    s, c = _cliente(tmp_path, monkeypatch, PUERTA)
+    _, c = _cliente(tmp_path, monkeypatch, PUERTA)
     puesta = c.get("/doctor").text
     assert "PUERTA PUESTA" in puesta
     assert "se puede plantear encender" not in puesta
 
-    s2, c2 = _cliente(tmp_path / "b", monkeypatch)      # misma construcción, sin la puerta
+    _, c2 = _cliente(tmp_path / "b", monkeypatch)      # misma construcción, sin la puerta
     abierta = c2.get("/doctor").text
     assert "PUERTA ABIERTA" in abierta
 
@@ -61,7 +61,7 @@ def test_con_la_puerta_puesta_un_sin_carril_es_rechazo_y_no_consumo(tmp_path, mo
     Control positivo incluido: el consumo CON carril sí es un consumo, y se cuenta
     aparte — si el arreglo se pasara de listo y dejara de contar nada, esto lo caza.
     """
-    s, c = _cliente(tmp_path, monkeypatch, PUERTA)
+    _, c = _cliente(tmp_path, monkeypatch, PUERTA)
     assert _consumir(c, "backend").status_code == 422           # rebota en la puerta
     assert _consumir(c, "backend", "demo").status_code == 200    # control positivo
 
@@ -81,14 +81,14 @@ def test_un_rol_siempre_rechazado_es_alarma_de_ahora_no_pronostico(tmp_path, mon
     debe aparecer en la alarma (control negativo: si el arreglo marcara a todos,
     esta línea falla).
     """
-    s, c = _cliente(tmp_path, monkeypatch, PUERTA)
+    _, c = _cliente(tmp_path, monkeypatch, PUERTA)
     _consumir(c, "cto-A")                       # 422, siempre sin carril
     _consumir(c, "backend", "demo")             # 200, con carril
 
     t = c.get("/doctor").text
     assert "cto" in t
     assert "dejaría mudos" not in t             # ya no es un pronóstico
-    linea = [l for l in t.splitlines() if "RECHAZADO SIEMPRE" in l]
+    linea = [x for x in t.splitlines() if "RECHAZADO SIEMPRE" in x]
     assert linea, "falta la alarma de rol 100% rechazado"
     assert "be" not in linea[0].split(":")[-1]  # el que manda carril no se denuncia
 
@@ -96,7 +96,7 @@ def test_un_rol_siempre_rechazado_es_alarma_de_ahora_no_pronostico(tmp_path, mon
 def test_con_la_puerta_abierta_el_informe_viejo_se_conserva(tmp_path, monkeypatch):
     """FALSADOR: el arreglo no puede romper el modo pre-vuelo, que sigue siendo
     el que se usa en un despliegue sin mapa de carriles."""
-    s, c = _cliente(tmp_path, monkeypatch)
+    _, c = _cliente(tmp_path, monkeypatch)
     _consumir(c, "cto-A")                       # 200: sin puerta, pasa sin carril
     t = c.get("/doctor").text
     assert "consumo(s) CON carril" in t and " 1 SIN " in t   # aquí SÍ es consumo
@@ -116,6 +116,7 @@ def test_rebotar_no_es_estar_parado_si_el_cursor_esta_fresco(tmp_path, monkeypat
     es una DURACIÓN, y no depende de cuándo se reinició el servicio.
     """
     from datetime import datetime, timedelta, timezone
+
     from conftest import db_directa
 
     s, c = _cliente(tmp_path, monkeypatch, PUERTA)
@@ -127,21 +128,23 @@ def test_rebotar_no_es_estar_parado_si_el_cursor_esta_fresco(tmp_path, monkeypat
                         ("be",  ahora - timedelta(hours=9))):
         con.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?)",
                     (rol, "demo-ledger", 1, cuando.isoformat(timespec="seconds")))
-    con.commit(); con.close()
+    con.commit()
+    con.close()
 
     t = c.get("/doctor").text
-    roja = [l for l in t.splitlines() if "sin drenar" in l]
+    roja = [x for x in t.splitlines() if "sin drenar" in x]
     assert roja, "sigue haciendo falta la alarma para quien de verdad no drena"
     assert "be" in roja[0], "lleva 9 h sin drenar y rebotando: eso sí es la alarma"
     assert "cto" not in roja[0], "drenó hace 5 min: rebota, pero NO está parado"
-    aviso = [l for l in t.splitlines() if "sin migrar" in l]
+    aviso = [x for x in t.splitlines() if "sin migrar" in x]
     assert aviso and "cto" in aviso[0], "el que rebota y drena se nombra, pero en ⚠️"
 
 
 def test_la_alarma_no_depende_de_cuando_se_reinicio_el_servicio(tmp_path, monkeypatch):
     """FALSADOR directo del bug de producción: un cursor movido JUSTO ANTES de
     arrancar (11 s, el caso real de `cpo`) no puede leerse como «parado»."""
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
+
     from conftest import db_directa
 
     s, c = _cliente(tmp_path, monkeypatch, PUERTA)
@@ -150,8 +153,59 @@ def test_la_alarma_no_depende_de_cuando_se_reinicio_el_servicio(tmp_path, monkey
     con = db_directa(s)
     con.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?)",
                 ("cto", "demo-ledger", 1, antes_de_arrancar.isoformat(timespec="seconds")))
-    con.commit(); con.close()
+    con.commit()
+    con.close()
 
     t = c.get("/doctor").text
-    roja = [l for l in t.splitlines() if "sin drenar" in l]
+    roja = [x for x in t.splitlines() if "sin drenar" in x]
     assert not roja or "cto" not in roja[0], "drenó 11 s antes del arranque: no está parado"
+
+
+def test_sin_fila_de_cursor_no_es_lo_mismo_que_cursor_parado(tmp_path, monkeypatch):
+    """Tercera vez que la alarma afirma más de lo que el dato sostiene (la caza
+    CodeRabbit en el #4, tras las de `infra` y `cpo` en producción).
+
+    Un rol que rebota y NO tiene fila en `cursors` caía en `parados`, y el informe
+    decía «su cursor lleva parado >2 h» sin un solo sello que lo probara: no hay
+    cursor, así que no hay nada parado. Es un estado distinto —nunca ha drenado— y
+    merece su propia línea, no que se le atribuya una antigüedad inventada.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from conftest import db_directa
+
+    s, c = _cliente(tmp_path, monkeypatch, PUERTA)
+    _consumir(c, "cto-A")        # rebota y NUNCA tuvo cursor
+    _consumir(c, "backend")      # rebota y su cursor es rancio de verdad
+    rancio = (datetime.now(timezone.utc) - timedelta(hours=9)).isoformat(timespec="seconds")
+    con = db_directa(s)
+    con.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?)",
+                ("be", "demo-ledger", 1, rancio))
+    con.commit()
+    con.close()
+
+    t = c.get("/doctor").text
+    parado = [x for x in t.splitlines() if "sin drenar desde hace" in x]
+    assert parado and "be" in parado[0], "el cursor rancio SÍ se puede fechar"
+    assert "cto" not in parado[0], "sin fila de cursor no se le pone antigüedad"
+    nunca = [x for x in t.splitlines() if "nunca ha drenado" in x]
+    assert nunca and "cto" in nunca[0], "y aun así hay que nombrarlo: no drena nada"
+
+
+def test_cursor_con_updated_nulo_tampoco_se_fecha(tmp_path, monkeypatch):
+    """Misma clase: la fila existe pero sin sello. `MAX(updated)` devuelve NULL y
+    NULL no es «antiguo», es «no sé»."""
+    from conftest import db_directa
+
+    s, c = _cliente(tmp_path, monkeypatch, PUERTA)
+    _consumir(c, "cto-A")
+    con = db_directa(s)
+    con.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?)",
+                ("cto", "demo-ledger", 1, None))
+    con.commit()
+    con.close()
+
+    t = c.get("/doctor").text
+    parado = [x for x in t.splitlines() if "sin drenar desde hace" in x]
+    assert not parado or "cto" not in parado[0], "updated NULL no fecha nada"
+    assert any("nunca ha drenado" in x and "cto" in x for x in t.splitlines())
