@@ -3400,10 +3400,14 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
             # contesta «no está» a los dos y marca al backend como humano fuera del
             # censo. Mismo filo, dos veces en el mismo endpoint: **el nombre que
             # enseño no es la clave con la que resuelvo.**
+            # El último campo es el HECHO (¿existe algún cursor suyo?), no su
+            # impresión. Se guarda aparte de la columna «último consumo» porque
+            # ordenar por la cadena «nunca» sería atarse a cómo se pinta.
             filas.append((pend, rol, (lec[rol]["ultima"][:16] if rol in lec else "nunca"),
                           (ult[:16] if ult else "nunca"), a.lower() in lp.CANON,
                           "difusion" if a.lower() in lp.DIFSET
-                          else "humano" if a.lower() not in lp.DUENO else "agente"))
+                          else "humano" if a.lower() not in lp.DUENO else "agente",
+                          ult is not None))
     # Los nombres FUERA DEL CENSO van aparte, y no es cosmética: la primera corrida
     # contra la flota real sacó 11 `zzz-*` —restos de pruebas de otros— entre los 20
     # primeros, cada uno con su deuda de 433, empujando fuera a los agentes de verdad.
@@ -3413,10 +3417,17 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
     # morosos: es una lista de lo que alguien tecleó alguna vez.
     fantasmas = [f for f in filas if not f[4]]
     filas = [f for f in filas if f[4]]
-    filas.sort(reverse=True)
+    # Ordena PRIMERO por «¿ha consumido alguna vez?» y después por deuda. Medido
+    # contra la flota real: las 8 primeras filas eran las 8 que tenían CERO
+    # cursores —dos humanos, dos alias de difusión y cuatro nombres de agente sin
+    # nadie detrás—, con ~62.000 pendientes entre todas empujando hacia abajo a
+    # quien sí drena y va atrasado, que es lo único sobre lo que se puede actuar.
+    # Ninguna se esconde: se hunden y se marcan. El desempate se deja explícito
+    # (antes lo daba de tapadillo el `reverse` sobre la tupla entera).
+    filas.sort(key=lambda f: (f[6], f[0], f[1]), reverse=True)
     out += ["", f"① MIRA Y NO DRENA — {len(filas)} agente(s) del censo con correo dirigido sin consumir",
             f"   {'agente':<20}{'pendientes':>11}  {'última mirada':<18}último consumo"]
-    for pend, a, mirada, consumo, _, clase_de in filas[:20]:
+    for pend, a, mirada, consumo, _, clase_de, drena in filas[:20]:
         # «nunca» en la 1ª columna y pendientes>0 es OTRA cosa: ni siquiera mira.
         # Se distingue en la propia fila en vez de en una sección aparte — la lista
         # ya está ordenada por deuda, y separarlas obliga a leer dos veces.
@@ -3432,9 +3443,25 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
             clase = "  (humano — su bandeja no la drena un agente)"
         elif mirada == "nunca":
             clase = "   ← NI MIRA"
+        elif not drena:
+            # La tercera cara de lo mismo. `humano` y `difusion` eran una lista a
+            # mano de los casos que a alguien se le ocurrieron, y los dos tienen
+            # cero cursores: el dato ya separaba solo, y además cubre el caso que
+            # nadie enumeró (un nombre de agente que no corre nadie).
+            #
+            # Dice lo que el DATO sostiene y ni una palabra más: el servicio no
+            # sabe qué sesiones están vivas, así que no puede afirmar «no lo corre
+            # nadie» — sólo que por ese nombre no se ha consumido jamás.
+            clase = "  (nunca ha consumido — no existe ningún cursor suyo)"
         else:
             clase = ""
         out.append(f"   {a:<20}{pend:>11}  {mirada:<18}{consumo}{clase}")
+    if len(filas) > 20:
+        # La cabecera anuncia N y aquí se leen 20. Callar la diferencia ya era
+        # descuido; con el orden de arriba pasa a mentira, porque cambia CUÁLES
+        # se quedan fuera. Un corte que no se dice se lee como «esto es todo».
+        out.append(f"   … y {len(filas) - 20} fila(s) más sin listar: la cola de este"
+                   " orden (primero quien sí drena, por deuda).")
     if not filas:
         out.append("   (nadie tiene correo dirigido sin consumir)")
     # ⚠️ EL PENDIENTE CRUZA CARRILES Y EL CONSUMO NO, y sin decirlo esta sección
