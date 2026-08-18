@@ -430,6 +430,10 @@ RE_AGENTE = re.compile(
 # **3.441 de 23.496 entradas (14,6%)** con el actor sustituido por la etiqueta, así
 # que `/entries?actor=alice-backend` perdía todos sus heartbeats. Se saltan antes de
 # buscar el actor, y se recogen como tipo.
+# La posición canónica del tipo: `### [origen → destino · TIPO] titular`. Se
+# captura el token TAL CUAL, sin validarlo contra `TIPOS` — validar aquí es
+# lo que hacía que 641 entradas perdieran lo que sí habían declarado.
+RAW_TIPO = re.compile(r"·\s*([A-Za-zÁÉÍÓÚÑáéíóúñ_/-]{2,})\s*\]")
 ETIQUETAS = re.compile(r"^\s*(HEARTBEAT|CARRY-FORWARD|CLAIM|CANON|CERT|DONE|RESP|AVISO|MSG|ASK|ACK|STATUS|INFO|HANDOFF)"
                        r"(?:[/·\-]\s*(?:HEARTBEAT|CARRY-FORWARD|CLAIM|CANON|CERT|DONE|RESP|AVISO|MSG|ASK|ACK|STATUS|INFO|HANDOFF))*\s*",
                        re.IGNORECASE)
@@ -489,6 +493,13 @@ class Entrada:
     # rompe a quien solo mire `.to`.
     difusion: list[str] = field(default_factory=list)
     tipo: str | None = None
+    # El texto que estaba ESCRITO en la posición del tipo, entienda el sistema esa
+    # palabra o no. `tipo` es lo que el sistema INTERPRETA; `raw_tipo` es lo que la
+    # flota ESCRIBIÓ. Existen los dos porque medí que no coinciden: 641 entradas del
+    # ledger piloto (8,2 %) declaran un tipo en posición canónica que este parser
+    # tiraba —MEDIDO, MEASURED, ADJUDICADO, VEREDICTO…—, y `lint` las contaba como
+    # «no declaran nada» cuando declaran de sobra. Nada de lo escrito se descarta.
+    raw_tipo: str | None = None
 
     @property
     def sha(self) -> str:
@@ -601,7 +612,12 @@ def _campos(head: str, cola: str) -> tuple[str | None, str | None, list[str], li
     tipo = next((t for t in TIPOS if t in head), None)
     if tipo is None and etiqueta:
         tipo = etiqueta.group(1).upper()
-    return ts, actor, to, difusion, tipo, por_arroba
+    # Lo escrito, se entienda o no. Se mira la posición canónica (`· TOKEN]`)
+    # antes que la etiqueta al frente, porque es donde la flota lo pone.
+    m_raw = RAW_TIPO.search(head)
+    raw = (m_raw.group(1).upper() if m_raw
+           else etiqueta.group(1).upper() if etiqueta else None)
+    return ts, actor, to, difusion, tipo, por_arroba, raw
 
 
 def parse(path: str, desde_byte: int = 0):
@@ -629,10 +645,10 @@ def parse(path: str, desde_byte: int = 0):
         text = "".join(lines[i:end]).rstrip() + "\n"
         head = lines[i].rstrip("\n")
         cola = "".join(lines[i + 1:i + 4])
-        ts, actor, to, difusion, tipo, por_arroba = _campos(head, cola)
+        ts, actor, to, difusion, tipo, por_arroba, raw_tipo = _campos(head, cola)
         out.append(Entrada(seq=n, line_no=i + 1, byte_off=offs[i], head=head,
                            text=text, ts=ts, actor=actor, to=to, difusion=difusion,
-                           tipo=tipo, por_arroba=por_arroba))
+                           tipo=tipo, por_arroba=por_arroba, raw_tipo=raw_tipo))
     return out, acc
 
 

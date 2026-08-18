@@ -633,7 +633,20 @@ def es_corrupcion(e: BaseException) -> bool:
 # producción no existe.
 COLUMNAS_ANADIDAS = (("coste", "maximo", "INTEGER DEFAULT 0"),
                      ("claims", "motivo", "TEXT"),
-                     ("claims", "cerrado_por", "TEXT"))
+                     ("claims", "cerrado_por", "TEXT"),
+                     # Lo ESCRITO en la posición del tipo, se entienda o no (641
+                     # entradas del ledger piloto se perdían aquí). Las otras dos
+                     # se crean vacías A PROPÓSITO: el día que se interprete
+                     # `MEDIDO → MEASUREMENT` hay que poder decir CON QUÉ revisión
+                     # del registro se hizo, o cambiar la taxonomía cambiaría en
+                     # silencio las métricas históricas.
+                     #
+                     # Van por la vía ADITIVA y no en `SCHEMA`: un cambio de huella
+                     # de esquema TIRA `cursors` (ver arranque), o sea le borra a
+                     # los 20 su posición de lectura por una columna.
+                     ("entries", "raw_tipo", "TEXT"),
+                     ("entries", "canonical_kind", "TEXT"),
+                     ("entries", "kind_registry_rev", "INTEGER"))
 
 DERIVADAS = ("entries", "recipients", "files", "pages", "citas")
 # ⚠️ LAS COLUMNAS SE ENUMERAN, y la lista de columnas se queda vieja igual que se
@@ -1104,7 +1117,7 @@ def reindex(ledger: str, path: str, con) -> dict:
         # cuando termine de escribirse.
         filas.append((ledger, e.sha, prox + nuevas, pos, e.line_no, e.byte_off,
                       e.ts, e.actor, e.tipo, e.head[:600], e.text, ahora, None,
-                      1 if pos == len(ents) - 1 else 0))
+                      1 if pos == len(ents) - 1 else 0, e.raw_tipo))
         # ¿SE ENRUTA POR `@`? La pregunta no es «¿es nueva?» —en la PRIMERA
         # indexación de un ledger TODO es nuevo, y eso volcaría el histórico entero
         # en las bandejas: 12.442 entradas de golpe, medido—. La pregunta es si esto
@@ -1139,8 +1152,9 @@ def reindex(ledger: str, path: str, con) -> dict:
         nuevas += 1
 
     con.executemany("INSERT OR REPLACE INTO entries (ledger,eid,arrival,seq,line_no,"
-                    "byte_off,ts,actor,tipo,head,body,visto,ausente,provisional) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", filas)
+                    "byte_off,ts,actor,tipo,head,body,visto,ausente,provisional,"
+                    "raw_tipo) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", filas)
     con.executemany("INSERT OR REPLACE INTO recipients VALUES (?,?,?)", dest)
 
     # Las que estaban y ya no: NO se borran. Un ledger de sólo-apéndice no pierde
@@ -3783,7 +3797,13 @@ def lint(ledger: str | None = None, limit: int = Query(10, le=100)):
         if not n:
             continue
         faltas = {
-            "sin tipo declarado": "tipo IS NULL",
+            # Dos deudas DISTINTAS que antes caían en el mismo saco: «no declara
+            # nada» se arregla enseñando a escribir; «declara algo que no entiendo»
+            # se arregla ampliando el registro, o cerrando el camino por el que
+            # entró. Medido: 641 de las 5.210 «sin tipo» del ledger piloto eran en
+            # realidad de la segunda clase.
+            "sin tipo declarado": "tipo IS NULL AND raw_tipo IS NULL",
+            "declara un tipo que no entiendo": "tipo IS NULL AND raw_tipo IS NOT NULL",
             "sin sello de hora": "ts IS NULL",
             "sin actor legible": "actor IS NULL",
             # NOT EXISTS, no `seq NOT IN (SELECT …)`: el NOT IN correlacionado
@@ -3831,7 +3851,7 @@ def lint(ledger: str | None = None, limit: int = Query(10, le=100)):
             (name,)).fetchall()
         perdidas = []
         for r in candidatos:
-            _, _, to, difusion, _, por_arroba = lp._campos(r["head"], "")
+            _, _, to, difusion, _, por_arroba, _ = lp._campos(r["head"], "")
             if (to or difusion) and not por_arroba:
                 perdidas.append(r)
         c = len(perdidas)
