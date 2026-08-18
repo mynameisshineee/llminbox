@@ -613,6 +613,28 @@ def es_corrupcion(e: BaseException) -> bool:
     return any(s in m for s in CORRUPCION)
 
 
+# ── QUÉ SE RESCATA DE UNA BASE ROTA, Y POR QUÉ ES UNA CONSTANTE ──────────────
+# El criterio es uno solo: **si no sale del markdown, se rescata**. `entries`,
+# `recipients` y `files` se re-derivan del ledger; `pages` y `citas`, de la wiki.
+# Todo lo demás es estado que sólo vive aquí.
+#
+# Vive como CONSTANTE, y no dentro del bucle, porque una lista escondida en el cuerpo
+# de una función se queda vieja en silencio: `claims` nació después de `_rescatar()`,
+# nadie la añadió, y el 2026-08-15 una corrupción de índice se llevó 96 claims —70
+# abiertos— mientras `/doctor ③` publicaba «0 sin cerrar ni relevar», la mejor nota
+# posible. Fuera, la puede enumerar un test contra el esquema
+# (`test_rescate_cubre_lo_no_derivable`) y el olvido se convierte en rojo.
+DERIVADAS = ("entries", "recipients", "files", "pages", "citas")
+TABLAS_RESCATADAS = (
+    ("cursors", "agent,ledger,last_arrival,updated"),
+    ("lecturas", "agent,primera,ultima,veces"),
+    ("claims", "tema,rol,agent,agent_bruto,abierto,cerrado,bruto"),
+    ("coste", "ruta,llamadas,bytes,ultima"),
+    ("incidencias", "ledger,ts,motivo,entradas_antes,entradas_despues,ultimo_sellado"),
+    ("meta", "k,v"),
+)
+
+
 def _rescatar(ruta: str) -> dict:
     """Lo que NO sale del markdown, tabla a tabla y cada una en su propio try.
 
@@ -643,9 +665,20 @@ def _rescatar(ruta: str) -> dict:
               f"se reconstruye SIN rescatar estado", flush=True)
         return out
     try:
-        for t, cols in (("cursors", "agent,ledger,last_arrival,updated"),
-                        ("lecturas", "agent,primera,ultima,veces"),
-                        ("meta", "k,v")):
+        # ⚠️ ESTA LISTA SE QUEDÓ CORTA Y COSTÓ EL ESTADO DE REPARTO DE LA FLOTA.
+        # `claims` nació DESPUÉS de esta función y nadie la añadió: el 2026-08-15T22:47
+        # el índice se corrompió (`quick_check: wrong # of entries in index i_who`), el
+        # servicio se curó como debía… y se llevó por delante 96 claims, 70 de ellos
+        # abiertos. Peor: `/doctor ③` lo publicó como «0 sin cerrar ni relevar», que es
+        # la mejor nota posible. Una pérdida de datos con cara de disciplina perfecta.
+        # `coste` e `incidencias` cayeron en el mismo viaje —y lo segundo es el colmo:
+        # el registro de incidentes destruido POR el incidente que iba a registrar.
+        # El criterio es el del docstring y no ha cambiado: **si no sale del markdown,
+        # se rescata**. Lo hace explícito el test `test_rescate_cubre_lo_no_derivable`,
+        # que compara esta lista contra el esquema y falla cuando alguien añade una
+        # tabla de estado sin decidir qué pasa con ella. Una lista se queda vieja; una
+        # lista con un test que la enumera, no.
+        for t, cols in TABLAS_RESCATADAS:
             try:
                 out[t] = [tuple(r) for r in con.execute(f"SELECT {cols} FROM {t}")]
                 out["leido"].append(t)
@@ -3353,7 +3386,19 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
             h = -1
         out.append(f"   {r['tema'][:37]:<38}{r['rol']:<9}{r['agent'][:11]:<12}{h:>5}")
     if not viejos:
-        out.append("   (ninguno pasado de plazo)")
+        # UN CERO TIENE DOS CAUSAS OPUESTAS y hasta hoy se imprimían igual. El
+        # 2026-08-15 una corrupción de índice se llevó los 96 claims —70 abiertos— y
+        # esta sección publicó «0 sin cerrar ni relevar», o sea la mejor nota posible,
+        # durante tres días. El cero de «nadie se ha pasado de plazo» y el cero de «no
+        # queda nada que mirar» se distinguen con una consulta más, y sin ella el
+        # informe convierte una pérdida de datos en un elogio.
+        vivos = con.execute("SELECT COUNT(*) n FROM claims").fetchone()["n"]
+        if vivos == 0:
+            out.append("   ⚠️  la tabla de claims está VACÍA — o nadie ha cogido nunca")
+            out.append("     nada, o se perdió. NO es «todo cerrado a tiempo»: no hay")
+            out.append("     nada que medir. (`llmi verify` dice si hubo reconstrucción.)")
+        else:
+            out.append("   (ninguno pasado de plazo)")
     out.append("   Vencido ≠ abandonado: el TTL dice que otro PUEDE relevarte, no que")
     out.append("   hayas fallado. Ciérralo, o di en el ledger por qué sigue abierto.")
     # LA TASA DE CIERRE, que es el único número que dice si la disciplina se usa o

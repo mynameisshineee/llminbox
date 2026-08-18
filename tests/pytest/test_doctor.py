@@ -289,3 +289,22 @@ def test_el_tablero_marca_lo_vencido(cliente, servicio):
     r2 = cliente.post("/claim", json={"tema": "otro2", "rol": "ejecuta", "agent": "backend"})
     fresco = next(t for t in r2.json()["tambien_cogido"] if t["tema"] == "fresco")
     assert fresco["vencido"] is False
+
+
+def test_un_cero_de_claims_vacios_no_se_lee_como_disciplina_perfecta(cliente):
+    """El 2026-08-15 una corrupción se llevó los 96 claims —70 abiertos— y ③ publicó
+    «0 sin cerrar ni relevar» durante tres días: la mejor nota posible sobre una
+    pérdida de datos. El cero de «nadie se pasó de plazo» y el de «no queda nada que
+    mirar» son opuestos y se imprimían igual.
+
+    FALSADOR: con un claim vivo, este aviso NO puede aparecer — si saliera siempre,
+    no distinguiría nada y sería otro decorado.
+    """
+    s = _seccion(_texto(cliente), 3)
+    assert "la tabla de claims está VACÍA" in s
+    assert "NO es «todo cerrado a tiempo»" in s
+
+    cliente.post("/claim", json={"tema": "vivo", "rol": "ejecuta", "agent": "backend"})
+    s2 = _seccion(_texto(cliente), 3)
+    assert "está VACÍA" not in s2
+    assert "ninguno pasado de plazo" in s2
