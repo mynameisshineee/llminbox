@@ -755,6 +755,18 @@ def reconstruir_indice(motivo: str) -> bool:
             nueva.executescript(SCHEMA)
             nueva.executemany("INSERT OR REPLACE INTO lecturas VALUES (?,?,?,?)",
                               rescatado["lecturas"])
+            # Por COLUMNAS NOMBRADAS y no `VALUES (?,…)` posicional: estas tres ya han
+            # crecido de columnas una vez (`claims.motivo`, `claims.cerrado_por`,
+            # `coste.maximo`) y un INSERT posicional no se rompe cuando vuelvan a
+            # crecer — coloca los valores CORRIDOS, que es peor.
+            for tabla, cols in TABLAS_RESCATADAS:
+                if tabla in ("cursors", "lecturas", "meta"):
+                    continue                      # tienen su propio volcado arriba/abajo
+                filas = rescatado.get(tabla) or []
+                if filas:
+                    marcas = ",".join("?" * len(cols.split(",")))
+                    nueva.executemany(
+                        f"INSERT OR REPLACE INTO {tabla} ({cols}) VALUES ({marcas})", filas)
             # Las huellas NO se rescatan: se escriben las de AHORA. La base nueva se
             # acaba de crear con el SCHEMA de este proceso, así que su huella de
             # esquema es la de este proceso por definición; copiar la de la base rota
