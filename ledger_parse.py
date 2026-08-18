@@ -231,7 +231,15 @@ def _cargar_roles_por_alias():
     # Valores TAMBIÉN en minúsculas: `canon_identidad()` compara el nombre ya
     # bajado contra `.values()`, y un `"BE"` en el fichero firmado (que se edita
     # a mano, fuera de este repo) dejaría ese rol sin matchear en silencio.
+    return _mapa_alias(d)
+
+
+def _mapa_alias(d: dict) -> dict:
     return {k.lower(): v.lower() for k, v in d.get("rol_por_alias", {}).items()}
+
+
+def _mapa_jerarquia(d: dict) -> dict:
+    return {k.lower(): v for k, v in d.get("jerarquia", {}).items()}
 
 
 ROLES_ALIAS = _cargar_roles_por_alias()
@@ -257,7 +265,7 @@ def _cargar_jerarquia() -> dict:
         return {}
     try:
         with open(ruta, encoding="utf-8") as fh:
-            return {k.lower(): v for k, v in _json.load(fh).get("jerarquia", {}).items()}
+            return _mapa_jerarquia(_json.load(fh))
     except Exception as e:
         print(f"[jerarquia] no pude leer {ruta}: {e} — se sirve vacía y se avisa",
               flush=True)
@@ -265,6 +273,67 @@ def _cargar_jerarquia() -> dict:
 
 
 JERARQUIA = _cargar_jerarquia()
+
+# Lo que está EFECTIVAMENTE cargado, para poder contestar «¿de qué bytes hablo?».
+ORG_SHA: str | None = None
+ORG_CARGADO_EN: str | None = None
+ORG_REVISION = None
+
+
+def refrescar_organigrama() -> dict:
+    """Relee la fuente firmada si sus bytes cambiaron. Sin TTL, a propósito.
+
+    Nació de un fallo de producción (2026-08-18): el bind-mount de FICHERO ÚNICO
+    quedó apuntando a un inodo borrado cuando el host reemplazó el fichero por
+    rename, y `/organigrama` siguió sirviendo 15 roles de hacía dos días **sin
+    avisar** — porque el fichero sí se había leído al arrancar: se leyó el viejo.
+
+    Dos decisiones que salen de ahí:
+
+    · **Se abre por RUTA en cada petición.** Resolver la ruta de nuevo es lo que
+      derrota al inodo borrado: con el mount roto, `open()` da ENOENT y el fallo
+      se vuelve visible en vez de silencioso. Cachear un descriptor lo reeditaría.
+    · **Sin TTL.** Una ventana en la que la fuente ya cambió y esto contesta
+      `stale=False` es exactamente la mentira que había. Hashear 6 KB por
+      petición cuesta menos que afirmar frescura que no se tiene.
+
+    Si la fuente no se deja leer se CONSERVA lo último bueno y se marca rancio:
+    servir una jerarquía vacía sería peor —el agente leería «no reporto a nadie»,
+    que es lo contrario de la verdad—, pero servirla como buena es lo que falló.
+    """
+    global ROLES_ALIAS, JERARQUIA, ORG_SHA, ORG_CARGADO_EN, ORG_REVISION
+    import hashlib as _h
+    import json as _json
+    import os as _os
+    from datetime import datetime as _dt, timezone as _tz
+
+    ruta = _os.environ.get("LLMINBOX_ROLES_ALIAS", "")
+    if not ruta:
+        return {"montada": False, "source_sha256": None,
+                "loaded_sha256": ORG_SHA, "recargado": False}
+    try:
+        with open(ruta, "rb") as fh:
+            crudo = fh.read()
+        sha = _h.sha256(crudo).hexdigest()
+        d = _json.loads(crudo.decode("utf-8"))
+    except Exception:
+        # Ilegible o corrupta: NO se toca el estado bueno; el llamante lo marca.
+        return {"montada": True, "source_sha256": None,
+                "loaded_sha256": ORG_SHA, "recargado": False}
+    if sha != ORG_SHA:
+        # Los DOS mapas salen del MISMO fichero, así que se refrescan juntos. Si
+        # sólo se refrescara la jerarquía, `engineering-manager` seguiría saliendo
+        # en el organigrama y dando 422 en la bandeja: un rol que no puede recibir
+        # trabajo. Ese caso está medido en producción, no es hipotético.
+        ROLES_ALIAS = _mapa_alias(d)
+        JERARQUIA = _mapa_jerarquia(d)
+        ORG_REVISION = d.get("_revision")
+        ORG_SHA = sha
+        ORG_CARGADO_EN = _dt.now(_tz.utc).isoformat(timespec="seconds")
+        return {"montada": True, "source_sha256": sha,
+                "loaded_sha256": sha, "recargado": True}
+    return {"montada": True, "source_sha256": sha,
+            "loaded_sha256": ORG_SHA, "recargado": False}
 
 
 def canon_identidad(nombre: str) -> str | None:

@@ -3135,14 +3135,39 @@ def organigrama():
     jerarquía vacía en silencio sería peor que no tener endpoint: el agente
     leería «no reporto a nadie», que es lo contrario de la verdad.
     """
+    # Se relee la fuente EN CADA PETICIÓN (§4.3 de la spec del Agent OS). No es
+    # celo: el 2026-08-18 este endpoint sirvió 15 roles de hacía dos días porque
+    # la jerarquía se cargaba al importar y el mount de fichero único apuntaba a
+    # un inodo borrado. `stale=False` sólo se puede afirmar habiendo LEÍDO la
+    # fuente en esta misma petición y coincidiendo el hash — cualquier otra cosa
+    # (ilegible, distinta, no montada) es rancio y se dice.
+    est = lp.refrescar_organigrama()
+    fresco = (est["source_sha256"] is not None
+              and est["source_sha256"] == est["loaded_sha256"])
+    base = {"revision": lp.ORG_REVISION,
+            "source_sha256": est["source_sha256"],
+            "loaded_sha256": est["loaded_sha256"],
+            "cargado_en": lp.ORG_CARGADO_EN or ARRANCADO_EN,
+            "stale": not fresco}
     j = lp.JERARQUIA
     if not j:
-        return {"jerarquia": {}, "roles": 0, "cargado_en": ARRANCADO_EN,
+        return {**base, "jerarquia": {}, "roles": 0,
                 "aviso": "jerarquía NO montada (LLMINBOX_ROLES_ALIAS vacío o "
                          "ilegible) — esto NO significa que no reportes a nadie, "
                          "significa que este servicio no lo sabe. Fuente en prosa: "
                          "_shared_refs/ORGANIGRAMA.md"}
-    return {"jerarquia": j, "roles": len(j), "cargado_en": ARRANCADO_EN, "aviso": None}
+    if not fresco:
+        # Se sirve lo último bueno: una jerarquía vacía haría leer «no reporto a
+        # nadie», que es lo contrario de la verdad. Pero marcada, que es lo que
+        # faltaba — el fallo no fue servir viejo, fue servirlo como bueno.
+        return {**base, "jerarquia": j, "roles": len(j),
+                "aviso": "organigrama RANCIO: no pude leer la fuente firmada en "
+                         "esta petición, así que esto es lo último que cargué y no "
+                         "puedo afirmar que siga vigente. Revisa el montaje "
+                         "(LLMINBOX_ROLES_ALIAS) — un bind-mount de FICHERO se "
+                         "rompe si el host lo reemplaza por rename; monta el "
+                         "DIRECTORIO."}
+    return {**base, "jerarquia": j, "roles": len(j), "aviso": None}
 
 
 @app.get("/claims", dependencies=GATE)
