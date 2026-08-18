@@ -465,7 +465,8 @@ def huella_censo() -> str:
     return hashlib.sha256(",".join(sorted(lp.AGENTES)).encode()).hexdigest()[:16]
 
 
-RAW_TIPO_V = "1"          # súbela si cambia CÓMO se deriva `raw_tipo` del head
+RAW_TIPO_V = "1"          # súbela si cambia CÓMO se deriva `raw_tipo` del head;
+                          # subirla RECALCULA el corpus entero (ver la función)
 
 
 def migrar_raw_tipo(con) -> None:
@@ -490,16 +491,28 @@ def migrar_raw_tipo(con) -> None:
         fila = con.execute("SELECT v FROM meta WHERE k='raw_tipo_v'").fetchone()
         if fila and fila["v"] == RAW_TIPO_V:
             return
-        pend = [(lp.raw_tipo_de(r["head"]), r["ledger"], r["eid"])
-                for r in con.execute("SELECT ledger, eid, head FROM entries "
-                                     "WHERE raw_tipo IS NULL")]
-        pend = [t for t in pend if t[0] is not None]
-        if pend:
-            con.executemany("UPDATE entries SET raw_tipo=? WHERE ledger=? AND eid=?", pend)
+        # SE RECALCULA TODO, no sólo los NULL. Un `WHERE raw_tipo IS NULL`
+        # funciona para v0→v1 y MIENTE en cualquier revisión posterior: las filas
+        # que ya tienen valor no se volverían a mirar, así que subir `RAW_TIPO_V`
+        # no arreglaría nada de lo ya escrito. Y es justo donde más duele, porque
+        # los ledgers dormidos tampoco vuelven a pasar por `reindex`: el valor
+        # incorrecto se fosilizaría para siempre.
+        #
+        # Incluye el sentido INVERSO: una revisión nueva puede descubrir FALSOS
+        # POSITIVOS (algo que se tomó por tipo y no lo era — el titular con
+        # `· trampa]`), así que `derivado is None` con valor guardado también es
+        # un cambio que hay que escribir.
+        cambios = [(d, r["ledger"], r["eid"])
+                   for r in con.execute("SELECT ledger, eid, head, raw_tipo FROM entries")
+                   if (d := lp.raw_tipo_de(r["head"])) != r["raw_tipo"]]
+        if cambios:
+            con.executemany("UPDATE entries SET raw_tipo=? WHERE ledger=? AND eid=?", cambios)
+        # El sello va en la MISMA transacción que los datos: un `commit` entre
+        # medias dejaría una base a medio migrar sellada como migrada.
         con.execute("INSERT OR REPLACE INTO meta VALUES ('raw_tipo_v', ?)", (RAW_TIPO_V,))
         con.commit()
-        print(f"[migración] raw_tipo: {len(pend)} entradas del corpus existente "
-              f"recuperan el lexema que declaraban", flush=True)
+        print(f"[migración] raw_tipo v{RAW_TIPO_V}: {len(cambios)} entradas recalculadas "
+              f"desde su cabecera guardada", flush=True)
     except sqlite3.OperationalError as e:
         # Base sin la columna todavía (orden de arranque) — no es fatal: el ALTER
         # corre antes, pero si algún día no lo hiciera, esto NO puede tumbar el

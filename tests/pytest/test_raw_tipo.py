@@ -289,3 +289,49 @@ def test_un_lexema_rancio_se_corrige_al_reparsear(tmp_path, monkeypatch):
     fila = db_directa(s).execute(
         "SELECT raw_tipo FROM entries WHERE head LIKE '%· FYI]%'").fetchone()
     assert fila["raw_tipo"] == "FYI", f"se fosilizó: {fila['raw_tipo']}"
+
+
+def test_una_revision_nueva_recalcula_todo_el_corpus(tmp_path, monkeypatch):
+    """`RAW_TIPO_V` promete que subirla arregla lo ya escrito. Este test es lo que
+    convierte esa promesa en contrato.
+
+    Un `WHERE raw_tipo IS NULL` funciona para v0→v1 y MIENTE después: las filas
+    que ya tienen valor no se vuelven a mirar. Y es donde más duele, porque los
+    ledgers dormidos tampoco pasan por `reindex` —`barrido()` los salta si su
+    tamaño y mtime no cambiaron—, así que un valor incorrecto se fosiliza para
+    siempre.
+
+    Se prueban las DOS direcciones, porque una revisión nueva no sólo rellena:
+
+      · valor RANCIO      `OBSOLETO` → `FYI`
+      · FALSO POSITIVO    `FANTASMA` → NULL   (algo que se tomó por tipo y no lo era)
+
+    El ledger NO se toca: fichero intacto, mismo tamaño y mismo mtime. Si la
+    migración dependiera de una re-indexación, aquí no pasaría nada.
+
+    FALSADOR: volver al `WHERE raw_tipo IS NULL` deja las dos filas como estaban
+    —ninguna es NULL— y las dos aserciones caen."""
+    s = construir(tmp_path, monkeypatch)
+    (tmp_path / "DEMO-LEDGER.md").write_text(CABECERAS)
+    with TestClient(s.app):
+        s.barrido()
+    con = db_directa(s)
+    con.execute("UPDATE entries SET raw_tipo='OBSOLETO' WHERE head LIKE '%· FYI]%'")
+    con.execute("UPDATE entries SET raw_tipo='FANTASMA' WHERE head LIKE '%sin tipo ninguno%'")
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('raw_tipo_v', '1')")
+    con.commit()
+
+    s2 = construir(tmp_path, monkeypatch)
+    monkeypatch.setattr(s2, "RAW_TIPO_V", "2")     # la revisión nueva
+    with TestClient(s2.app):                        # arranque, sin tocar el fichero
+        pass
+
+    con2 = db_directa(s2)
+    rancio = con2.execute(
+        "SELECT raw_tipo FROM entries WHERE head LIKE '%· FYI]%'").fetchone()["raw_tipo"]
+    falso = con2.execute(
+        "SELECT raw_tipo FROM entries WHERE head LIKE '%sin tipo ninguno%'").fetchone()["raw_tipo"]
+    sello = con2.execute("SELECT v FROM meta WHERE k='raw_tipo_v'").fetchone()["v"]
+    assert rancio == "FYI", f"el lexema rancio no se recalculó: {rancio}"
+    assert falso is None, f"el falso positivo sobrevivió a la revisión: {falso}"
+    assert sello == "2", sello
