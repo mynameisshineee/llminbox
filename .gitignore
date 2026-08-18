@@ -2,6 +2,11 @@
 # El repo lleva los ejemplos; esto lo genera `llmi init`.
 docker-compose.override.yml
 roster.json
+# Copias de seguridad del censo (`roster.json.pre-alta-*`, `.bak-*`): las deja
+# cualquier alta de agente y NO están cubiertas por la línea de arriba. Una se
+# quedó suelta el 2026-08-17 y `git add -A` la habría publicado con los nombres
+# y humanos de los 60 agentes.
+roster.json.*
 # Sugerencias de censo que `llmi init` propone cuando roster.json YA existe
 # (no lo pisa) — nombres candidatos vistos en tus ledgers, para que los revises
 # a mano. No es config activa, así que no se commitea.

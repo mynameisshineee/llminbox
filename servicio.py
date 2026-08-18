@@ -1461,6 +1461,18 @@ LECTURAS_LOCK = threading.Lock()
 # no puede pagar una escritura más— y lo publica `/doctor`.
 CONSUMOS: dict[str, list] = {}          # rol -> [con_carril, sin_carril, ultimo_iso]
 CONSUMOS_LOCK = threading.Lock()
+# Hora de arranque de ESTE proceso. `CONSUMOS` se vacía en cada reinicio, así que
+# «lleva rebotando desde el arranque» sólo significa algo comparado con esta marca:
+# recién reiniciado, la ventana son segundos y CUALQUIER rol cuyo poller sin carril
+# dispare primero parece mudo. Cazado en producción el 2026-08-18: ⑤ acusó a `infra`
+# de no drenar 17 minutos después de que `infra` drenara.
+ARRANQUE = datetime.now(timezone.utc).isoformat(timespec="seconds")
+# Cuánto tiempo sin mover el cursor convierte «rebota» en «no drena». Es una
+# DURACIÓN y no «desde el arranque» a propósito: la ventana en memoria se reinicia
+# con el proceso, así que recién arrancado TODO EL MUNDO parece parado. Medido dos
+# veces en producción el 2026-08-18: la alarma acusó a `infra` (había drenado 17 min
+# antes) y luego a `cpo` (había drenado ONCE SEGUNDOS antes de arrancar).
+MUDO_H = float(os.environ.get("LLMINBOX_MUDO_H", "2"))
 
 
 def anota_consumo(rol: str, con_carril: bool, ahora_iso: str) -> None:
@@ -2755,8 +2767,12 @@ def marcar_leido(agent: str, l: Leido,
     # falta que la respuesta traiga el ANTES y el DESPUÉS, y que nombre lo ignorado.
     agent = resolver_o_422(agent)                  # ① — antes de tocar nada más
     canon = clave_cursor(agent)                     # ② — la clave es el ROL, no el nombre
-    anota_consumo(canon, bool(x_llminbox_carril),
-                  datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    # OJO con dónde se cuenta: mandar una cabecera NO es declarar carril. Esto contaba
+    # `bool(x_llminbox_carril)` ANTES de resolverla, así que un `X-Llminbox-Carril:
+    # basura` sumaba a la columna «CON carril» y acto seguido devolvía 422 — y ⑤ podía
+    # publicar su ✓ verde sostenido por peticiones que habían fallado todas. Ahora se
+    # anota el DESENLACE: éxito sólo cuando el carril ya resolvió, y rechazo en las dos
+    # puertas. Quien rebota se sigue nombrando, que era el motivo de contar aquí.
     # ③ fail-closed TAMBIÉN para el carril (hallazgo de fe·bikeus 2026-08-10T17:17Z):
     # una cabecera que no resuelve devolvía `ok:true` y DEGRADABA a consumir TODOS
     # los cursores — justo lo que la cabecera existe para evitar — con la única seña
@@ -2779,6 +2795,8 @@ def marcar_leido(agent: str, l: Leido,
     # `LLMINBOX_CARRIL_OPCIONAL=1` devuelve la conducta vieja para un despliegue sin
     # mapa de carriles, que si no quedaría sin poder marcar leído nada.
     if not x_llminbox_carril and CARRIL_LEDGER and CARRIL_OBLIGATORIO:
+        anota_consumo(canon, False,
+                      datetime.now(timezone.utc).isoformat(timespec="seconds"))
         raise HTTPException(
             422,
             "sin carril declarado no se consume: di de qué carril eres y sólo se "
@@ -2799,11 +2817,15 @@ def marcar_leido(agent: str, l: Leido,
                          "(carriles.tsv): quita la cabecera o móntalo")
             else:
                 pista = ""
+            anota_consumo(canon, False,
+                          datetime.now(timezone.utc).isoformat(timespec="seconds"))
             raise HTTPException(
                 422,
                 f"carril '{x_llminbox_carril}' no resuelve a ningún ledger de este "
                 f"servicio (válidos: {sorted(CARRIL_LEDGER)}){pista}")
     ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Aquí ya no hay puerta que rebote: el carril (si vino) resolvió.
+    anota_consumo(canon, bool(x_llminbox_carril), ahora)
     con = db()
     aplicados, ignorados, retrocedidos, sin_cambio, fuera_de_carril = {}, [], {}, [], []
     try:
@@ -3563,15 +3585,81 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
             out.append("      re-deriva y sus entradas recuperan actor y destinatarios.")
 
     # ── ⑤ ¿SE PUEDE YA EXIGIR CARRIL PARA CONSUMIR? ──────────────────────────
-    # El gate ⑱ está APAGADO esperando a que los consumidores manden la cabecera.
-    # Esto dice cuántos la mandan DE VERDAD —contando POST, no grepeando scripts—
-    # porque el grep con el que lo estimé contó menciones y dio 18 donde había ~10.
+    # Esto dice cuántos mandan la cabecera DE VERDAD —contando POST, no grepeando
+    # scripts— porque el grep con el que lo estimé contó menciones y dio 18 donde
+    # había ~10.
+    #
+    # ⚠️ 2026-08-18 — ⑤ nació como medidor de PRE-VUELO («¿se puede ya encender el
+    # gate?») y seguía hablando en pre-vuelo DOS DÍAS DESPUÉS de encenderlo: recomendaba
+    # encender lo que ya estaba encendido, y llamaba «1390 consumo(s) SIN carril» a 1390
+    # RECHAZOS con 422. La causa está ~180 líneas más arriba: `anota_consumo()` se llama
+    # ANTES del `raise` de la puerta —a propósito, quien rebota también es un consumidor
+    # al que hay que poder poner nombre—, así que con el gate puesto la columna «SIN»
+    # cuenta intentos que NO drenaron nada.
+    # Por qué importa más que un rótulo: uvicorn corre SIN log de acceso (medido: 0
+    # líneas GET/POST en 28 h de logs), así que este bloque es la ÚNICA fuente que sabe
+    # quién rebota. Un instrumento que llama «consumo» a un rechazo es peor que no
+    # tenerlo: da por sano lo que está mudo.
     out.append("")
-    out.append("── ⑤ ¿listo para exigir carril al consumir? ──")
+    puerta = CARRIL_OBLIGATORIO and bool(CARRIL_LEDGER)
+    if puerta:
+        out.append("── ⑤ carril al consumir: PUERTA PUESTA "
+                   "(LLMINBOX_CARRIL_OBLIGATORIO=1) ──")
+    else:
+        out.append("── ⑤ ¿listo para exigir carril al consumir? "
+                   "(PUERTA ABIERTA: hoy se consume sin declararlo) ──")
     with CONSUMOS_LOCK:
         foto = {k: list(v) for k, v in CONSUMOS.items()}
     if not foto:
         out.append("   (sin consumos desde el último arranque: nada que medir todavía)")
+    elif puerta:
+        con_c = sum(v[0] for v in foto.values())
+        sin_c = sum(v[1] for v in foto.values())
+        mudos = sorted(k for k, v in foto.items() if v[1] and not v[0])
+        out.append(f"   {con_c} consumo(s) CON carril · {sin_c} RECHAZADO(S) con 422 · "
+                   f"{len(foto)} rol(es) activos desde el arranque")
+        out.append("   Un rechazado NO es un consumo: rebotó en la puerta y no drenó "
+                   "nada. Se ven porque el contador va ANTES del gate.")
+        # «No drena» es una afirmación sobre el CURSOR, así que se comprueba contra el
+        # cursor y no contra el contador. Sin esto la alarma acusaba a quien había
+        # consumido hace un rato por otra vía (su cursor se movió DESPUÉS del arranque):
+        # rebotar y estar parado no son lo mismo, y mezclarlos quema la alarma.
+        # Tres estados, no dos. «Lleva parado >N h» es una afirmación FECHADA, y sólo
+        # se puede hacer sobre quien tiene un sello que fecharla: sin fila en `cursors`
+        # —o con `updated` NULL— no hay antigüedad que atribuir, hay ausencia. Meterlos
+        # en el mismo saco era la tercera vez que esta alarma afirmaba más de lo que el
+        # dato sostiene (las dos primeras, `infra` y `cpo`, en producción).
+        parados, rebotando, nunca = [], [], []
+        if mudos:
+            fresco = (datetime.now(timezone.utc)
+                      - timedelta(hours=MUDO_H)).isoformat(timespec="seconds")
+            sello = {r: u for r, u in con.execute(
+                "SELECT agent, MAX(updated) FROM cursors WHERE agent IN (%s) "
+                "GROUP BY agent" % ",".join("?" * len(mudos)), tuple(mudos))}
+            for r in mudos:
+                u = sello.get(r)
+                if not u:
+                    nunca.append(r)
+                elif u > fresco:
+                    rebotando.append(r)
+                else:
+                    parados.append(r)
+        if parados:
+            out.append(f"   🔴 RECHAZADO SIEMPRE y sin drenar desde hace >{MUDO_H:g} h: "
+                       f"{', '.join(parados)}")
+            out.append("      su cursor lleva parado ese tiempo mientras rebota. Si llama "
+                       "con `curl -sf` no ve el 422 y se cree al día.")
+        if nunca:
+            out.append(f"   🔴 RECHAZADO SIEMPRE y nunca ha drenado: {', '.join(nunca)}")
+            out.append("      no tiene ni fila de cursor: no es que se haya parado, es que "
+                       "no ha llegado a empezar.")
+        if rebotando:
+            out.append(f"   ⚠️ rebota sin carril pero SÍ drena por otra vía: "
+                       f"{', '.join(rebotando)} — tiene una herramienta sin migrar")
+        if not mudos:
+            out.append("   ✓ todo rol que consume manda carril alguna vez — la puerta no "
+                       "ha dejado mudo a nadie")
+        out.append(f"      (ventana en memoria: desde {ARRANQUE})")
     else:
         con_c = sum(v[0] for v in foto.values())
         sin_c = sum(v[1] for v in foto.values())
