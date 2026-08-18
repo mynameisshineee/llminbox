@@ -10,6 +10,8 @@ nada — sería una sección que se queja siempre.
 """
 from __future__ import annotations
 
+import re
+
 from conftest import construir
 
 
@@ -308,3 +310,48 @@ def test_un_cero_de_claims_vacios_no_se_lee_como_disciplina_perfecta(cliente):
     s2 = _seccion(_texto(cliente), 3)
     assert "está VACÍA" not in s2
     assert "ninguno pasado de plazo" in s2
+
+
+# ── la tendencia: otra población, no otro número ─────────────────────────────
+
+def test_la_tendencia_excluye_las_sin_fecha_y_lo_dice(tmp_path, monkeypatch):
+    """El titular de ② es un STOCK y no puede moverse: más de la mitad son entradas
+    históricas SIN FECHA. Medido el 2026-08-18, llevaba seis días clavado en 33 %
+    mientras la conducta reciente sí cambiaba (37 % a 30 días → 20 % a 7).
+
+    La cohorte las excluye POR CONSTRUCCIÓN, así que su denominador cae solo. Sin
+    decirlo, el número pequeño se lee como una mejora que nadie ha hecho — es el aviso
+    que pidió `llminbox-a7` al pasar la línea base.
+
+    FALSADOR: una huérfana SIN FECHA tiene que contar en el titular y NO en la
+    tendencia. Si contara en las dos, la cohorte no sería otra población: sería el
+    mismo número con otro nombre.
+    """
+    from datetime import datetime, timedelta, timezone
+    from fastapi.testclient import TestClient
+    hoy = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    s = construir(tmp_path, monkeypatch)
+    (tmp_path / "DEMO-LEDGER.md").write_text(
+        f"### [cto-A → backend · FYI] {hoy} dirigida y fechada\ncuerpo\n"
+        f"### [cto-A · FYI] {hoy} huerfana FECHADA\ncuerpo\n"
+        "### [cto-A · FYI] huerfana SIN FECHA\ncuerpo\n"
+    )
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        sec = _seccion(_texto(c), 2)
+
+    # El titular (stock) cuenta las DOS huérfanas: la fechada y la que no lo está.
+    assert "2 de 4" in sec, sec           # 3 de este ledger + 1 de otro-ledger
+    assert "2 sin sello de hora" in sec
+
+    # La tendencia cuenta SÓLO la fechada.
+    # Anclado al PATRÓN «N de M», no a la posición del token: `split()[2]` cazaba el
+    # «día(s):» porque el propio número de días desplaza las columnas. Es la regla que
+    # tengo escrita para los falsadores sobre salida de herramienta, aplicada aquí.
+    linea = next(l for l in sec.splitlines() if "últimos  2 día(s)" in l)
+    assert re.search(r"\b1 de\s+2 sin dirigir", linea), linea
+
+    # Y lo dice, para que el denominador pequeño no se lea como mejora.
+    assert "EXCLUYE por construcción" in sec
+    assert "no porque el problema encoja" in sec

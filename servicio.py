@@ -3477,6 +3477,37 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
     out.append("   Una entrada sin `→ destinatario` (o sin `@nombre`) no entra en ninguna")
     out.append("   bandeja: se publica en un canal que ya nadie lee entero.")
 
+    # ── LA TENDENCIA, porque el titular de arriba NO PUEDE MOVERSE ───────────
+    # El número de arriba es un STOCK: mide todo lo indexado, y más de la mitad son
+    # entradas históricas sin fecha. Medido el 2026-08-18: llevaba SEIS DÍAS clavado en
+    # el 33 % mientras la conducta reciente sí cambiaba —37 % a 30 días, 20 % a 7—. Un
+    # indicador que no puede moverse enseña a ignorarlo, y de paso deja sin premio a
+    # quien está haciendo el trabajo bien.
+    #
+    # ⚠️ Y va DEBAJO, sin tocar el titular, a propósito: cambiar el número de arriba por
+    # el de la cohorte lo habría «mejorado» de golpe sin que nadie hubiera hecho nada
+    # ese día. Enseñar por qué difieren es el trabajo; sustituirlo sería repetir la
+    # clase de fallo que este informe existe para cazar.
+    out.append("")
+    out.append("   TENDENCIA (sólo entradas FECHADAS — otra población, no otro número):")
+    for dias_v in (30, 7, 2):
+        c_v = (ahora - timedelta(days=dias_v)).isoformat(timespec="seconds")
+        t_v = con.execute("SELECT COUNT(*) n FROM entries WHERE ts>=? AND ausente IS NULL",
+                          (c_v,)).fetchone()["n"]
+        h_v = con.execute(
+            "SELECT COUNT(*) n FROM entries e WHERE e.ts>=? AND e.ausente IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM recipients r WHERE r.ledger=e.ledger AND r.eid=e.eid)",
+            (c_v,)).fetchone()["n"]
+        p_v = f"{100 * h_v // t_v}%" if t_v else "—"
+        out.append(f"     últimos {dias_v:>2} día(s): {h_v:>6} de {t_v:>6} sin dirigir  ({p_v})")
+    # El aviso que impide leer el denominador pequeño como una mejora. Lo pidió
+    # `llminbox-a7` al pasar la línea base, y tiene razón: sin esto parece que el
+    # problema encogió solo cuando lo único que pasó es que se mira otra población.
+    out.append(f"   La cohorte EXCLUYE por construcción las {sin_ts} sin sello de hora, que son")
+    out.append("   más de la mitad del stock: el denominador cae porque se mira otra cosa,")
+    out.append("   no porque el problema encoja. Las dos líneas van juntas mientras el")
+    out.append("   stock siga dominado por historia que ya no se puede arreglar.")
+
     # ── ③ CLAIMS QUE NADIE SOLTÓ ─────────────────────────────────────────────
     # Vencido NO es abandonado: el TTL sólo dice que otro PUEDE relevarte. Lo que se
     # lista es lo que está cogido más tiempo del que dura la garantía, para que el
