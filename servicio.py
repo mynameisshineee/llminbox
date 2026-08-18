@@ -2767,8 +2767,12 @@ def marcar_leido(agent: str, l: Leido,
     # falta que la respuesta traiga el ANTES y el DESPUÉS, y que nombre lo ignorado.
     agent = resolver_o_422(agent)                  # ① — antes de tocar nada más
     canon = clave_cursor(agent)                     # ② — la clave es el ROL, no el nombre
-    anota_consumo(canon, bool(x_llminbox_carril),
-                  datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    # OJO con dónde se cuenta: mandar una cabecera NO es declarar carril. Esto contaba
+    # `bool(x_llminbox_carril)` ANTES de resolverla, así que un `X-Llminbox-Carril:
+    # basura` sumaba a la columna «CON carril» y acto seguido devolvía 422 — y ⑤ podía
+    # publicar su ✓ verde sostenido por peticiones que habían fallado todas. Ahora se
+    # anota el DESENLACE: éxito sólo cuando el carril ya resolvió, y rechazo en las dos
+    # puertas. Quien rebota se sigue nombrando, que era el motivo de contar aquí.
     # ③ fail-closed TAMBIÉN para el carril (hallazgo de fe·bikeus 2026-08-10T17:17Z):
     # una cabecera que no resuelve devolvía `ok:true` y DEGRADABA a consumir TODOS
     # los cursores — justo lo que la cabecera existe para evitar — con la única seña
@@ -2791,6 +2795,8 @@ def marcar_leido(agent: str, l: Leido,
     # `LLMINBOX_CARRIL_OPCIONAL=1` devuelve la conducta vieja para un despliegue sin
     # mapa de carriles, que si no quedaría sin poder marcar leído nada.
     if not x_llminbox_carril and CARRIL_LEDGER and CARRIL_OBLIGATORIO:
+        anota_consumo(canon, False,
+                      datetime.now(timezone.utc).isoformat(timespec="seconds"))
         raise HTTPException(
             422,
             "sin carril declarado no se consume: di de qué carril eres y sólo se "
@@ -2811,11 +2817,15 @@ def marcar_leido(agent: str, l: Leido,
                          "(carriles.tsv): quita la cabecera o móntalo")
             else:
                 pista = ""
+            anota_consumo(canon, False,
+                          datetime.now(timezone.utc).isoformat(timespec="seconds"))
             raise HTTPException(
                 422,
                 f"carril '{x_llminbox_carril}' no resuelve a ningún ledger de este "
                 f"servicio (válidos: {sorted(CARRIL_LEDGER)}){pista}")
     ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Aquí ya no hay puerta que rebote: el carril (si vino) resolvió.
+    anota_consumo(canon, bool(x_llminbox_carril), ahora)
     con = db()
     aplicados, ignorados, retrocedidos, sin_cambio, fuera_de_carril = {}, [], {}, [], []
     try:

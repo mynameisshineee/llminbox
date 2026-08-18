@@ -13,9 +13,24 @@ flota para saber si la puerta está puesta (uvicorn corre sin log de acceso).
 """
 from __future__ import annotations
 
+import pytest
 from conftest import construir
 
 PUERTA = {"LLMINBOX_CARRIL_OBLIGATORIO": "1"}
+
+_ABIERTOS = []
+
+
+@pytest.fixture(autouse=True)
+def _cierra_lifespans():
+    """`TestClient.__enter__()` arranca el lifespan; sin su `__exit__()` el apagado
+    NO corre y cada test deja un servicio a medio cerrar (CodeRabbit, #4). Se cierran
+    en orden inverso al de apertura, que es el que espera un gestor de contexto."""
+    _ABIERTOS.clear()
+    yield
+    for c in reversed(_ABIERTOS):
+        c.__exit__(None, None, None)
+    _ABIERTOS.clear()
 
 
 def _cliente(tmp_path, monkeypatch, extra_env=None):
@@ -29,6 +44,7 @@ def _cliente(tmp_path, monkeypatch, extra_env=None):
     s = construir(tmp_path, monkeypatch, extra_env=extra_env)
     c = TestClient(s.app)
     c.__enter__()
+    _ABIERTOS.append(c)
     s.barrido()
     c.headers.update({"X-Llminbox-Token": "test-token"})
     return s, c
@@ -209,3 +225,24 @@ def test_cursor_con_updated_nulo_tampoco_se_fecha(tmp_path, monkeypatch):
     parado = [x for x in t.splitlines() if "sin drenar desde hace" in x]
     assert not parado or "cto" not in parado[0], "updated NULL no fecha nada"
     assert any("nunca ha drenado" in x and "cto" in x for x in t.splitlines())
+
+
+def test_un_carril_INVALIDO_no_cuenta_como_consumo_con_carril(tmp_path, monkeypatch):
+    """FALSADOR (CodeRabbit, #4): mandar una cabecera de carril NO es declarar carril.
+
+    `anota_consumo()` corría antes de RESOLVER el carril, así que
+    `X-Llminbox-Carril: no-existe` incrementaba la columna «CON carril» y acto seguido
+    devolvía 422. Con eso, ⑤ podía publicar su ✓ verde —«todo rol que consume manda
+    carril»— sostenido por peticiones que fallaron TODAS. Es el mismo error que este
+    fichero arregla una capa más afuera: contar el intento como si fuera el efecto.
+    """
+    _, c = _cliente(tmp_path, monkeypatch, PUERTA)
+    r = c.post("/inbox/backend/leido", json={"hasta": {}},
+               headers={"X-Llminbox-Carril": "carril-que-no-existe"})
+    assert r.status_code == 422
+    assert "no resuelve" in r.json()["detail"]
+
+    t = c.get("/doctor").text
+    assert "0 consumo(s) CON carril" in t, "un 422 no es un consumo"
+    assert "1 RECHAZADO" in t
+    assert "✓ todo rol que consume manda carril" not in t, "el verde no puede salir de un 422"
