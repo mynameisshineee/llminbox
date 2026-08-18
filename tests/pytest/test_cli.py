@@ -237,3 +237,70 @@ def test_sin_tmux_el_cli_no_cambia_de_conducta(stub, tmp_path):
                        env={**env, "HOME": str(tmp_path), "PATH": "/usr/bin:/bin",
                             "LLMINBOX_API": f"http://127.0.0.1:{stub.server_port}"})
     assert r.returncode == 2
+
+
+# ── la forma GNU: pedir ayuda es un uso CORRECTO ─────────────────────────────
+# `llmi --help` salía con rc=2 («mal uso») y la ayuda por stdout, y el mal uso
+# TAMBIÉN por stdout. Las dos mitades del contrato estaban cruzadas, y no es
+# cosmética: `llmi --help || die` mataba el script en el caso bueno, y
+# `llmi inbox 2>/dev/null | procesa` se comía la pantalla de uso como si fuera
+# datos. La prueba de que dolió está en la propia BD de producción: entre los
+# 101 nombres FUERA DEL CENSO con bandeja hay uno llamado `--help` — alguien
+# escribió `llmi inbox --help` y el CLI lo tomó por el nombre de un agente.
+
+def test_ayuda_pedida_sale_por_stdout_con_rc_0(tmp_path):
+    """FALSADOR: hoy `--help` sale rc=2. Y el puerto muerto prueba lo segundo —
+    si la ayuda tocara la red, esto sería rc=3."""
+    r = _llmi(["--help"], tmp_path, "http://127.0.0.1:1")
+    assert r.returncode == 0
+    assert "llmi — consulta la red de ledgers" in r.stdout
+    assert r.stderr == ""
+
+
+def test_sin_comando_es_mal_uso_y_no_ensucia_stdout(tmp_path):
+    """La otra mitad: invocar sin comando SÍ es mal uso — rc=2 y la pantalla por
+    stderr, para que un `llmi ... | procesa` no la lea como datos.
+
+    FALSADOR: hoy la misma llamada imprime el uso por STDOUT; la aserción de
+    stdout vacío cae."""
+    r = _llmi([], tmp_path, "http://127.0.0.1:1")
+    assert r.returncode == 2
+    assert r.stdout == ""
+    assert "llmi — consulta la red de ledgers" in r.stderr
+
+
+def test_comando_desconocido_tambien_por_stderr(tmp_path):
+    """Control de que lo anterior no es un caso suelto: TODO mal uso va a stderr."""
+    r = _llmi(["nombre-que-no-existe"], tmp_path, "http://127.0.0.1:1")
+    assert r.returncode == 2
+    assert r.stdout == ""
+    assert "comando desconocido" in r.stderr
+
+
+def test_ayuda_de_subcomando_no_se_toma_por_un_nombre_de_agente(tmp_path):
+    """El mecanismo que metió `--help` en el censo de producción: `llmi inbox
+    --help` caía en el bucle de argumentos, `--help` acababa en `args` y salía
+    pedido como `/inbox/--help`.
+
+    FALSADOR con puerto muerto: si `--help` volviera a tratarse como nombre, el
+    CLI intentaría hablar con el servicio y saldría rc=3 «no responde». rc=0 sin
+    tocar la red es la única forma de pasar."""
+    for sub in ("inbox", "peek", "to"):
+        r = _llmi([sub, "--help"], tmp_path, "http://127.0.0.1:1")
+        assert r.returncode == 0, f"{sub} --help → rc={r.returncode}: {r.stderr}"
+        assert "llmi — consulta la red de ledgers" in r.stdout
+        assert "no responde" not in r.stderr
+
+
+def test_peek_mal_uso_no_se_disfraza_de_servicio_caido(tmp_path):
+    """`peek` comprobaba que el servicio estaba vivo ANTES de mirar sus propios
+    argumentos, al revés que `inbox`. Con el servicio caído, `peek --carril` (sin
+    valor) contestaba rc=3 «no responde»: culpaba al contenedor de un error de
+    teclado, y el rc=2 que este PR acaba de fijar no llegaba a existir.
+
+    FALSADOR: devolver el `vivo` a su sitio anterior da rc=3 y las dos
+    aserciones de abajo caen a la vez."""
+    r = _llmi(["peek", "--carril"], tmp_path, "http://127.0.0.1:1")
+    assert r.returncode == 2
+    assert "--carril necesita un valor" in r.stderr
+    assert "no responde" not in r.stderr

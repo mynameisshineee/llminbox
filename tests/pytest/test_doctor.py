@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import re
 
-from conftest import construir
+from conftest import construir, db_directa
+from fastapi.testclient import TestClient
 
 
 def _texto(cliente, **params):
@@ -355,3 +356,166 @@ def test_la_tendencia_excluye_las_sin_fecha_y_lo_dice(tmp_path, monkeypatch):
     # Y lo dice, para que el denominador pequeño no se lea como mejora.
     assert "EXCLUYE por construcción" in sec
     assert "no porque el problema encoja" in sec
+
+
+# ── ① el orden: la deuda de quien NUNCA drenó no es deuda de nadie ───────────
+# Medido contra la flota real (2026-08-18): de las 8 primeras filas de ①, las 8
+# tenían CERO cursores — nadie había consumido jamás por esos nombres. Cuatro
+# salían marcadas (`ALBERT`/`Patxi` humanos, `flota`/`TODOS` difusión) y cuatro
+# no (`destilador`, `Lead`, `Lead-cfo-cockpit`, `code-reviewer-biklabs`), pero
+# las ocho ocupaban la cabecera con ~62.000 pendientes entre todas. El informe ya
+# IMPRIME el dato que las separa —«último consumo: nunca»— y no lo usaba para
+# nada: ni para ordenar ni para marcar. Las dos marcas que sí existían eran una
+# enumeración a mano de un hecho que el dato da entero.
+
+def _monta(tmp_path, monkeypatch, reparto):
+    """Un servicio con `reparto` = {nombre: nº de entradas dirigidas a él}.
+
+    Cada agente lleva su propio rol (== su nombre) para que ① no los agrupe, y
+    el autor `cto-A` no recibe nada: sólo firma.
+    """
+    roster = {"agentes": [{"nombre": "cto-A", "humano": "albert", "clave": "", "rol": "cto"}]
+                         + [{"nombre": n, "humano": "albert", "clave": "", "rol": n}
+                            for n in reparto],
+              "humanos": [{"nombre": "albert", "alias": ["Albert"]}],
+              "difusion": ["equipo"]}
+    s = construir(tmp_path, monkeypatch, roster=roster)
+    # El ledger se reescribe ENTERO: el de `construir` dirige todo a `backend`,
+    # que aquí no está censado y ensuciaría el recuento.
+    (tmp_path / "DEMO-LEDGER.md").write_text("".join(
+        f"### [cto-A → {n} · REQUEST] {n} numero {i}\ncuerpo\n"
+        for n, k in reparto.items() for i in range(k)))
+    (tmp_path / "OTRO-LEDGER.md").write_text("### [cto-A · FYI] sin dirigir\ncuerpo\n")
+    return s
+
+
+def _filas_de_1(txt):
+    """Los nombres de ①, EN ORDEN. Una fila se reconoce por su FORMA —nombre y
+    número de pendientes— y no por «empieza con tres espacios»: la prosa del pie
+    también sangra, y con ese filtro el helper colaba `alto` (de «…un número alto
+    con consumo reciente…») como si fuera un agente. Un parser de arnés laxo
+    afirma de más igual que el código que mide."""
+    return [m.group(1) for m in
+            re.finditer(r"^ {3}(\S+)\s+\d+\s{2}", _seccion(txt, 1), re.M)]
+
+
+def _mira_todos(c, nombres):
+    for n in nombres:
+        c.get(f"/inbox/{n}")
+
+
+def test_quien_nunca_ha_consumido_cae_por_debajo_del_que_si_drena(tmp_path, monkeypatch):
+    """LA PROPIEDAD: `drena` tiene MENOS pendientes que `moroso`, y aun así va
+    primero — porque de `moroso` no hay nadie de quien esperar que drene.
+
+    FALSADOR: el `filas.sort(reverse=True)` de antes ordenaba por pendientes a
+    secas; con él, `moroso` (2) sale por encima de `drena` (1) y esto cae."""
+    s = _monta(tmp_path, monkeypatch, {"moroso": 2, "drena": 2})
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        _mira_todos(c, ("moroso", "drena"))
+        con = db_directa(s)
+        arr = [r[0] for r in con.execute(
+            "SELECT e.arrival FROM entries e JOIN recipients r "
+            "ON r.ledger=e.ledger AND r.eid=e.eid "
+            "WHERE r.who='drena' ORDER BY e.arrival")]
+        assert len(arr) == 2, arr           # el arnés fija lo que la aserción usa
+        c.post("/inbox/drena/leido", json={"hasta": {"demo-ledger": arr[0]}})
+        s.barrido()
+        filas = _filas_de_1(_texto(c))
+    assert filas.index("drena") < filas.index("moroso"), filas
+
+
+def test_entre_los_que_drenan_sigue_mandando_la_deuda(tmp_path, monkeypatch):
+    """CONTROL de que el fix no se lleva por delante el ranking: con los dos
+    cursores vivos, el que más debe sigue arriba.
+
+    FALSADOR: si el orden pasara a ser SÓLO «¿tiene cursor?», los empates
+    quedarían al azar del nombre y `mucho` caería debajo de `poco`."""
+    s = _monta(tmp_path, monkeypatch, {"mucho": 3, "poco": 3})
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        _mira_todos(c, ("mucho", "poco"))
+        con = db_directa(s)
+        arr = {q: [r[0] for r in con.execute(
+            "SELECT e.arrival FROM entries e JOIN recipients r "
+            "ON r.ledger=e.ledger AND r.eid=e.eid "
+            "WHERE r.who=? ORDER BY e.arrival", (q,))] for q in ("mucho", "poco")}
+        c.post("/inbox/mucho/leido", json={"hasta": {"demo-ledger": arr["mucho"][0]}})
+        c.post("/inbox/poco/leido", json={"hasta": {"demo-ledger": arr["poco"][1]}})
+        s.barrido()
+        txt = _texto(c)
+    filas = _filas_de_1(txt)
+    assert filas.index("mucho") < filas.index("poco"), txt
+
+
+def test_la_bandeja_que_nadie_ha_drenado_nunca_sale_marcada(tmp_path, monkeypatch):
+    """La marca dice lo que el DATO sostiene («no hay cursor suyo»), no lo que a
+    mí me consta por fuera («no lo corre nadie»): el servicio no sabe qué
+    sesiones están vivas y no puede afirmarlo.
+
+    FALSADOR doble: sin la marca, la fila de `moroso` es indistinguible de la de
+    un agente al día; y si la marca se pusiera a todos, `drena` la llevaría."""
+    s = _monta(tmp_path, monkeypatch, {"moroso": 2, "drena": 2})
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        _mira_todos(c, ("moroso", "drena"))
+        con = db_directa(s)
+        arr = [r[0] for r in con.execute(
+            "SELECT e.arrival FROM entries e JOIN recipients r "
+            "ON r.ledger=e.ledger AND r.eid=e.eid "
+            "WHERE r.who='drena' ORDER BY e.arrival")]
+        c.post("/inbox/drena/leido", json={"hasta": {"demo-ledger": arr[0]}})
+        s.barrido()
+        sec = _seccion(_texto(c), 1)
+    l_moroso = next(l for l in sec.splitlines() if l.strip().startswith("moroso "))
+    l_drena = next(l for l in sec.splitlines() if l.strip().startswith("drena "))
+    assert "nunca ha consumido" in l_moroso, l_moroso
+    assert "nunca ha consumido" not in l_drena, l_drena
+
+
+def test_el_corte_de_veinte_dice_cuantas_filas_esconde(tmp_path, monkeypatch):
+    """① anuncia N agentes y lista 20. Con 21, cinco filas desaparecían sin una
+    palabra — y el reordenado de arriba cambia CUÁLES desaparecen, así que
+    callarlo pasa de descuido a mentira.
+
+    FALSADOR: sin la línea del corte, la cabecera dice 21 y se leen 20."""
+    s = _monta(tmp_path, monkeypatch, {f"a{i:02d}": 1 for i in range(21)})
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        _mira_todos(c, [f"a{i:02d}" for i in range(21)])
+        s.barrido()
+        sec = _seccion(_texto(c), 1)
+    assert "21 agente(s)" in sec, sec
+    assert len(_filas_de_1(_texto(c))) == 20
+    assert "1 fila(s) más" in sec, sec
+
+
+def test_un_cursor_sin_sello_sigue_siendo_un_cursor(tmp_path, monkeypatch):
+    """`cursors.updated` es NULLABLE. Medir la EXISTENCIA de cursor con
+    `MAX(updated)` confunde «no hay fila» con «hay fila sin sello», y entonces la
+    marca afirma «no existe ningún cursor suyo» de alguien que sí lo tiene — el
+    mismo defecto que este cambio venía a arreglar, cometido al arreglarlo.
+
+    (Medido: 0 de 132 cursores de producción tienen `updated` NULL hoy. El
+    esquema lo permite y la frase lo afirma; se mide lo que se dice.)
+
+    FALSADOR: volver a `ult is not None` como campo de existencia marca a
+    `conSello` como si no tuviera cursor y esto se pone rojo."""
+    s = _monta(tmp_path, monkeypatch, {"conSello": 2})
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        c.get("/inbox/conSello")
+        con = db_directa(s)
+        con.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?)",
+                    ("conSello", "demo-ledger", -1, None))   # fila SIN sello
+        con.commit()
+        s.barrido()
+        sec = _seccion(_texto(c), 1)
+    linea = next(l for l in sec.splitlines() if l.strip().startswith("conSello "))
+    assert "no existe ningún cursor" not in linea, linea
