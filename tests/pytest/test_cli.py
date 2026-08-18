@@ -290,3 +290,17 @@ def test_ayuda_de_subcomando_no_se_toma_por_un_nombre_de_agente(tmp_path):
         assert r.returncode == 0, f"{sub} --help → rc={r.returncode}: {r.stderr}"
         assert "llmi — consulta la red de ledgers" in r.stdout
         assert "no responde" not in r.stderr
+
+
+def test_peek_mal_uso_no_se_disfraza_de_servicio_caido(tmp_path):
+    """`peek` comprobaba que el servicio estaba vivo ANTES de mirar sus propios
+    argumentos, al revés que `inbox`. Con el servicio caído, `peek --carril` (sin
+    valor) contestaba rc=3 «no responde»: culpaba al contenedor de un error de
+    teclado, y el rc=2 que este PR acaba de fijar no llegaba a existir.
+
+    FALSADOR: devolver el `vivo` a su sitio anterior da rc=3 y las dos
+    aserciones de abajo caen a la vez."""
+    r = _llmi(["peek", "--carril"], tmp_path, "http://127.0.0.1:1")
+    assert r.returncode == 2
+    assert "--carril necesita un valor" in r.stderr
+    assert "no responde" not in r.stderr

@@ -771,7 +771,11 @@ except Exception: print(open(sys.argv[1]).read(), file=sys.stderr)' "$cuerpo_pos
   peek)   YO_DERIVADO=""; CARRIL_DERIVADO=""
           _aviso_identidad "${1:-}"
           [ $# -ge 1 ] || { [ -n "$YO_DERIVADO" ] && set -- "$YO_DERIVADO" || { mal_uso; }; }
-          vivo || { sin_servicio; exit 3; }
+          # El `vivo` iba AQUÍ, antes de mirar los propios argumentos — al revés
+          # que `inbox`. Con el servicio caído, `peek --carril` (sin valor)
+          # contestaba «no responde»: culpaba al contenedor de un error de
+          # teclado, y el rc=2 de mal uso no llegaba a existir. Primero se valida
+          # lo que uno controla; sólo después se llama a la puerta.
           carril="${BIK_CARRIL:-$CARRIL_DERIVADO}"; args=()
           while [ $# -gt 0 ]; do
             case "$1" in
@@ -782,6 +786,7 @@ except Exception: print(open(sys.argv[1]).read(), file=sys.stderr)' "$cuerpo_pos
           done
           set -- "${args[@]}"
           [ $# -ge 1 ] || { mal_uso; }
+          vivo || { sin_servicio; exit 3; }
           # PARED DE CARRIL EN LA BANDEJA (vision-canon 2026-08-14, MARK:vision-canon-
           # la-bandeja-entrega-ocho-ledgers-y-el-hook-no-lo-ve): con carril declarado
           # el GET pasa only=<ledger> — 8 ledgers servidos y 7 ajenos era la puerta

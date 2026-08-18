@@ -493,3 +493,29 @@ def test_el_corte_de_veinte_dice_cuantas_filas_esconde(tmp_path, monkeypatch):
     assert "21 agente(s)" in sec, sec
     assert len(_filas_de_1(_texto(c))) == 20
     assert "1 fila(s) más" in sec, sec
+
+
+def test_un_cursor_sin_sello_sigue_siendo_un_cursor(tmp_path, monkeypatch):
+    """`cursors.updated` es NULLABLE. Medir la EXISTENCIA de cursor con
+    `MAX(updated)` confunde «no hay fila» con «hay fila sin sello», y entonces la
+    marca afirma «no existe ningún cursor suyo» de alguien que sí lo tiene — el
+    mismo defecto que este cambio venía a arreglar, cometido al arreglarlo.
+
+    (Medido: 0 de 132 cursores de producción tienen `updated` NULL hoy. El
+    esquema lo permite y la frase lo afirma; se mide lo que se dice.)
+
+    FALSADOR: volver a `ult is not None` como campo de existencia marca a
+    `conSello` como si no tuviera cursor y esto se pone rojo."""
+    s = _monta(tmp_path, monkeypatch, {"conSello": 2})
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        c.get("/inbox/conSello")
+        con = db_directa(s)
+        con.execute("INSERT OR REPLACE INTO cursors VALUES (?,?,?,?)",
+                    ("conSello", "demo-ledger", -1, None))   # fila SIN sello
+        con.commit()
+        s.barrido()
+        sec = _seccion(_texto(c), 1)
+    linea = next(l for l in sec.splitlines() if l.strip().startswith("conSello "))
+    assert "no existe ningún cursor" not in linea, linea

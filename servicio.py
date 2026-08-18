@@ -3390,8 +3390,15 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
                 "AND e.arrival>? AND e.ausente IS NULL",
                 (name, *nombres, c["last_arrival"] if c else -1)).fetchone()["n"]
         if pend:
-            ult = con.execute("SELECT MAX(updated) u FROM cursors WHERE agent=?",
-                              (clave_cursor(a),)).fetchone()["u"]
+            # Dos hechos DISTINTOS en una sola consulta: cuándo fue el último
+            # consumo (para la columna) y si EXISTE fila de cursor (para el orden
+            # y para la marca). `updated` es NULLABLE, así que `MAX(updated) IS
+            # NULL` confunde «no hay cursor» con «hay cursor sin sello» — y la
+            # marca afirma lo primero. Hoy son 0 de 132 en producción: el esquema
+            # lo permite y la frase lo afirma, así que se mide lo que se dice.
+            cur = con.execute("SELECT MAX(updated) u, COUNT(*) n FROM cursors WHERE agent=?",
+                              (clave_cursor(a),)).fetchone()
+            ult = cur["u"]
             # Se guarda si el REPRESENTANTE está censado, no el rol: `CANON` tiene
             # nombres (`backend`, `qa-2`) y aquí se agrupa por rol (`be`, `qa`), así
             # que preguntar por el rol contestaba «fuera del censo» a TODO el mundo.
@@ -3407,7 +3414,7 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
                           (ult[:16] if ult else "nunca"), a.lower() in lp.CANON,
                           "difusion" if a.lower() in lp.DIFSET
                           else "humano" if a.lower() not in lp.DUENO else "agente",
-                          ult is not None))
+                          bool(cur["n"])))
     # Los nombres FUERA DEL CENSO van aparte, y no es cosmética: la primera corrida
     # contra la flota real sacó 11 `zzz-*` —restos de pruebas de otros— entre los 20
     # primeros, cada uno con su deuda de 433, empujando fuera a los agentes de verdad.
@@ -3417,7 +3424,7 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
     # morosos: es una lista de lo que alguien tecleó alguna vez.
     fantasmas = [f for f in filas if not f[4]]
     filas = [f for f in filas if f[4]]
-    # Ordena PRIMERO por «¿ha consumido alguna vez?» y después por deuda. Medido
+    # Ordena PRIMERO por «¿existe un cursor suyo?» y después por deuda. Medido
     # contra la flota real: las 8 primeras filas eran las 8 que tenían CERO
     # cursores —dos humanos, dos alias de difusión y cuatro nombres de agente sin
     # nadie detrás—, con ~62.000 pendientes entre todas empujando hacia abajo a
@@ -3461,7 +3468,7 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
         # descuido; con el orden de arriba pasa a mentira, porque cambia CUÁLES
         # se quedan fuera. Un corte que no se dice se lee como «esto es todo».
         out.append(f"   … y {len(filas) - 20} fila(s) más sin listar: la cola de este"
-                   " orden (primero quien sí drena, por deuda).")
+                   " orden (primero quien TIENE cursor, por deuda).")
     if not filas:
         out.append("   (nadie tiene correo dirigido sin consumir)")
     # ⚠️ EL PENDIENTE CRUZA CARRILES Y EL CONSUMO NO, y sin decirlo esta sección
