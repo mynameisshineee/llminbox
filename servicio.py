@@ -1485,7 +1485,13 @@ def anota_consumo(rol: str, con_carril: bool, ahora_iso: str) -> None:
         v = CONSUMOS.setdefault(rol, [0, 0, ahora_iso, ""])
         v[0 if con_carril else 1] += 1
         v[2] = ahora_iso
-        if con_carril:
+        # MONOTÓNICO a propósito (CodeRabbit, #5): `ahora_iso` se calcula FUERA del
+        # lock, así que dos peticiones concurrentes del mismo rol pueden entrar en
+        # orden inverso al de su sello y hacer RETROCEDER el acierto — y un acierto
+        # que retrocede es justo lo que hace que ⑤ clasifique como viejo algo
+        # reciente. (`v[2]` tiene la misma carrera y se deja: no decide nada, sólo
+        # se guarda; si algún día decide, hay que darle esta misma guarda.)
+        if con_carril and (not v[3] or ahora_iso > v[3]):
             v[3] = ahora_iso
 
 
