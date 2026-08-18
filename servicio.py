@@ -3788,6 +3788,61 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
         else:
             out.append("   ✓ ningún rol consume sólo sin carril — se puede plantear "
                        "encender LLMINBOX_CARRIL_OBLIGATORIO=1")
+    # ── ⑥ IDENTIDADES SIN GOBIERNO ───────────────────────────────────────────
+    # La pregunta: ¿qué nombres puede AUTENTICAR este servicio que el organigrama
+    # firmado no declara — y al revés? Medido el 2026-08-18: `roles-por-alias.json`
+    # declara 16 roles, `roster.json` declara 31, y `canon_identidad()` resuelve por
+    # la UNIÓN de los dos. Resultado: 16 nombres que pasan la puerta fail-closed,
+    # reciben correo, y no tienen jefe, ni gate, ni humano responsable.
+    #
+    # ESTA SECCIÓN ENCUENTRA; NO ADJUDICA. El tipo sale `UNCLASSIFIED` y se queda
+    # así. Inferirlo por el nombre —«`destilador` suena a servicio»— sería que el
+    # software se invente el organigrama, que es el problema que esto denuncia, no
+    # su solución. Se enseñan HECHOS que el servicio puede sostener, y ya.
+    out.append("")
+    if not lp.JERARQUIA:
+        # Sin la fuente firmada montada, comparar contra una jerarquía vacía diría
+        # que NADIE está gobernado: 31 acusaciones falsas de golpe. Un informe
+        # catastrofista se deja de leer, y con razón.
+        out.append("⑥ IDENTIDADES SIN GOBIERNO — organigrama NO montado, no se "
+                   "puede decidir quién está gobernado")
+    else:
+        alias_de: dict[str, list[str]] = {}
+        for alias, rol in lp.ROL_DE.items():
+            alias_de.setdefault(rol, []).append(alias)
+        en_censo, en_org = set(alias_de), set(lp.JERARQUIA)
+        # Las DOS direcciones. La inversa (`censo: no`) es la que rompe de verdad:
+        # existe en el organigrama, se le puede asignar trabajo, y su bandeja
+        # contesta 422. Está medida en producción con `engineering-manager`.
+        huerfanos = sorted(en_censo ^ en_org)
+        out.append(f"⑥ IDENTIDADES SIN GOBIERNO — {len(huerfanos)} principal(es) que "
+                   f"el censo y el organigrama no declaran igual")
+        out.append(f"   {'principal':<24}{'censo':<7}{'organigrama':<13}"
+                   f"{'alias':>5}  {'cursor':<8}{'correo':<8}tipo")
+        for rol in huerfanos[:25]:
+            al = alias_de.get(rol, [])
+            cur = con.execute("SELECT COUNT(*) n FROM cursors WHERE agent=?",
+                              (rol,)).fetchone()["n"]
+            correo = 0
+            if al:
+                marcas = ",".join("?" * len(al))
+                correo = con.execute(
+                    f"SELECT COUNT(*) n FROM recipients WHERE lower(who) IN ({marcas})",
+                    tuple(a.lower() for a in al)).fetchone()["n"]
+            out.append(f"   {rol:<24}{'sí' if rol in en_censo else 'no':<7}"
+                       f"{'sí' if rol in en_org else 'no':<13}{len(al):>5}  "
+                       f"{'sí' if cur else 'no':<8}{'sí' if correo else 'no':<8}"
+                       f"UNCLASSIFIED")
+        if len(huerfanos) > 25:
+            out.append(f"   … y {len(huerfanos) - 25} fila(s) más sin listar "
+                       f"(cola del orden alfabético)")
+        if huerfanos:
+            out.append("   `censo: no` es el caso que ROMPE: está en el organigrama y "
+                       "su bandeja contesta 422.")
+            out.append("   El tipo lo adjudica el operador — esto encuentra, no "
+                       "clasifica.")
+        else:
+            out.append("   (censo y organigrama declaran exactamente los mismos roles)")
     con.close()
     return "\n".join(out) + "\n"
 
