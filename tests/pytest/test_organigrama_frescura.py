@@ -186,7 +186,10 @@ def test_una_fuente_con_forma_ajena_no_revienta_ni_pierde_lo_bueno(tmp_path, mon
         ruta.write_text("[]")                    # JSON válido, organigrama no
         d = _org(c)
     assert d["stale"] is True, d
-    assert d["jerarquia"], "tiró la jerarquía buena por un fichero con forma rara"
+    # LA JERARQUÍA EXACTA, no «no vacía». Una regresión que sustituyera el estado
+    # bueno por otro mapa cualquiera pasaba la versión anterior de esta aserción:
+    # medía que hubiera ALGO, no que fuera lo correcto.
+    assert d["jerarquia"] == ORG_INICIAL["jerarquia"], d["jerarquia"]
     assert d["aviso"] and "rancio" in d["aviso"].lower()
 
 
@@ -210,16 +213,22 @@ def test_la_respuesta_sale_de_UNA_instantanea(tmp_path, monkeypatch):
 
     def refresca_y_pisa():
         foto = real()
+        # SE PISAN LOS CUATRO. Pisar sólo `JERARQUIA` y `ORG_SHA` dejaba pasar un
+        # endpoint que releyera `ORG_REVISION` o `ORG_CARGADO_EN` de los globales:
+        # el test cubría dos campos de la instantánea y afirmaba cubrirla entera.
         lp.JERARQUIA = {"PISADO-POR-OTRO-HILO": {"reporta_a": "nadie"}}
         lp.ORG_SHA = "hash-de-otra-revision"
+        lp.ORG_REVISION = "revision-de-otro-hilo"
+        lp.ORG_CARGADO_EN = "1999-01-01T00:00:00+00:00"
         return foto
 
     monkeypatch.setattr(lp, "refrescar_organigrama", refresca_y_pisa)
     with _cliente(s) as c:
         d = _org(c)
-    assert "PISADO-POR-OTRO-HILO" not in d["jerarquia"], d
+    assert d["jerarquia"] == ORG_INICIAL["jerarquia"], d["jerarquia"]
     assert d["loaded_sha256"] != "hash-de-otra-revision", d
-    assert "be" in d["jerarquia"], d
+    assert d["revision"] != "revision-de-otro-hilo", d
+    assert d["cargado_en"] != "1999-01-01T00:00:00+00:00", d
 
 
 def test_sin_carga_valida_no_se_finge_una_hora(tmp_path, monkeypatch):
