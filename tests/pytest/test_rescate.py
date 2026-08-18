@@ -40,13 +40,14 @@ def test_las_columnas_declaradas_existen_de_verdad(servicio):
     `OperationalError` que se traga el `except` de al lado: el rescate 'funciona' y no
     trae nada. Se comprueba contra el esquema real, no contra la memoria de quien lo
     escribió."""
-    con = sqlite3.connect(":memory:")
-    con.executescript(servicio.SCHEMA)
-    for tabla, cols in servicio.TABLAS_RESCATADAS:
-        reales = {r[1] for r in con.execute(f"PRAGMA table_info({tabla})")}
-        pedidas = set(cols.split(","))
+    # Contra el esquema COMPLETO (SCHEMA + ALTERs), no contra `SCHEMA` a secas: dos de
+    # las columnas rescatadas se añaden por ALTER y comparar sólo con el CREATE TABLE
+    # las daba por inexistentes — un rojo que acusaba a la lista teniendo razón ella.
+    cols = _esquema_completo(servicio)
+    for tabla, declaradas in servicio.TABLAS_RESCATADAS:
+        pedidas = set(declaradas.split(","))
+        reales = cols.get(tabla, set())
         assert pedidas <= reales, f"{tabla}: no existen {sorted(pedidas - reales)}"
-    con.close()
 
 
 def test_los_claims_sobreviven_a_una_reconstruccion(cliente, servicio):
@@ -69,3 +70,68 @@ def test_los_claims_sobreviven_a_una_reconstruccion(cliente, servicio):
     fila = con.execute("SELECT tema, rol, agent FROM claims").fetchall()
     con.close()
     assert [tuple(r) for r in fila] == [("no_me_pierdas", "ejecuta", "be")], fila
+
+
+# ── el mismo guarda, una capa más abajo: COLUMNAS ────────────────────────────
+
+# Columnas que a propósito NO se rescatan, cada una con su motivo. Es una lista de
+# EXCEPCIONES declaradas, no un cajón: quien añada una columna nueva tiene que
+# rescatarla o justificarla aquí, y eso es justo lo que se quiere que cueste.
+NO_SE_RESCATAN = {
+    ("incidencias", "id"),   # AUTOINCREMENT: lo pone la base nueva, copiarlo no aporta
+}
+
+
+def _esquema_completo(servicio):
+    """El esquema tal y como existe EN PRODUCCIÓN: `SCHEMA` más los ALTERs del
+    arranque. Comparar sólo contra `SCHEMA` mira a un esquema que no existe en
+    ninguna máquina — `claims.motivo` y `claims.cerrado_por` se añaden por ALTER, así
+    que una comprobación ingenua no las vería y daría verde justo sobre el hueco."""
+    import sqlite3
+    con = sqlite3.connect(":memory:")
+    con.executescript(servicio.SCHEMA)
+    for tabla, col, tipo in servicio.COLUMNAS_ANADIDAS:
+        # Con su `except`, igual que producción: una columna puede estar en el CREATE
+        # TABLE **y** en la lista de ALTERs a la vez (`coste.maximo` lo está: en el
+        # esquema para las bases nuevas, en el ALTER para las que se crearon antes).
+        # Un ayudante de test que no tolere lo que el servicio tolera mide un esquema
+        # que no existe, y falla por su propia rigidez.
+        try:
+            con.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {tipo}")
+        except sqlite3.OperationalError:
+            pass
+    cols = {t: {r[1] for r in con.execute(f"PRAGMA table_info({t})")}
+            for t in re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", servicio.SCHEMA)}
+    con.close()
+    return cols
+
+
+def test_rescate_no_se_deja_columnas(servicio):
+    """El guarda de tablas comparaba TABLAS y por eso esto le pasaba por debajo:
+    `coste` estaba rescatada y su columna `maximo` volvía a 0 en cada cura; `claims`
+    perdía `motivo` y `cerrado_por` — las dos que existen para distinguir «lo cerró su
+    dueño» de «se lo relevaron». El dato que mide la disciplina, borrado por la cura.
+
+    FALSADOR: quitar `maximo` de la lista de `coste` tiene que poner esto rojo con su
+    nombre. Es el estado exacto en que estuvo el repo hasta hoy.
+    """
+    cols = _esquema_completo(servicio)
+    faltan = {}
+    for tabla, declaradas in servicio.TABLAS_RESCATADAS:
+        reales = cols.get(tabla, set())
+        sueltas = reales - set(declaradas.split(",")) - {c for t, c in NO_SE_RESCATAN if t == tabla}
+        if sueltas:
+            faltan[tabla] = sorted(sueltas)
+    assert not faltan, (
+        f"columnas que existen y no se rescatan: {faltan} — se pierden en la próxima "
+        "reconstrucción. Añádelas a TABLAS_RESCATADAS o decláralas en NO_SE_RESCATAN.")
+
+
+def test_las_columnas_del_alter_tambien_se_rescatan(servicio):
+    """CONTROL DIRIGIDO al caso que se escapó: las columnas que NO están en el
+    `CREATE TABLE` sino en un `ALTER` posterior son las más fáciles de olvidar —no se
+    ven leyendo el esquema— y son, por definición, las más nuevas."""
+    for tabla, col, _ in servicio.COLUMNAS_ANADIDAS:
+        declaradas = dict((t, c) for t, c in servicio.TABLAS_RESCATADAS).get(tabla)
+        assert declaradas is not None, f"{tabla} no se rescata en absoluto"
+        assert col in declaradas.split(","), f"{tabla}.{col} se añade por ALTER y no se rescata"

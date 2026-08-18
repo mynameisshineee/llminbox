@@ -624,12 +624,32 @@ def es_corrupcion(e: BaseException) -> bool:
 # abiertos— mientras `/doctor ③` publicaba «0 sin cerrar ni relevar», la mejor nota
 # posible. Fuera, la puede enumerar un test contra el esquema
 # (`test_rescate_cubre_lo_no_derivable`) y el olvido se convierte en rojo.
+# Columnas que se añaden por ALTER a tablas que YA existen (ver el bucle del arranque:
+# `executescript(SCHEMA)` con `IF NOT EXISTS` no añade columnas a una tabla creada).
+# Vive aquí, y no dentro de la función, por el mismo motivo que la lista de abajo: para
+# que un test pueda montar el esquema COMPLETO —SCHEMA + estos ALTERs— y comprobar que
+# el rescate no se deja ninguna. Sin eso, `PRAGMA table_info` sobre una base recién
+# creada del SCHEMA no las ve, y una comprobación de columnas mira a un esquema que en
+# producción no existe.
+COLUMNAS_ANADIDAS = (("coste", "maximo", "INTEGER DEFAULT 0"),
+                     ("claims", "motivo", "TEXT"),
+                     ("claims", "cerrado_por", "TEXT"))
+
 DERIVADAS = ("entries", "recipients", "files", "pages", "citas")
+# ⚠️ LAS COLUMNAS SE ENUMERAN, y la lista de columnas se queda vieja igual que se
+# quedó la de tablas — una capa más abajo y por el mismo motivo. Estuvo así: `coste`
+# rescatada pero su `maximo` volviendo a 0 en cada cura, y `claims.motivo` /
+# `claims.cerrado_por` —las dos columnas que existen para distinguir «lo cerró su
+# dueño» de «se lo relevaron»— perdiéndose enteras. O sea: el dato que mide la
+# disciplina, borrado por la cura, otra vez. Lo caza `test_rescate_no_se_deja_columnas`,
+# que compara ESTA lista contra el esquema COMPLETO (SCHEMA + COLUMNAS_ANADIDAS).
+# Cazado por CodeRabbit en el #4 y verificado por `llminbox-a7`; el guarda de tablas
+# que escribí no podía verlo porque comparaba TABLAS.
 TABLAS_RESCATADAS = (
     ("cursors", "agent,ledger,last_arrival,updated"),
     ("lecturas", "agent,primera,ultima,veces"),
-    ("claims", "tema,rol,agent,agent_bruto,abierto,cerrado,bruto"),
-    ("coste", "ruta,llamadas,bytes,ultima"),
+    ("claims", "tema,rol,agent,agent_bruto,abierto,cerrado,bruto,motivo,cerrado_por"),
+    ("coste", "ruta,llamadas,bytes,ultima,maximo"),
     ("incidencias", "ledger,ts,motivo,entradas_antes,entradas_despues,ultimo_sellado"),
     ("meta", "k,v"),
 )
@@ -753,6 +773,20 @@ def reconstruir_indice(motivo: str) -> bool:
         try:
             nueva.row_factory = sqlite3.Row
             nueva.executescript(SCHEMA)
+            # LOS ALTERs TAMBIÉN, y esto es un defecto anterior a la lista de rescate:
+            # `executescript(SCHEMA)` con `IF NOT EXISTS` no añade columnas, y esta
+            # reconstrucción corre EN CALIENTE (la dispara el vigilante), no en el
+            # arranque — así que `_preparar_indice()` no pasa por aquí. Resultado: una
+            # base recién curada se quedaba SIN `claims.motivo`, `claims.cerrado_por`
+            # ni `coste.maximo` hasta el siguiente reinicio, y cualquier escritura a
+            # esas columnas reventaba en medio. Lo destapó el test de columnas al
+            # intentar rescatarlas: el rescate no podía escribir lo que la base nueva
+            # no tenía.
+            for tabla, col, tipo in COLUMNAS_ANADIDAS:
+                try:
+                    nueva.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {tipo}")
+                except sqlite3.OperationalError:
+                    pass          # ya existe: el SCHEMA la trae de serie
             nueva.executemany("INSERT OR REPLACE INTO lecturas VALUES (?,?,?,?)",
                               rescatado["lecturas"])
             # Por COLUMNAS NOMBRADAS y no `VALUES (?,…)` posicional: estas tres ya han
@@ -1678,9 +1712,7 @@ def _preparar_indice(con: sqlite3.Connection) -> None:
     # disciplina —26 de 96 cerrados (27 %)—, porque «qa: 10 de 10» incluía el relevo
     # que le hice yo esa mañana. Un dato que no distingue las dos cosas se lee como
     # la buena.
-    for tabla, col, tipo in (("coste", "maximo", "INTEGER DEFAULT 0"),
-                             ("claims", "motivo", "TEXT"),
-                             ("claims", "cerrado_por", "TEXT")):
+    for tabla, col, tipo in COLUMNAS_ANADIDAS:
         try:
             hay = {r[1] for r in con.execute(f"PRAGMA table_info({tabla})")}
             if hay and col not in hay:
