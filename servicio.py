@@ -645,6 +645,23 @@ DERIVADAS = ("entries", "recipients", "files", "pages", "citas")
 # que compara ESTA lista contra el esquema COMPLETO (SCHEMA + COLUMNAS_ANADIDAS).
 # Cazado por CodeRabbit en el #4 y verificado por `llminbox-a7`; el guarda de tablas
 # que escribí no podía verlo porque comparaba TABLAS.
+# CÓMO SE RECONCILIAN LAS DOS FOTOS. La reconstrucción saca una foto del estado al
+# empezar y otra —`tarde`— justo antes de cambiar la base, porque entre las dos pasan
+# los segundos que cuesta re-derivar el markdown y el servicio SIGUE VIVO. Hasta hoy
+# esa segunda foto sólo se usaba para `cursors`: un `/claim` o un `GET` que aterrizara
+# en esa ventana lo pisaba la foto vieja y desaparecía. Las claves de abajo dicen qué
+# fila es «la misma» en las dos fotos; gana SIEMPRE la tardía, que es la más nueva por
+# construcción, y las que sólo estén en la primera se conservan (unión, no reemplazo:
+# si la lectura tardía falla o vuelve corta por corrupción, no se pierde nada).
+# `incidencias` va por `id` y `coste` por `ruta`, que son sus claves reales; `claims`
+# no declara PK, así que se identifica por la tupla que hace única a una toma.
+CLAVE_RECONCILIACION = {
+    "lecturas": (0,),                 # agent
+    "claims": (0, 1, 2, 4),           # tema, rol, agent, abierto
+    "coste": (0,),                    # ruta
+    "incidencias": (0,),              # id
+}
+
 TABLAS_RESCATADAS = (
     ("cursors", "agent,ledger,last_arrival,updated"),
     ("lecturas", "agent,primera,ultima,veces"),
@@ -653,6 +670,25 @@ TABLAS_RESCATADAS = (
     ("incidencias", "ledger,ts,motivo,entradas_antes,entradas_despues,ultimo_sellado"),
     ("meta", "k,v"),
 )
+
+
+def _reconciliar(tabla: str, pronto, tarde) -> list:
+    """Unión de las dos fotos con la TARDÍA ganando el empate.
+
+    No es un `or`: si la segunda lectura falla —o vuelve corta porque la corrupción
+    avanzó— quedarse sólo con ella pierde filas que sí se tenían. Y no es un
+    reemplazo: una fila que sólo esté en la primera se conserva. Gana la tardía
+    porque es la más nueva por construcción, que es la misma dirección segura de
+    perder un empate que ya se usa para los cursores.
+    """
+    pronto, tarde = list(pronto or []), list(tarde or [])
+    idx = CLAVE_RECONCILIACION.get(tabla)
+    if idx is None:
+        return tarde or pronto
+    fusion = {}
+    for fila in pronto + tarde:                    # el orden ES la precedencia
+        fusion[tuple(fila[i] for i in idx)] = fila
+    return list(fusion.values())
 
 
 def _rescatar(ruta: str) -> dict:
@@ -787,20 +823,11 @@ def reconstruir_indice(motivo: str) -> bool:
                     nueva.execute(f"ALTER TABLE {tabla} ADD COLUMN {col} {tipo}")
                 except sqlite3.OperationalError:
                     pass          # ya existe: el SCHEMA la trae de serie
-            nueva.executemany("INSERT OR REPLACE INTO lecturas VALUES (?,?,?,?)",
-                              rescatado["lecturas"])
+
             # Por COLUMNAS NOMBRADAS y no `VALUES (?,…)` posicional: estas tres ya han
             # crecido de columnas una vez (`claims.motivo`, `claims.cerrado_por`,
             # `coste.maximo`) y un INSERT posicional no se rompe cuando vuelvan a
             # crecer — coloca los valores CORRIDOS, que es peor.
-            for tabla, cols in TABLAS_RESCATADAS:
-                if tabla in ("cursors", "lecturas", "meta"):
-                    continue                      # tienen su propio volcado arriba/abajo
-                filas = rescatado.get(tabla) or []
-                if filas:
-                    marcas = ",".join("?" * len(cols.split(",")))
-                    nueva.executemany(
-                        f"INSERT OR REPLACE INTO {tabla} ({cols}) VALUES ({marcas})", filas)
             # Las huellas NO se rescatan: se escriben las de AHORA. La base nueva se
             # acaba de crear con el SCHEMA de este proceso, así que su huella de
             # esquema es la de este proceso por definición; copiar la de la base rota
@@ -876,6 +903,20 @@ def reconstruir_indice(motivo: str) -> bool:
                   (nueva.execute("SELECT COUNT(*) c FROM entries WHERE ledger=?",
                                  (n,)).fetchone()["c"]))
                  for n in LEDGERS])
+            # EL VOLCADO DEL ESTADO VA AQUÍ, y el sitio es la mitad del arreglo:
+            # después de la segunda foto (`tarde`) y bajo el cerrojo. Estaba arriba,
+            # antes de tomarla, así que sólo podía escribir la foto VIEJA — un
+            # `/claim` o una lectura que aterrizaran mientras se re-deriva el markdown
+            # (segundos, con el servicio vivo) se perdían al cambiar la base. Los
+            # cursores ya se reconciliaban así; el resto del estado, no.
+            for tabla, cols in TABLAS_RESCATADAS:
+                if tabla in ("cursors", "meta"):
+                    continue                      # tienen su propio volcado reconciliado
+                filas = _reconciliar(tabla, rescatado.get(tabla), tarde.get(tabla))
+                if filas:
+                    marcas = ",".join("?" * len(cols.split(",")))
+                    nueva.executemany(
+                        f"INSERT OR REPLACE INTO {tabla} ({cols}) VALUES ({marcas})", filas)
             nueva.commit()
             nueva.close()
 

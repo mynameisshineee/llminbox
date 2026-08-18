@@ -135,3 +135,62 @@ def test_las_columnas_del_alter_tambien_se_rescatan(servicio):
         declaradas = dict((t, c) for t, c in servicio.TABLAS_RESCATADAS).get(tabla)
         assert declaradas is not None, f"{tabla} no se rescata en absoluto"
         assert col in declaradas.split(","), f"{tabla}.{col} se añade por ALTER y no se rescata"
+
+
+# ── la ventana entre las dos fotos ───────────────────────────────────────────
+
+def test_reconciliar_une_y_gana_la_foto_tardia(servicio):
+    """`_reconciliar` no es un `or` ni un reemplazo, y cada mitad importa:
+    · lo que sólo está en la PRIMERA se conserva (si la lectura tardía falla o vuelve
+      corta porque la corrupción avanzó, quedarse sólo con ella pierde filas);
+    · lo que sólo está en la SEGUNDA entra (es el correo de la ventana);
+    · y en el empate gana la tardía, que es la más nueva por construcción.
+    """
+    r = servicio._reconciliar
+    pronto = [("a", "ejecuta", "qa", None, "T1", None, "a", None, None)]
+    tarde = [("a", "ejecuta", "qa", None, "T1", "CERRADO", "a", "cierro", "qa"),
+             ("b", "ejecuta", "be", None, "T2", None, "b", None, None)]
+    out = {f[0]: f for f in r("claims", pronto, tarde)}
+    assert out["a"][5] == "CERRADO", "el empate lo gana la foto tardía"
+    assert "b" in out, "lo que sólo está en la tardía tiene que entrar"
+
+    solo_pronto = r("claims", pronto, [])
+    assert solo_pronto == pronto, "si la lectura tardía no trae nada, no se pierde lo que había"
+
+    # Y una tabla sin clave declarada no puede reventar: degrada a «la que haya».
+    assert r("desconocida", [("x",)], []) == [("x",)]
+
+
+def test_un_claim_de_la_VENTANA_no_lo_pisa_la_foto_vieja(cliente, servicio, monkeypatch):
+    """El caso que reportó CodeRabbit, montado: entre la primera foto y el cambio de
+    base pasan los segundos de re-derivar el markdown, con el servicio VIVO. Un
+    `/claim` que aterrice ahí lo pisaba la foto vieja y desaparecía.
+
+    Se simula haciendo que la SEGUNDA llamada a `_rescatar` traiga un claim que la
+    primera no tenía — que es exactamente lo que pasa cuando alguien escribe en medio.
+
+    FALSADOR: con el volcado en su sitio viejo (antes de la segunda foto) este claim
+    no aparece, porque sólo se escribía `rescatado`.
+    """
+    cliente.post("/claim", json={"tema": "el_de_antes", "rol": "ejecuta", "agent": "backend"})
+    real = servicio._rescatar
+    llamadas = {"n": 0}
+
+    def espia(ruta):
+        out = real(ruta)
+        llamadas["n"] += 1
+        if llamadas["n"] == 2:          # la foto TARDÍA: alguien escribió en la ventana
+            out["claims"] = list(out["claims"]) + [
+                ("en_la_ventana", "ejecuta", "cto", None, "2026-08-18T10:00:00+00:00",
+                 None, "en_la_ventana", None, None)]
+        return out
+
+    monkeypatch.setattr(servicio, "_rescatar", espia)
+    assert servicio.reconstruir_indice("prueba de ventana") is True
+    assert llamadas["n"] >= 2, "la reconstrucción tiene que tomar DOS fotos"
+
+    con = servicio.db()
+    temas = {r[0] for r in con.execute("SELECT tema FROM claims")}
+    con.close()
+    assert "en_la_ventana" in temas, "el claim de la ventana se ha perdido"
+    assert "el_de_antes" in temas, "y el anterior no puede desaparecer por rescatar el nuevo"
