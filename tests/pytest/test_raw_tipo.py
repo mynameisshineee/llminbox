@@ -25,7 +25,10 @@ CABECERAS = (
     "### [cto-A → backend · FYI] canónica\ncuerpo\n"          # de los 8
     "### [cto-A → backend · MEDIDO] desconocida\ncuerpo\n"     # escrita y hoy tirada
     "### [cto-A → backend · ADJUDICADO] otra\ncuerpo\n"
+    "### [cto-A → backend · Medido] con caja mixta\ncuerpo\n"  # el lexema, tal cual
+    "### [cto-A → backend · REVIEW.V2] con punto\ncuerpo\n"    # fuera de cualquier vocabulario
     "### [cto-A → backend] sin tipo ninguno\ncuerpo\n"
+    "### [cto-A → cto-A] titular con · trampa]\ncuerpo\n"   # NO es un tipo
 )
 
 
@@ -51,7 +54,7 @@ def test_un_tipo_desconocido_se_conserva_literal(tmp_path, monkeypatch):
 
     FALSADOR: hoy `raw_tipo` no existe; con la columna pero sin capturar, sale
     NULL y esta aserción cae — que es exactamente el descarte silencioso."""
-    s, con = _monta(tmp_path, monkeypatch)
+    _, con = _monta(tmp_path, monkeypatch)
     f = _filas(con)
     assert f["MEDIDO"][1] == "MEDIDO", f
     assert f["ADJUDICADO"][1] == "ADJUDICADO", f
@@ -65,7 +68,7 @@ def test_no_se_interpreta_nada_todavia(tmp_path, monkeypatch):
     literal en `tipo`, esto se pone rojo — y con razón: `tipo` es el vocabulario
     que el sistema entiende, y ensancharlo por la puerta de atrás haría pasar por
     canónico lo que nadie ha aprobado."""
-    s, con = _monta(tmp_path, monkeypatch)
+    _, con = _monta(tmp_path, monkeypatch)
     f = _filas(con)
     assert f["MEDIDO"][0] is None, "se coló en `tipo`: eso es interpretar"
     assert f["MEDIDO"][2] is None and f["MEDIDO"][3] is None
@@ -76,7 +79,7 @@ def test_el_canonico_tambien_deja_su_literal(tmp_path, monkeypatch):
     """`raw_tipo` es «lo que estaba escrito», sin excepciones. Que coincida con
     `tipo` en los 8 canónicos no lo hace redundante: hace que la partición del
     corpus se pueda calcular en SQL sin casos especiales."""
-    s, con = _monta(tmp_path, monkeypatch)
+    _, con = _monta(tmp_path, monkeypatch)
     f = _filas(con)
     assert f["FYI"] [:2] == ("FYI", "FYI"), f
 
@@ -86,7 +89,7 @@ def test_sin_tipo_escrito_no_se_inventa_uno(tmp_path, monkeypatch):
     entrada que NO declara nada tiene que salir con los cuatro campos vacíos. Sin
     esto, una implementación que rellenara `raw_tipo` con cualquier cosa pasaría
     los tres tests anteriores."""
-    s, con = _monta(tmp_path, monkeypatch)
+    _, con = _monta(tmp_path, monkeypatch)
     assert _filas(con)["SIN"] == (None, None, None, None)
 
 
@@ -134,7 +137,7 @@ def test_una_huella_distinta_si_borra_los_cursores(tmp_path, monkeypatch):
     con.commit()
 
     s2 = construir(tmp_path, monkeypatch)
-    with TestClient(s2.app) as c2:
+    with TestClient(s2.app):
         s2.barrido()
     assert db_directa(s2).execute(
         "SELECT COUNT(*) c FROM cursors").fetchone()["c"] == 0, (
@@ -146,10 +149,10 @@ def test_las_tres_columnas_existen_tras_reiniciar(tmp_path, monkeypatch):
     con `IF NOT EXISTS` NO añade columnas a una tabla que ya existe — es la
     cicatriz de `coste.maximo`. El ALTER tiene que correr en cada arranque."""
     s = construir(tmp_path, monkeypatch)
-    with TestClient(s.app) as c:
+    with TestClient(s.app):
         s.barrido()
     s2 = construir(tmp_path, monkeypatch)
-    with TestClient(s2.app) as c2:
+    with TestClient(s2.app):
         s2.barrido()
     cols = {r[1] for r in db_directa(s2).execute("PRAGMA table_info(entries)")}
     assert {"raw_tipo", "canonical_kind", "kind_registry_rev"} <= cols, cols
@@ -162,12 +165,127 @@ def test_lint_separa_no_declarar_de_declarar_algo_que_no_entiendo(tmp_path, monk
 
     FALSADOR: con el `tipo IS NULL` de antes, las dos filas caen en el mismo saco
     y el desglose no existe."""
-    s, _ = _monta(tmp_path, monkeypatch)
+    s, _con = _monta(tmp_path, monkeypatch)
     with TestClient(s.app) as c:
         c.headers.update({"X-Llminbox-Token": "test-token"})
         txt = c.get("/lint").text
+    import re as _re
     assert "declara un tipo que no entiendo" in txt, txt
-    linea = next(l for l in txt.splitlines() if "no entiendo" in l)
-    assert "2" in linea, linea            # MEDIDO y ADJUDICADO
-    sin = next(l for l in txt.splitlines() if "sin tipo declarado" in l)
-    assert "1" in sin, sin                # sólo la que no declara nada
+    linea = next(ln for ln in txt.splitlines() if "no entiendo" in ln)
+    # Se ancla al NÚMERO, no a un `in` suelto: el porcentaje que va detrás en la
+    # misma línea hacía pasar la aserción por la puerta de al lado.
+    assert _re.search(r"no entiendo: 4\b", linea), linea   # MEDIDO ADJUDICADO Medido REVIEW.V2
+    sin = next(ln for ln in txt.splitlines() if "sin tipo declarado" in ln)
+    assert _re.search(r"sin tipo declarado: 2\b", sin), sin   # la sin tipo y la del titular trampa
+
+
+def test_el_lexema_se_guarda_tal_cual_sin_normalizar(tmp_path, monkeypatch):
+    """`raw_tipo` es el LEXEMA, no una versión canonizada de él. Normalizar a
+    mayúsculas ya es interpretar: decide que `Medido` y `MEDIDO` son la misma
+    palabra, que es precisamente lo que el registro canónico tendrá que
+    adjudicar — con su revisión anotada — y no el troceador por su cuenta.
+
+    Era una contradicción entre el código y este mismo fichero: los tests decían
+    «se guarda el texto literal» y el capturador hacía `.upper()`.
+
+    FALSADOR: devolver el `.upper()` convierte `Medido` en `MEDIDO` y esto cae."""
+    _, con = _monta(tmp_path, monkeypatch)
+    assert _filas(con)["Medido"][1] == "Medido"
+
+
+def test_el_capturador_no_tiene_vocabulario_implicito(tmp_path, monkeypatch):
+    """El capturador nació para que NADA de lo escrito se descarte, y su primera
+    versión traía un vocabulario implícito propio: sólo letras, `_`, `/` y `-`.
+    Un tipo con punto, dígito o cualquier otro Unicode volvía a perderse — el
+    mismo fallo, una capa más abajo y más difícil de ver.
+
+    FALSADOR: restringir la clase de caracteres deja `REVIEW.V2` en NULL."""
+    _, con = _monta(tmp_path, monkeypatch)
+    f = _filas(con)
+    assert f["REVIEW.V2"][1] == "REVIEW.V2", f
+    assert f["REVIEW.V2"][0] is None, "no es de los 8: no puede acabar en `tipo`"
+
+
+def test_un_titular_con_punto_medio_no_es_una_declaracion_de_tipo(tmp_path, monkeypatch):
+    """El tipo vive DENTRO del corchete de la cabecera. Un `· algo]` en la prosa
+    del titular no declara nada, y tomarlo por tipo inventaría materia prima —
+    justo lo contrario de lo que este cambio persigue.
+
+    FALSADOR (el que me pilló): buscar en la línea entera en vez de en el corchete
+    cerrado devuelve `trampa` como si fuera un tipo declarado. El mutante
+    sobrevivió a la primera versión de este arreglo porque `inner` llega hasta
+    fin de línea y el corte no existía."""
+    _, con = _monta(tmp_path, monkeypatch)
+    fila = next(r for r in con.execute(
+        "SELECT head,tipo,raw_tipo FROM entries WHERE head LIKE '%trampa%'"))
+    assert fila["raw_tipo"] is None, fila["head"]
+
+
+def test_el_corpus_QUE_YA_EXISTE_tambien_se_rellena(tmp_path, monkeypatch):
+    """EL FALSADOR QUE FALTABA, y sin él este cambio sería inerte en producción.
+
+    La tupla del volcado sólo corre para eids NUEVOS. Una entrada ya indexada
+    entra por la rama de «ya conocida», que hasta ahora no tocaba `raw_tipo`: las
+    641 entradas del hallazgo llevan meses en la base, así que se habrían quedado
+    NULL para siempre y `/lint` seguiría llamándolas «sin tipo». El arreglo,
+    inerte justo sobre los datos para los que se hizo.
+
+    Simula el despliegue: fila existente con `raw_tipo` a NULL, markdown SIN
+    tocar, y una pasada de barrido. Tiene que quedar rellena.
+
+    FALSADOR: quitar `raw_tipo` de la comparación de cambios deja el NULL puesto
+    —el markdown no cambió, así que nada más dispara la escritura— y esto se pone
+    rojo. Cazado por CodeRabbit."""
+    s = construir(tmp_path, monkeypatch)
+    (tmp_path / "DEMO-LEDGER.md").write_text(CABECERAS)
+    with TestClient(s.app):
+        s.barrido()
+    con = db_directa(s)
+    # El estado EXACTO de un despliegue sobre base existente: las entradas ya
+    # indexadas por el código viejo, la columna recién creada por el ALTER (o sea
+    # NULL entera) y sin sello de migración.
+    con.execute("UPDATE entries SET raw_tipo=NULL")
+    con.execute("DELETE FROM meta WHERE k='raw_tipo_v'")
+    con.commit()
+    assert con.execute("SELECT COUNT(*) c FROM entries "
+                       "WHERE raw_tipo IS NOT NULL").fetchone()["c"] == 0
+
+    s2 = construir(tmp_path, monkeypatch)     # el despliegue
+    with TestClient(s2.app):                   # el arranque corre la migración
+        pass
+    rellenas = db_directa(s2).execute(
+        "SELECT COUNT(*) c FROM entries WHERE ledger='demo-ledger' "
+        "AND raw_tipo IS NOT NULL").fetchone()["c"]
+    assert rellenas == 5, f"el corpus existente se quedó sin rellenar: {rellenas}"
+
+
+def test_un_lexema_rancio_se_corrige_al_reparsear(tmp_path, monkeypatch):
+    """La migración rellena una vez; ESTO mantiene el campo vivo después.
+
+    Cubre un caso que la migración no puede: una entrada cuyo `raw_tipo`
+    almacenado ya no coincide con lo que hoy se deriva de su cabecera — porque
+    subió `RAW_TIPO_V`, o porque el fichero se reescribió. La rama de «entrada ya
+    conocida» sólo escribe si algo cambió, así que `raw_tipo` tiene que estar
+    DENTRO de esa comparación o se fosiliza en silencio (lo dice el propio
+    comentario del reindex, y aun así se me pasó; lo señaló CodeRabbit).
+
+    Se corrompe una fila que NO es la última, para que el único disparador
+    posible de la escritura sea la diferencia de `raw_tipo`: la última cambia de
+    `provisional` al crecer el fichero y pasaría por otro motivo.
+
+    FALSADOR: quitar `raw_tipo` de la comparación deja `OBSOLETO` puesto."""
+    s = construir(tmp_path, monkeypatch)
+    (tmp_path / "DEMO-LEDGER.md").write_text(CABECERAS)
+    with TestClient(s.app):
+        s.barrido()
+    con = db_directa(s)
+    con.execute("UPDATE entries SET raw_tipo='OBSOLETO' WHERE head LIKE '%· FYI]%'")
+    con.commit()
+
+    with open(tmp_path / "DEMO-LEDGER.md", "a") as fh:
+        fh.write("### [cto-A → backend · ACK] nueva al final\ncuerpo\n")
+    s.barrido()                      # el fichero creció: se re-parsea entero
+
+    fila = db_directa(s).execute(
+        "SELECT raw_tipo FROM entries WHERE head LIKE '%· FYI]%'").fetchone()
+    assert fila["raw_tipo"] == "FYI", f"se fosilizó: {fila['raw_tipo']}"

@@ -431,9 +431,20 @@ RE_AGENTE = re.compile(
 # que `/entries?actor=alice-backend` perdía todos sus heartbeats. Se saltan antes de
 # buscar el actor, y se recogen como tipo.
 # La posición canónica del tipo: `### [origen → destino · TIPO] titular`. Se
-# captura el token TAL CUAL, sin validarlo contra `TIPOS` — validar aquí es
-# lo que hacía que 641 entradas perdieran lo que sí habían declarado.
-RAW_TIPO = re.compile(r"·\s*([A-Za-zÁÉÍÓÚÑáéíóúñ_/-]{2,})\s*\]")
+# captura el lexema TAL CUAL —sin validarlo contra `TIPOS` y SIN normalizarlo—,
+# porque validar aquí es lo que hacía que 641 entradas perdieran lo que sí habían
+# declarado, y normalizar es ya interpretar: decidir que `Medido` y `MEDIDO` son
+# la misma palabra le toca al registro canónico, con su revisión anotada, no al
+# troceador por su cuenta.
+#
+# Sin clase de caracteres «permitidos»: la primera versión aceptaba sólo letras,
+# `_`, `/` y `-`, o sea traía su propio vocabulario implícito y perdía `REVIEW.V2`
+# — el mismo fallo una capa más abajo. Se acota por LONGITUD, no por alfabeto.
+#
+# `·` sí queda fuera de la clase, y eso no es vocabulario: hace que capture el
+# ÚLTIMO campo de la cabecera. Sin esa exclusión, un `a · b · TIPO]` devolvería
+# «b · TIPO».
+RAW_TIPO = re.compile(r"·\s*([^·\]\r\n]{1,64}?)\s*\]")
 ETIQUETAS = re.compile(r"^\s*(HEARTBEAT|CARRY-FORWARD|CLAIM|CANON|CERT|DONE|RESP|AVISO|MSG|ASK|ACK|STATUS|INFO|HANDOFF)"
                        r"(?:[/·\-]\s*(?:HEARTBEAT|CARRY-FORWARD|CLAIM|CANON|CERT|DONE|RESP|AVISO|MSG|ASK|ACK|STATUS|INFO|HANDOFF))*\s*",
                        re.IGNORECASE)
@@ -504,6 +515,29 @@ class Entrada:
     @property
     def sha(self) -> str:
         return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+
+
+def raw_tipo_de(head: str) -> str | None:
+    """El lexema escrito en la posición del tipo, o None. UNA sola fuente.
+
+    Se expone aparte de `_campos` porque el backfill del corpus ya indexado lo
+    necesita **sin volver a leer el fichero**: `head` está guardado en la base, y
+    `barrido()` salta un ledger entero cuando su tamaño y mtime no cambiaron —
+    así que confiar la migración a una re-indexación dejaría sin rellenar todos
+    los ledgers dormidos, para siempre.
+    """
+    inner = head
+    mb = re.match(r"^#{2,3} \[(.*)$", head or "")
+    if mb:
+        inner = mb.group(1)
+    inner = _sin_emoji(inner)
+    cierre = inner.find("]")
+    inner = inner[:cierre + 1] if cierre != -1 else inner
+    m = RAW_TIPO.search(inner)
+    if m:
+        return m.group(1)
+    et = ETIQUETAS.match(inner)
+    return et.group(1) if et else None
 
 
 def _campos(head: str, cola: str) -> tuple[str | None, str | None, list[str], list[str], str | None]:
@@ -614,9 +648,7 @@ def _campos(head: str, cola: str) -> tuple[str | None, str | None, list[str], li
         tipo = etiqueta.group(1).upper()
     # Lo escrito, se entienda o no. Se mira la posición canónica (`· TOKEN]`)
     # antes que la etiqueta al frente, porque es donde la flota lo pone.
-    m_raw = RAW_TIPO.search(head)
-    raw = (m_raw.group(1).upper() if m_raw
-           else etiqueta.group(1).upper() if etiqueta else None)
+    raw = raw_tipo_de(head)
     return ts, actor, to, difusion, tipo, por_arroba, raw
 
 

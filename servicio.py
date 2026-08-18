@@ -465,6 +465,49 @@ def huella_censo() -> str:
     return hashlib.sha256(",".join(sorted(lp.AGENTES)).encode()).hexdigest()[:16]
 
 
+RAW_TIPO_V = "1"          # súbela si cambia CÓMO se deriva `raw_tipo` del head
+
+
+def migrar_raw_tipo(con) -> None:
+    """Rellena `raw_tipo` del corpus que YA estaba indexado.
+
+    Sin esto el cambio es inerte justo donde importa: las 641 entradas del
+    hallazgo llevan meses en la base, y la tupla del volcado sólo corre para eids
+    NUEVOS. Lo señaló CodeRabbit — y su arreglo (meter `raw_tipo` en la
+    comparación de la rama «ya conocida») es necesario pero NO suficiente:
+    `barrido()` salta un ledger entero cuando su tamaño y su mtime no han
+    cambiado, así que los ledgers dormidos no se re-examinan nunca. Confiarle la
+    migración a una re-indexación los dejaría en NULL para siempre.
+
+    Por eso se deriva del `head` YA GUARDADO: no toca ficheros, no depende de que
+    un ledger reciba tráfico, y corre una sola vez (sellada en `meta`). Medido
+    sobre la base viva: 16.099 de 65.186 entradas quedan con lexema.
+
+    `canonical_kind`/`kind_registry_rev` NO se tocan: son interpretación, y su
+    revisión, no re-derivables del markdown.
+    """
+    try:
+        fila = con.execute("SELECT v FROM meta WHERE k='raw_tipo_v'").fetchone()
+        if fila and fila["v"] == RAW_TIPO_V:
+            return
+        pend = [(lp.raw_tipo_de(r["head"]), r["ledger"], r["eid"])
+                for r in con.execute("SELECT ledger, eid, head FROM entries "
+                                     "WHERE raw_tipo IS NULL")]
+        pend = [t for t in pend if t[0] is not None]
+        if pend:
+            con.executemany("UPDATE entries SET raw_tipo=? WHERE ledger=? AND eid=?", pend)
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('raw_tipo_v', ?)", (RAW_TIPO_V,))
+        con.commit()
+        print(f"[migración] raw_tipo: {len(pend)} entradas del corpus existente "
+              f"recuperan el lexema que declaraban", flush=True)
+    except sqlite3.OperationalError as e:
+        # Base sin la columna todavía (orden de arranque) — no es fatal: el ALTER
+        # corre antes, pero si algún día no lo hiciera, esto NO puede tumbar el
+        # servicio por una columna de diagnóstico.
+        print(f"[migración] raw_tipo: no pude migrar ({e}) — se reintenta al "
+              f"próximo arranque", flush=True)
+
+
 # ── MIGRACIÓN alias→rol de `cursors` (②) ───────────────────────────────────────
 # Antes de esto, `backend`, `backend-biklabs` y (donde apliquen) sus otros alias
 # tenían CADA UNO su propia fila de cursor por ledger — el mismo humano/rol leyendo
@@ -1034,8 +1077,8 @@ def reindex(ledger: str, path: str, con) -> dict:
         vivos.setdefault(e.sha, e)          # duplicado exacto = la misma entrada
 
     previos = {r["eid"]: r for r in con.execute(
-        "SELECT eid, ausente, provisional, seq, line_no, byte_off FROM entries "
-        "WHERE ledger=?", (ledger,))}
+        "SELECT eid, ausente, provisional, seq, line_no, byte_off, raw_tipo "
+        "FROM entries WHERE ledger=?", (ledger,))}
     ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
     prox = (con.execute("SELECT COALESCE(MAX(arrival), -1) + 1 m FROM entries "
                         "WHERE ledger=?", (ledger,)).fetchone()["m"])
@@ -1076,12 +1119,29 @@ def reindex(ledger: str, path: str, con) -> dict:
             # añadirlo a la comparación o se quedará fosilizado en silencio.
             prev = previos[e.sha]
             prov = 1 if pos == len(ents) - 1 else 0
+            # `raw_tipo` ENTRA EN LA COMPARACIÓN, y es lo que hace que el cambio
+            # llegue al corpus que ya existe. Sin esto, la tupla de arriba sólo
+            # corre para eids NUEVOS: en producción las 641 entradas del hallazgo
+            # ya están indexadas, así que se habrían quedado NULL para siempre y
+            # `/lint` seguiría llamándolas «sin tipo» — el arreglo, inerte justo
+            # sobre los datos para los que se hizo. Cazado por CodeRabbit; el
+            # comentario de arriba ya lo predecía («si algún día un campo de estos
+            # empieza a derivarse de otra cosa, hay que añadirlo a la comparación
+            # o se quedará fosilizado en silencio»), y aun así se me pasó.
+            #
+            # Coste: una sola pasada de backfill, 16.099 filas medidas sobre la
+            # base viva repartidas en 12 ledgers. Después la comparación vuelve a
+            # dar falso y no se escribe nada.
+            #
+            # `canonical_kind`/`kind_registry_rev` NO se tocan: son interpretación
+            # y su revisión, no re-derivables del markdown (ver NO_SE_RESCATAN).
             if (prev["seq"] != pos or prev["line_no"] != e.line_no
                     or prev["byte_off"] != e.byte_off
-                    or prev["provisional"] != prov or prev["ausente"] is not None):
+                    or prev["provisional"] != prov or prev["ausente"] is not None
+                    or prev["raw_tipo"] != e.raw_tipo):
                 con.execute("UPDATE entries SET seq=?, line_no=?, byte_off=?, ausente=NULL, "
-                            "provisional=? WHERE ledger=? AND eid=?",
-                            (pos, e.line_no, e.byte_off, prov, ledger, e.sha))
+                            "provisional=?, raw_tipo=? WHERE ledger=? AND eid=?",
+                            (pos, e.line_no, e.byte_off, prov, e.raw_tipo, ledger, e.sha))
                 refrescadas += 1
             # RE-DERIVAR SÍ respeta el corte, y aquí está su razón de ser: recalcular
             # el histórico con el router de `@` añadiría 1.679 entradas de golpe a las
@@ -1800,6 +1860,7 @@ def _preparar_indice(con: sqlite3.Connection) -> None:
                 print(f"[arranque] {tabla}: columna {col} añadida", flush=True)
         except sqlite3.OperationalError as e:
             print(f"[arranque] no pude añadir {tabla}.{col}: {e}", flush=True)
+    migrar_raw_tipo(con)           # rellena el corpus ya indexado (ver la función)
     migrar_alias_a_rol(con)        # ② — después de SCHEMA (tablas garantizadas),
                                     # antes de CENSO cambiado (orden no crítico entre
                                     # ambas, pero así quedan agrupados: migraciones de
