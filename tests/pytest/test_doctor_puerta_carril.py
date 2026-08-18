@@ -17,6 +17,11 @@ import pytest
 from conftest import construir
 
 PUERTA = {"LLMINBOX_CARRIL_OBLIGATORIO": "1"}
+# La ventana se FIJA aquí y no se hereda (CodeRabbit, #5): estos tests envejecen
+# aciertos «9 h atrás» dando por hecho que 9 > MUDO_H. Si el entorno definiera
+# `LLMINBOX_MUDO_H=12`, `be` dejaría de ser antiguo y el test pasaría sin cubrir
+# nada — un arnés más permisivo que producción, otra vez.
+VENTANA = {"LLMINBOX_MUDO_H": "2"}
 
 _ABIERTOS = []
 
@@ -41,7 +46,7 @@ def _cliente(tmp_path, monkeypatch, extra_env=None):
         # del primero sobrevive al segundo: sin este delenv, el caso «PUERTA ABIERTA»
         # se mediría con la puerta puesta y el test pasaría por el motivo equivocado.
         monkeypatch.delenv("LLMINBOX_CARRIL_OBLIGATORIO", raising=False)
-    s = construir(tmp_path, monkeypatch, extra_env=extra_env)
+    s = construir(tmp_path, monkeypatch, extra_env={**VENTANA, **(extra_env or {})})
     c = TestClient(s.app)
     c.__enter__()
     _ABIERTOS.append(c)
@@ -246,3 +251,51 @@ def test_un_carril_INVALIDO_no_cuenta_como_consumo_con_carril(tmp_path, monkeypa
     assert "0 consumo(s) CON carril" in t, "un 422 no es un consumo"
     assert "1 RECHAZADO" in t
     assert "✓ todo rol que consume manda carril" not in t, "el verde no puede salir de un 422"
+
+
+def test_un_exito_viejo_no_inmuniza_al_que_dejo_de_mandar_carril(tmp_path, monkeypatch):
+    """FALSADOR: la alarma de ⑤ sólo podía moverse hacia el silencio.
+
+    `mudos` se calculaba con `not v[0]` — «cero éxitos en TODA la ventana». Un rol que
+    mandó carril UNA vez al arrancar y desde entonces sólo rebota quedaba inmunizado
+    para siempre: su acierto viejo lo sacaba de la alarma y nadie volvía a mirarlo.
+    Con días de uptime eso significa que **una regresión es invisible** — justo lo que
+    la sesión hermana midió en ② (un agregado que no puede moverse hace publicar la
+    conclusión al revés a quien se fía de él).
+
+    Aquí `be` acierta una vez, se envejece ese acierto, y luego sólo rebota: tiene que
+    volver a aparecer. Control negativo: `cto` acierta AHORA y no debe aparecer.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    s, c = _cliente(tmp_path, monkeypatch, PUERTA)
+    _consumir(c, "backend", "demo")                     # éxito… pero viejo
+    _consumir(c, "cto-A", "demo")                       # éxito reciente (control)
+    _consumir(c, "cto-A")                               # …y ADEMÁS rebota: no basta con
+                                                        # que no rebote para no salir
+    viejo = (datetime.now(timezone.utc) - timedelta(hours=9)).isoformat(timespec="seconds")
+    s.CONSUMOS["be"] = [1, 0, viejo, viejo]
+    for _ in range(3):
+        _consumir(c, "backend")                         # desde entonces, sólo rebota
+
+    quinta = c.get("/doctor").text.split("⑤")[1]
+    assert "be" in quinta, "dejó de mandar carril hace 9 h y la alarma no lo ve"
+    nombrados = [x for x in quinta.splitlines() if "be" in x]
+    assert not any("cto" in x for x in nombrados), "el que acertó hace un momento no se denuncia"
+
+
+def test_el_sello_del_acierto_no_retrocede(tmp_path, monkeypatch):
+    """FALSADOR de la carrera que señaló CodeRabbit en el #5.
+
+    `ahora_iso` se calcula FUERA del lock, así que dos peticiones concurrentes del
+    mismo rol pueden entrar en orden inverso al de su sello. Sin guarda, la vieja
+    pisa a la nueva y ⑤ clasifica como antiguo un acierto reciente. No se simula la
+    concurrencia —sería un test que a veces pasa—: se ejerce la PROPIEDAD que la
+    concurrencia rompería.
+    """
+    s, _ = _cliente(tmp_path, monkeypatch, PUERTA)
+    s.anota_consumo("be", True, "2026-08-18T10:00:06+00:00")
+    s.anota_consumo("be", True, "2026-08-18T10:00:05+00:00")   # la vieja, tarde
+    assert s.CONSUMOS["be"][3] == "2026-08-18T10:00:06+00:00", "el acierto retrocedió"
+    s.anota_consumo("be", True, "2026-08-18T10:00:09+00:00")   # control: sí avanza
+    assert s.CONSUMOS["be"][3] == "2026-08-18T10:00:09+00:00"

@@ -1476,10 +1476,23 @@ MUDO_H = float(os.environ.get("LLMINBOX_MUDO_H", "2"))
 
 
 def anota_consumo(rol: str, con_carril: bool, ahora_iso: str) -> None:
+    # El 4º hueco es CUÁNDO acertó por última vez, y no es un adorno: sin él, `mudos`
+    # se calculaba con «cero éxitos en toda la ventana», así que un rol que mandó
+    # carril UNA vez al arrancar quedaba inmunizado para siempre y su REGRESIÓN era
+    # invisible. Un indicador que sólo puede moverse hacia el silencio no informa:
+    # hace publicar la conclusión al revés a quien se fía de él.
     with CONSUMOS_LOCK:
-        v = CONSUMOS.setdefault(rol, [0, 0, ahora_iso])
+        v = CONSUMOS.setdefault(rol, [0, 0, ahora_iso, ""])
         v[0 if con_carril else 1] += 1
         v[2] = ahora_iso
+        # MONOTÓNICO a propósito (CodeRabbit, #5): `ahora_iso` se calcula FUERA del
+        # lock, así que dos peticiones concurrentes del mismo rol pueden entrar en
+        # orden inverso al de su sello y hacer RETROCEDER el acierto — y un acierto
+        # que retrocede es justo lo que hace que ⑤ clasifique como viejo algo
+        # reciente. (`v[2]` tiene la misma carrera y se deja: no decide nada, sólo
+        # se guarda; si algún día decide, hay que darle esta misma guarda.)
+        if con_carril and (not v[3] or ahora_iso > v[3]):
+            v[3] = ahora_iso
 
 
 def anota_lectura(agent: str, ahora_iso: str) -> None:
@@ -3646,7 +3659,12 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
     elif puerta:
         con_c = sum(v[0] for v in foto.values())
         sin_c = sum(v[1] for v in foto.values())
-        mudos = sorted(k for k, v in foto.items() if v[1] and not v[0])
+        # «Rebota y no acierta DESDE HACE RATO», no «no acertó nunca»: así la alarma
+        # puede volver a encenderse cuando un rol que iba bien se rompe.
+        acierto_fresco = (datetime.now(timezone.utc)
+                          - timedelta(hours=MUDO_H)).isoformat(timespec="seconds")
+        mudos = sorted(k for k, v in foto.items()
+                       if v[1] and not (len(v) > 3 and v[3] and v[3] > acierto_fresco))
         out.append(f"   {con_c} consumo(s) CON carril · {sin_c} RECHAZADO(S) con 422 · "
                    f"{len(foto)} rol(es) activos desde el arranque")
         out.append("   Un rechazado NO es un consumo: rebotó en la puerta y no drenó "
