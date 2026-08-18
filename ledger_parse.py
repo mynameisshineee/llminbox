@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import threading as _threading
 import unicodedata
 from dataclasses import dataclass, field
 
@@ -280,22 +281,45 @@ ORG_CARGADO_EN: str | None = None
 ORG_REVISION = None
 
 
+_ORG_CERROJO = _threading.Lock()
+
+
+def _foto_org(montada: bool, source: str | None) -> dict:
+    """Instantánea INMUTABLE del organigrama. Se construye SIEMPRE dentro del
+    cerrojo, y el llamante no vuelve a mirar los globales.
+
+    Sin esto había una carrera —la misma del sello del PR #5, un piso más arriba—:
+    el refresco devolvía el hash de una revisión y el endpoint leía `JERARQUIA` y
+    `ORG_REVISION` de otra si una petición concurrente recargaba en medio. Servir
+    el hash de una con la jerarquía de otra no es un organigrama viejo: es uno
+    IMPOSIBLE, y firmado.
+    """
+    return {"montada": montada, "source_sha256": source,
+            "loaded_sha256": ORG_SHA, "jerarquia": dict(JERARQUIA),
+            "revision": ORG_REVISION, "cargado_en": ORG_CARGADO_EN}
+
+
 def refrescar_organigrama() -> dict:
-    """Relee la fuente firmada si sus bytes cambiaron. Sin TTL, a propósito.
+    """Relee la fuente firmada si sus bytes cambiaron y devuelve UNA instantánea.
 
     Nació de un fallo de producción (2026-08-18): el bind-mount de FICHERO ÚNICO
     quedó apuntando a un inodo borrado cuando el host reemplazó el fichero por
     rename, y `/organigrama` siguió sirviendo 15 roles de hacía dos días **sin
     avisar** — porque el fichero sí se había leído al arrancar: se leyó el viejo.
 
-    Dos decisiones que salen de ahí:
+    Tres decisiones que salen de ahí:
 
     · **Se abre por RUTA en cada petición.** Resolver la ruta de nuevo es lo que
       derrota al inodo borrado: con el mount roto, `open()` da ENOENT y el fallo
       se vuelve visible en vez de silencioso. Cachear un descriptor lo reeditaría.
     · **Sin TTL.** Una ventana en la que la fuente ya cambió y esto contesta
-      `stale=False` es exactamente la mentira que había. Hashear 6 KB por
-      petición cuesta menos que afirmar frescura que no se tiene.
+      «fresco» es exactamente la mentira que había. Hashear 6 KB por petición
+      cuesta menos que afirmar frescura que no se tiene.
+    · **La FORMA se valida dentro del bloque protegido.** `json.loads` acepta `[]`
+      y `"texto"`: son JSON válido y no son un organigrama. Derivar los mapas
+      fuera del `try` convertía eso en un 500, y un 500 no es «rancio» — es que el
+      endpoint se cae. Una fuente con forma ajena es indistinguible de una
+      ilegible: no se puede derivar nada de ella, y se trata igual.
 
     Si la fuente no se deja leer se CONSERVA lo último bueno y se marca rancio:
     servir una jerarquía vacía sería peor —el agente leería «no reporto a nadie»,
@@ -308,32 +332,34 @@ def refrescar_organigrama() -> dict:
     from datetime import datetime as _dt, timezone as _tz
 
     ruta = _os.environ.get("LLMINBOX_ROLES_ALIAS", "")
-    if not ruta:
-        return {"montada": False, "source_sha256": None,
-                "loaded_sha256": ORG_SHA, "recargado": False}
-    try:
-        with open(ruta, "rb") as fh:
-            crudo = fh.read()
-        sha = _h.sha256(crudo).hexdigest()
-        d = _json.loads(crudo.decode("utf-8"))
-    except Exception:
-        # Ilegible o corrupta: NO se toca el estado bueno; el llamante lo marca.
-        return {"montada": True, "source_sha256": None,
-                "loaded_sha256": ORG_SHA, "recargado": False}
-    if sha != ORG_SHA:
-        # Los DOS mapas salen del MISMO fichero, así que se refrescan juntos. Si
-        # sólo se refrescara la jerarquía, `engineering-manager` seguiría saliendo
-        # en el organigrama y dando 422 en la bandeja: un rol que no puede recibir
-        # trabajo. Ese caso está medido en producción, no es hipotético.
-        ROLES_ALIAS = _mapa_alias(d)
-        JERARQUIA = _mapa_jerarquia(d)
-        ORG_REVISION = d.get("_revision")
-        ORG_SHA = sha
-        ORG_CARGADO_EN = _dt.now(_tz.utc).isoformat(timespec="seconds")
-        return {"montada": True, "source_sha256": sha,
-                "loaded_sha256": sha, "recargado": True}
-    return {"montada": True, "source_sha256": sha,
-            "loaded_sha256": ORG_SHA, "recargado": False}
+    with _ORG_CERROJO:
+        if not ruta:
+            return _foto_org(False, None)
+        try:
+            with open(ruta, "rb") as fh:
+                crudo = fh.read()
+            sha = _h.sha256(crudo).hexdigest()
+            d = _json.loads(crudo.decode("utf-8"))
+            # LOS MAPAS SE DERIVAN AQUÍ DENTRO, y eso es todo lo que hace falta:
+            # si `d` es `[]`, `"texto"` o `5`, o si sus campos no son mapas, el
+            # `.get()`/`.items()` revienta AQUÍ y lo recoge el `except`. Un
+            # `isinstance(d, dict)` explícito delante sería código muerto — lo
+            # escribí, y el mutante que lo quitaba sobrevivió: no cambiaba nada.
+            # Una comprobación sin falsador es adorno.
+            alias, jer = _mapa_alias(d), _mapa_jerarquia(d)
+        except Exception:
+            # Ilegible, corrupta o con forma ajena: NO se toca el estado bueno.
+            return _foto_org(True, None)
+        if sha != ORG_SHA:
+            # Los DOS mapas salen del MISMO fichero, así que se publican juntos.
+            # Si sólo se refrescara la jerarquía, `engineering-manager` seguiría
+            # saliendo en el organigrama y dando 422 en la bandeja: un rol que no
+            # puede recibir trabajo. Ese caso está medido, no es hipotético.
+            ROLES_ALIAS, JERARQUIA = alias, jer
+            ORG_REVISION = d.get("_revision")
+            ORG_SHA = sha
+            ORG_CARGADO_EN = _dt.now(_tz.utc).isoformat(timespec="seconds")
+        return _foto_org(True, sha)
 
 
 def canon_identidad(nombre: str) -> str | None:

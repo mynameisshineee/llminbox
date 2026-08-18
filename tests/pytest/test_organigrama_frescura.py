@@ -166,3 +166,71 @@ def test_sin_fuente_montada_no_se_finge_frescura(tmp_path, monkeypatch):
     assert d["jerarquia"] == {}
     assert d["aviso"] and "NO montada" in d["aviso"]
     assert d["stale"] is True
+
+
+# ── tres de CodeRabbit, las tres de la misma familia ──────────────────────────
+
+def test_una_fuente_con_forma_ajena_no_revienta_ni_pierde_lo_bueno(tmp_path, monkeypatch):
+    """`json.loads` acepta `[]` y `"texto"`: son JSON válido y no son un
+    organigrama. Construir los mapas FUERA del bloque protegido convertía eso en
+    un 500 — y un 500 no es «rancio», es que el endpoint se cae.
+
+    Una fuente con forma ajena es indistinguible de una ilegible: no se puede
+    derivar nada de ella. Se trata igual — se conserva lo último bueno y se marca.
+
+    FALSADOR: construir los mapas fuera del `try` da 500 y las tres aserciones
+    caen a la vez."""
+    s, ruta = _monta(tmp_path, monkeypatch)
+    with _cliente(s) as c:
+        assert _org(c)["stale"] is False
+        ruta.write_text("[]")                    # JSON válido, organigrama no
+        d = _org(c)
+    assert d["stale"] is True, d
+    assert d["jerarquia"], "tiró la jerarquía buena por un fichero con forma rara"
+    assert d["aviso"] and "rancio" in d["aviso"].lower()
+
+
+def test_la_respuesta_sale_de_UNA_instantanea(tmp_path, monkeypatch):
+    """La misma carrera que el sello del #5, un piso más arriba: si el endpoint
+    lee los globales DESPUÉS de refrescar, otra petición concurrente puede haber
+    cambiado la revisión en medio — y se serviría el hash de una con la jerarquía
+    de otra. Un organigrama así no es viejo: es imposible.
+
+    Se falsa sin simular concurrencia (sería un test que a veces pasa): se ejerce
+    la PROPIEDAD que la concurrencia rompería. El refresco se envuelve para que,
+    justo después de devolver su instantánea, los globales cambien —que es lo que
+    haría el otro hilo—. La respuesta tiene que seguir siendo coherente consigo
+    misma.
+
+    FALSADOR: que el endpoint lea `lp.JERARQUIA` en vez de la instantánea hace que
+    aquí salga la jerarquía pisada."""
+    s, _ruta = _monta(tmp_path, monkeypatch)
+    lp = s.lp
+    real = lp.refrescar_organigrama
+
+    def refresca_y_pisa():
+        foto = real()
+        lp.JERARQUIA = {"PISADO-POR-OTRO-HILO": {"reporta_a": "nadie"}}
+        lp.ORG_SHA = "hash-de-otra-revision"
+        return foto
+
+    monkeypatch.setattr(lp, "refrescar_organigrama", refresca_y_pisa)
+    with _cliente(s) as c:
+        d = _org(c)
+    assert "PISADO-POR-OTRO-HILO" not in d["jerarquia"], d
+    assert d["loaded_sha256"] != "hash-de-otra-revision", d
+    assert "be" in d["jerarquia"], d
+
+
+def test_sin_carga_valida_no_se_finge_una_hora(tmp_path, monkeypatch):
+    """`cargado_en` significa «cuándo se cargó el ORGANIGRAMA». Si nunca hubo
+    carga válida, devolver la hora de arranque del proceso es exactamente la
+    mentira que esta rama vino a quitar: un sello que afirma una carga que no
+    ocurrió.
+
+    FALSADOR: el fallback a `ARRANCADO_EN` publica una hora con `jerarquia: {}`."""
+    s = construir(tmp_path, monkeypatch)          # sin fuente montada
+    with _cliente(s) as c:
+        d = _org(c)
+    assert d["jerarquia"] == {}
+    assert d["cargado_en"] is None, d

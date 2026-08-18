@@ -3141,15 +3141,22 @@ def organigrama():
     # un inodo borrado. `stale=False` sólo se puede afirmar habiendo LEÍDO la
     # fuente en esta misma petición y coincidiendo el hash — cualquier otra cosa
     # (ilegible, distinta, no montada) es rancio y se dice.
+    # TODO sale de la MISMA instantánea. Volver a mirar los globales aquí reabre la
+    # carrera que el cerrojo cierra: otra petición puede recargar entre medias y se
+    # serviría el hash de una revisión con la jerarquía de otra.
     est = lp.refrescar_organigrama()
     fresco = (est["source_sha256"] is not None
               and est["source_sha256"] == est["loaded_sha256"])
-    base = {"revision": lp.ORG_REVISION,
+    base = {"revision": est["revision"],
             "source_sha256": est["source_sha256"],
             "loaded_sha256": est["loaded_sha256"],
-            "cargado_en": lp.ORG_CARGADO_EN or ARRANCADO_EN,
+            # Sin carga válida, `null`. Caer a `ARRANCADO_EN` publicaba la hora de
+            # arranque del proceso como si fuera la del organigrama: un sello que
+            # afirma una carga que no ocurrió — la mentira exacta que esta rama
+            # vino a quitar, cometida en el campo que la mide.
+            "cargado_en": est["cargado_en"],
             "stale": not fresco}
-    j = lp.JERARQUIA
+    j = est["jerarquia"]
     if not j:
         return {**base, "jerarquia": {}, "roles": 0,
                 "aviso": "jerarquía NO montada (LLMINBOX_ROLES_ALIAS vacío o "
