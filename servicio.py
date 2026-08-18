@@ -514,11 +514,20 @@ def migrar_raw_tipo(con) -> None:
         print(f"[migración] raw_tipo v{RAW_TIPO_V}: {len(cambios)} entradas recalculadas "
               f"desde su cabecera guardada", flush=True)
     except sqlite3.OperationalError as e:
-        # Base sin la columna todavía (orden de arranque) — no es fatal: el ALTER
-        # corre antes, pero si algún día no lo hiciera, esto NO puede tumbar el
-        # servicio por una columna de diagnóstico.
-        print(f"[migración] raw_tipo: no pude migrar ({e}) — se reintenta al "
-              f"próximo arranque", flush=True)
+        # ROLLBACK ANTES DE SALIR, y no es defensivo: sin él, un fallo a mitad del
+        # `executemany` dejaba la transacción de escritura ABIERTA, y el siguiente
+        # paso del arranque (`migrar_alias_a_rol`) hace su backup y COMMITEA — o
+        # sea que las filas ya recalculadas se confirmaban SIN el sello de versión,
+        # que es justo la propiedad «todo o nada» que el comentario de arriba
+        # afirma. El cerrojo de escritura, además, se quedaba tomado hasta ese
+        # commit ajeno. Cazado por CodeRabbit.
+        #
+        # Base sin la columna todavía (orden de arranque) tampoco es fatal: el
+        # ALTER corre antes, pero esto NO puede tumbar el servicio por una columna
+        # de diagnóstico.
+        con.rollback()
+        print(f"[migración] raw_tipo: no pude migrar ({e}) — nada escrito, se "
+              f"reintenta al próximo arranque", flush=True)
 
 
 # ── MIGRACIÓN alias→rol de `cursors` (②) ───────────────────────────────────────

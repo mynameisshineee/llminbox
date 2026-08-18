@@ -445,6 +445,27 @@ RE_AGENTE = re.compile(
 # ÚLTIMO campo de la cabecera. Sin esa exclusión, un `a · b · TIPO]` devolvería
 # «b · TIPO».
 RAW_TIPO = re.compile(r"·\s*([^·\]\r\n]{1,64}?)\s*\]")
+
+# Operadores de RUTA del propio formato. Excluirlos no es vocabulario de palabras:
+# es respetar la sintaxis de la cabecera, donde `→`/`∧` separan actores.
+OPERADORES_RUTA = ("→", "->", "←", "<-", "∧", "&")
+
+
+def _es_token_de_tipo(v: str) -> bool:
+    """Un tipo es UN SOLO TOKEN. Espacios y operadores de ruta lo descalifican.
+
+    Nace de medir la otra cara del filo: liberar el capturador de su vocabulario
+    cerrado (que perdía 641 tipos reales) lo dejó capturando 38.848 valores, de
+    los que **7.570 eran RUTAS o prosa** — `bikeus→security ∧ Albert`, `BARRIDO
+    CERRADO security→bikeus`—, porque `·` se usa como separador general y el
+    último campo no siempre es el tipo.
+
+    La regla NO es una lista negra de flechas: eso deja pasar 3.855 rutas con
+    espacios y sin flecha. Es la FORMA. Medido: con esta guarda sobreviven los
+    31.273 que sí lo son, y los tipos del hallazgo enteros (MEDIDO 376,
+    MEASURED 340, ADJUDICADO 90, VEREDICTO 27).
+    """
+    return bool(v) and not re.search(r"\s", v) and not any(o in v for o in OPERADORES_RUTA)
 ETIQUETAS = re.compile(r"^\s*(HEARTBEAT|CARRY-FORWARD|CLAIM|CANON|CERT|DONE|RESP|AVISO|MSG|ASK|ACK|STATUS|INFO|HANDOFF)"
                        r"(?:[/·\-]\s*(?:HEARTBEAT|CARRY-FORWARD|CLAIM|CANON|CERT|DONE|RESP|AVISO|MSG|ASK|ACK|STATUS|INFO|HANDOFF))*\s*",
                        re.IGNORECASE)
@@ -534,17 +555,23 @@ def raw_tipo_de(head: str) -> str | None:
     cierre = inner.find("]")
     inner = inner[:cierre + 1] if cierre != -1 else inner
     m = RAW_TIPO.search(inner)
-    if m:
+    if m and _es_token_de_tipo(m.group(1)):
         return m.group(1)
+    # Si el último campo NO era un tipo, la cabecera todavía puede declararlo al
+    # frente (`### [DONE algo · bikeus→security ∧ Albert]`). Cortar en seco aquí
+    # sería descartar de más por el otro lado.
     et = ETIQUETAS.match(inner)
     return et.group(1) if et else None
 
 
-def _campos(head: str, cola: str) -> tuple[str | None, str | None, list[str], list[str], str | None]:
-    """Extrae (ts, actor, destinatarios, difusion, tipo, por_arroba).
+def _campos(head: str, cola: str) -> tuple[
+        str | None, str | None, list[str], list[str], str | None, bool, str | None]:
+    """Extrae (ts, actor, destinatarios, difusion, tipo, por_arroba, raw_tipo).
 
     Devuelve None en lo que no se pueda leer. `por_arroba` dice si los destinatarios
     salieron de un `@` en una cabecera sin flecha — ver el campo del mismo nombre.
+    `raw_tipo` es el LEXEMA escrito en la posición del tipo, se entienda o no
+    (ver `raw_tipo_de`); `tipo` es lo que el sistema interpreta de él.
     """
     m = TS.search(head) or TS.search(cola)
     ts = m.group(1) if m else None

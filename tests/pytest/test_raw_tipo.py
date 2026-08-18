@@ -335,3 +335,112 @@ def test_una_revision_nueva_recalcula_todo_el_corpus(tmp_path, monkeypatch):
     assert rancio == "FYI", f"el lexema rancio no se recalculó: {rancio}"
     assert falso is None, f"el falso positivo sobrevivió a la revisión: {falso}"
     assert sello == "2", sello
+
+
+# ── la otra cara del mismo filo: no descartar de menos, pero tampoco de más ──
+# Medido sobre el corpus vivo: liberar el capturador de su vocabulario lo dejó
+# capturando 38.848 valores, de los que **7.570 no eran tipos sino RUTAS o prosa**
+# (`bikeus→security ∧ Albert`, `BARRIDO CERRADO security→bikeus`). El separador
+# `·` se usa como separador general y el último campo no siempre es el tipo.
+#
+# La regla NO es una lista negra de flechas —eso deja pasar 3.855 rutas con
+# espacios y sin flecha—: **un tipo es UN SOLO TOKEN**. Espacios y operadores de
+# ruta son gramática de la cabecera, no parte de un nombre. No es vocabulario de
+# palabras; es respetar la sintaxis del propio formato.
+
+def _raw(head):
+    import ledger_parse as lp
+    return lp.raw_tipo_de(head)
+
+
+def test_una_ruta_en_el_ultimo_campo_no_es_un_tipo():
+    """El caso mayoritario del corpus real: `·` separando prosa y ruta.
+
+    FALSADOR: sin la guarda de forma, `/lint` reportaría 7.570 «tipos declarados
+    que no entiendo» que son rutas — envenenando exactamente el instrumento que
+    la taxonomía tiene que alimentar."""
+    assert _raw("### [S-15 · BARRIDO CERRADO security→bikeus ∧ Albert] x") is None
+    assert _raw("### [S-17 · nota corta security→marketing ∧ bikeus] x") is None
+
+
+def test_una_ruta_sin_espacios_tampoco():
+    """La lista negra de flechas y la regla de token se solapan aquí, y por eso
+    se aplican las dos: `bikeus→security` es un solo token y sigue siendo ruta."""
+    assert _raw("### [algo · bikeus→security] x") is None
+
+
+def test_si_el_ultimo_campo_no_vale_se_cae_a_la_etiqueta_del_frente():
+    """No se devuelve None a la ligera: si la cabecera SÍ declara tipo al frente,
+    ése es el bueno. Es el caso real `### [DONE hueco … · bikeus→security ∧ …]`.
+
+    FALSADOR: cortar en seco al rechazar el último campo perdería el `DONE` que
+    la entrada sí declaraba — descartar de más otra vez, por el otro lado."""
+    assert _raw("### [DONE hueco npm audit · bikeus→security ∧ Albert] x") == "DONE"
+
+
+def test_el_token_con_punto_sigue_valiendo():
+    """CONTROL de que la guarda no ha reintroducido un vocabulario: `REVIEW.V2`
+    no tiene espacios ni operadores, luego pasa."""
+    assert _raw("### [cto-A → backend · REVIEW.V2] x") == "REVIEW.V2"
+    assert _raw("### [cto-A → backend · Medido] x") == "Medido"
+
+
+def test_prosa_sin_flecha_tampoco_es_un_tipo():
+    """EL FALSADOR QUE FALTABA, y lo delató un mutante que sobrevivía: con sólo
+    una lista negra de flechas, `S-13 APLICADOS Y VERIFICADOS E2E` pasaría como
+    tipo declarado. Son 3.855 casos en el corpus vivo — prosa con espacios y sin
+    ninguna flecha.
+
+    Por eso la regla es la FORMA (un solo token) y no una lista de símbolos: una
+    lista negra sólo prohíbe lo que a alguien se le ocurrió enumerar."""
+    assert _raw("### [S-12 · S-13 APLICADOS Y VERIFICADOS E2E] x") is None
+    assert _raw("### [algo · nota corta de cierre] x") is None
+
+
+def test_la_migracion_que_falla_no_deja_nada_escrito(tmp_path, monkeypatch):
+    """El camino de fallo tiene que ser «todo o nada», que es lo que su comentario
+    afirma. Sin `rollback()`, un fallo a mitad del `executemany` dejaba la
+    transacción ABIERTA y el siguiente paso del arranque (`migrar_alias_a_rol`)
+    la commiteaba: filas recalculadas confirmadas SIN el sello de versión — o sea
+    una base a medio migrar que se cree migrada. Cazado por CodeRabbit.
+
+    FALSADOR: quitar el `rollback()` deja escrita la fila parcial y esto cae."""
+    import sqlite3
+    s = construir(tmp_path, monkeypatch)
+    (tmp_path / "DEMO-LEDGER.md").write_text(CABECERAS)
+    with TestClient(s.app):
+        s.barrido()
+    con = db_directa(s)
+    con.execute("UPDATE entries SET raw_tipo=NULL")
+    con.execute("DELETE FROM meta WHERE k='raw_tipo_v'")
+    con.commit()
+
+    class _Falla:
+        """Escribe una fila y REVIENTA — la forma exacta del fallo a mitad."""
+        def __init__(self, real):
+            self._r = real
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+        def executemany(self, sql, seq):
+            self._r.executemany(sql, list(seq)[:1])
+            raise sqlite3.OperationalError("disk I/O error (simulado)")
+
+    s.migrar_raw_tipo(_Falla(con))       # no debe propagar: es diagnóstico
+
+    # EL COMMIT AJENO, que es donde está el daño. `migrar_alias_a_rol` corre justo
+    # después en el arranque y commitea SOBRE LA MISMA CONEXIÓN: sin el rollback,
+    # aquí es donde la fila parcial se confirma sin sello.
+    #
+    # (Mi primera versión de este test consultaba con una conexión NUEVA y pasaba
+    # con el mutante puesto: una escritura sin confirmar no se ve desde fuera, así
+    # que medía el aislamiento de SQLite y no la propiedad. Teatro, cazado por el
+    # mutante que sobrevivía.)
+    con.commit()
+
+    ver = db_directa(s)
+    assert ver.execute("SELECT COUNT(*) c FROM entries "
+                       "WHERE raw_tipo IS NOT NULL").fetchone()["c"] == 0, \
+        "un commit posterior confirmó la fila parcial de una migración que falló"
+    assert ver.execute("SELECT COUNT(*) c FROM meta "
+                       "WHERE k='raw_tipo_v'").fetchone()["c"] == 0, \
+        "se selló como migrada una base que no lo está"
