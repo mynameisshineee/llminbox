@@ -3275,11 +3275,24 @@ def organigrama():
             "stale": not fresco}
     j = est["jerarquia"]
     if not j:
-        return {**base, "jerarquia": {}, "roles": 0,
-                "aviso": "jerarquía NO montada (LLMINBOX_ROLES_ALIAS vacío o "
-                         "ilegible) — esto NO significa que no reportes a nadie, "
-                         "significa que este servicio no lo sabe. Fuente en prosa: "
-                         "_shared_refs/ORGANIGRAMA.md"}
+        # Dos causas DISTINTAS caían en el mismo aviso, y sólo una de ellas es un
+        # problema de montaje. `source_sha256` las separa: es `None` sólo cuando no
+        # hubo lectura válida en ESTA petición. Con hash de fuente, el fichero está
+        # ahí y se leyó — lo que falta es el CAMPO. Culpar al montaje entonces manda
+        # al operador a buscar una avería que no existe: un aviso que imputa una
+        # causa que su comprobación no midió estorba más que callarse.
+        if est["source_sha256"] is None:
+            aviso = ("jerarquía NO montada (LLMINBOX_ROLES_ALIAS vacío o "
+                     "ilegible) — esto NO significa que no reportes a nadie, "
+                     "significa que este servicio no lo sabe. Fuente en prosa: "
+                     "_shared_refs/ORGANIGRAMA.md")
+        else:
+            aviso = ("la fuente firmada SÍ se leyó en esta petición, pero no trae "
+                     "el campo `jerarquia` (o viene vacío) — el montaje está bien, "
+                     "revisa el CONTENIDO de LLMINBOX_ROLES_ALIAS. Esto NO significa "
+                     "que no reportes a nadie, significa que este servicio no lo "
+                     "sabe. Fuente en prosa: _shared_refs/ORGANIGRAMA.md")
+        return {**base, "jerarquia": {}, "roles": 0, "aviso": aviso}
     if not fresco:
         # Se sirve lo último bueno: una jerarquía vacía haría leer «no reporto a
         # nadie», que es lo contrario de la verdad. Pero marcada, que es lo que

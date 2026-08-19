@@ -303,6 +303,13 @@ def _foto_org(montada: bool, source: str | None) -> dict:
             "revision": ORG_REVISION, "cargado_en": ORG_CARGADO_EN}
 
 
+# Si la fuente se vuelve ilegible, se avisa UNA vez. `refrescar_organigrama()`
+# corre en cada petición: sin este marcador una sola avería imprime una línea por
+# petición y entierra el resto del log. Se rearma al recuperarse — si no, la
+# SIGUIENTE caída sería la que pasa desapercibida.
+_ORG_FALLO_AVISADO = False
+
+
 def refrescar_organigrama() -> dict:
     """Relee la fuente firmada si sus bytes cambiaron y devuelve UNA instantánea.
 
@@ -329,7 +336,7 @@ def refrescar_organigrama() -> dict:
     servir una jerarquía vacía sería peor —el agente leería «no reporto a nadie»,
     que es lo contrario de la verdad—, pero servirla como buena es lo que falló.
     """
-    global ROLES_ALIAS, JERARQUIA, ORG_SHA, ORG_CARGADO_EN, ORG_REVISION
+    global ROLES_ALIAS, JERARQUIA, ORG_SHA, ORG_CARGADO_EN, ORG_REVISION, _ORG_FALLO_AVISADO
     import hashlib as _h
     import json as _json
     import os as _os
@@ -351,8 +358,14 @@ def refrescar_organigrama() -> dict:
             # escribí, y el mutante que lo quitaba sobrevivió: no cambiaba nada.
             # Una comprobación sin falsador es adorno.
             alias, jer = _mapa_alias(d), _mapa_jerarquia(d)
-        except Exception:
+        except Exception as e:
             # Ilegible, corrupta o con forma ajena: NO se toca el estado bueno.
+            if not _ORG_FALLO_AVISADO:
+                _ORG_FALLO_AVISADO = True
+                print(f"[organigrama] la fuente firmada dejó de leerse ({ruta}): "
+                      f"{type(e).__name__}: {e} — sirvo lo último bueno MARCADO "
+                      f"como rancio. No vuelvo a repetir este aviso hasta que se "
+                      f"recupere.", flush=True)
             return _foto_org(True, None)
         if sha != ORG_SHA:
             # Los DOS mapas salen del MISMO fichero, así que se publican juntos.
@@ -363,6 +376,10 @@ def refrescar_organigrama() -> dict:
             ORG_REVISION = d.get("_revision")
             ORG_SHA = sha
             ORG_CARGADO_EN = _dt.now(_tz.utc).isoformat(timespec="seconds")
+        if _ORG_FALLO_AVISADO:
+            _ORG_FALLO_AVISADO = False
+            print(f"[organigrama] la fuente firmada vuelve a leerse ({ruta})",
+                  flush=True)
         return _foto_org(True, sha)
 
 

@@ -243,3 +243,74 @@ def test_sin_carga_valida_no_se_finge_una_hora(tmp_path, monkeypatch):
         d = _org(c)
     assert d["jerarquia"] == {}
     assert d["cargado_en"] is None, d
+
+
+def test_leida_sin_jerarquia_no_se_confunde_con_no_montada(tmp_path, monkeypatch):
+    """Montada-y-leída-sin-`jerarquia` NO es lo mismo que no montada.
+
+    La rama del aviso miraba sólo `j`, así que una fuente presente, legible en
+    ESTA petición y con el hash coincidiendo respondía «jerarquía NO montada
+    (LLMINBOX_ROLES_ALIAS vacío o ilegible)». Las dos causas que nombra son
+    FALSAS en ese caso: el operador sale a buscar una avería de montaje que no
+    existe, en vez del campo ausente en el fichero firmado. Un aviso que imputa
+    una causa que su comprobación no midió es peor que no avisar.
+
+    `est["source_sha256"]` ya separa los dos mundos: es `None` sólo cuando no
+    hubo lectura válida en esta petición.
+
+    FALSADOR: con la rama mirando sólo `j`, el aviso dice «NO montada» y la
+    aserción del texto cae; `stale` además se afirmaría sin haberlo medido.
+    """
+    s, ruta = _monta(tmp_path, monkeypatch, org={"roles_alias": {"cto": "cto"}})
+    with _cliente(s) as c:
+        d = _org(c)
+    # La lectura SÍ ocurrió: hay hash de fuente y coincide con el cargado.
+    assert d["source_sha256"] == _sha(ruta), d
+    assert d["stale"] is False, d
+    assert d["jerarquia"] == {} and d["roles"] == 0, d
+    # Y el aviso no puede imputar el montaje.
+    aviso = (d.get("aviso") or "").lower()
+    assert "no montada" not in aviso, aviso
+    assert "ilegible" not in aviso, aviso
+    assert "jerarquia" in aviso or "jerarquía" in aviso, aviso
+
+
+def test_la_caida_a_rancio_se_anuncia_UNA_vez_y_se_rearma(tmp_path, monkeypatch, capsys):
+    """Que la fuente se vuelva ilegible no imprimía NADA.
+
+    CodeRabbit lo señaló como «registra sólo en la transición», dando por hecho
+    que ya había registro que deduplicar. No lo había: el `except` devolvía la
+    foto rancia en silencio. El hallazgo estaba mal en la premisa y bien en la
+    forma — en una flota desatendida el único aviso era que alguien preguntara
+    por `/organigrama`, y nadie pregunta hasta que algo ya salió mal.
+
+    Una vez, porque `refrescar_organigrama()` corre en CADA petición: registrar
+    sin deduplicar convierte una avería en miles de líneas idénticas y entierra
+    todo lo demás. Y con rearme, porque si no, la SEGUNDA caída —la de la semana
+    que viene— sería la que no se anuncia.
+
+    FALSADOR: sin el marcador, la segunda petición vuelve a imprimir y `una vez`
+    cae; sin el rearme en la rama de éxito, la segunda caída no imprime y
+    `otra vez` cae.
+    """
+    s, ruta = _monta(tmp_path, monkeypatch)
+    with _cliente(s) as c:
+        assert _org(c)["stale"] is False
+        capsys.readouterr()                       # descarto el ruido del arranque
+
+        ruta.write_text("{ roto")                 # ilegible
+        assert _org(c)["stale"] is True
+        una_vez = capsys.readouterr().out
+        assert una_vez.count("organigrama") >= 1, una_vez
+
+        _org(c); _org(c)                          # dos peticiones más, misma avería
+        assert "organigrama" not in capsys.readouterr().out.lower(), "repitió el aviso"
+
+        ruta.write_text(json.dumps(ORG_INICIAL))  # se recupera
+        assert _org(c)["stale"] is False
+        capsys.readouterr()
+
+        ruta.write_text("{ roto otra vez")        # y vuelve a caer
+        assert _org(c)["stale"] is True
+        otra_vez = capsys.readouterr().out
+        assert "organigrama" in otra_vez.lower(), "el marcador no se rearmó: " + repr(otra_vez)
