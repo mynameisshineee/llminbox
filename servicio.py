@@ -3862,7 +3862,13 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
         si = lambda b: "sí" if b else "no"              # noqa: E731
         for rol in filas[:25]:
             ns = sorted(nombres_de.get(rol, set()))
-            cur = con.execute("SELECT COUNT(*) n FROM cursors WHERE agent=?",
+            # `lower(agent)`, y es el REVERSO de la normalización de arriba:
+            # `clave_cursor()` guarda el rol TAL COMO lo declara `roster.json`, así
+            # que un `"rol": "CTO"` deja la fila con clave `CTO`. Consultar con el
+            # valor ya normalizado devolvía cero y la columna decía `cursor=no`
+            # sobre un cursor que existe. Normalizar para comparar conjuntos y no
+            # normalizar al consultar es el mismo defecto con el signo cambiado.
+            cur = con.execute("SELECT COUNT(*) n FROM cursors WHERE lower(agent)=?",
                               (rol,)).fetchone()["n"]
             correo = 0
             if ns:

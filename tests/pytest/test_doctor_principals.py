@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 
-from conftest import construir
+from conftest import construir, db_directa
 from fastapi.testclient import TestClient
 
 ORG = {                                   # organigrama firmado: sólo `be` y `cto`
@@ -305,3 +305,65 @@ def test_el_correo_del_informe_coincide_con_lo_que_la_bandeja_ENTREGA(tmp_path, 
     assert dice_correo == entregado, (
         f"⑥ dice correo={'sí' if dice_correo else 'no'} y la bandeja entrega="
         f"{entregado} — el informe afirma una entrega que no ocurre:\n{fila}")
+
+
+def test_el_cursor_se_encuentra_aunque_el_roster_declare_el_rol_en_mayusculas(tmp_path, monkeypatch):
+    """El reverso de la normalización, y por eso va junto a ella.
+
+    `clave_cursor()` guarda el rol TAL COMO lo declara `roster.json`. Al normalizar
+    los conjuntos para comparar proyecciones, la consulta de cursores empezó a
+    buscar el valor en minúsculas y no encontraba la fila: `cursor=no` sobre un
+    cursor que existe. Normalizar para comparar y no normalizar al consultar es el
+    mismo defecto con el signo cambiado.
+
+    FALSADOR: volver a `WHERE agent=?` deja `cursor=no` con la fila delante."""
+    roster = json.loads(json.dumps(ROSTER))
+    for a in roster["agentes"]:
+        if a["nombre"] == "destilador":
+            a["rol"] = "DESTILADOR"           # el humano escribió en mayúsculas
+    (tmp_path / "org.json").write_text(json.dumps(ORG))
+    s = construir(tmp_path, monkeypatch, roster=roster,
+                  extra_env={"LLMINBOX_ROLES_ALIAS": str(tmp_path / "org.json")})
+    (tmp_path / "DEMO-LEDGER.md").write_text(
+        "### [cto-A → destilador · FYI] algo\ncuerpo\n")
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        c.post("/inbox/destilador/leido", json={"hasta": {"demo-ledger": 1}})
+        con = db_directa(s)
+        clave = con.execute("SELECT agent FROM cursors").fetchone()["agent"]
+        sec = _seis(c.get("/doctor").text)
+    assert clave == "DESTILADOR", f"el arnés no reprodujo el caso: clave={clave}"
+    fila = next(ln for ln in sec.splitlines() if ln.strip().startswith("destilador"))
+    assert fila.split()[5] == "sí", f"dice cursor=no con la fila delante: {fila}"
+
+
+def test_el_alias_no_parseable_se_comprueba_CONTRA_LA_BANDEJA(tmp_path, monkeypatch):
+    """El hallazgo atado a la conducta, no al texto del informe.
+
+    La primera versión de este test sólo leía `/doctor`: habría seguido verde si
+    el alias dejara de resolver, o si el parser empezara a producir destinatarios
+    para él — o sea, precisamente cuando el hallazgo dejara de ser cierto.
+
+    Se comprueban las dos mitades sobre una entrada REAL dirigida a `em-bikeus`:
+
+      · `/inbox/em-bikeus` responde 200      → la identidad SÍ resuelve
+      · y NO trae esa entrada                 → el nombre NO produce destinatario
+
+    Juntas son la patología. Por separado, ninguna lo es.
+
+    FALSADOR: si el parser aprendiera a enrutar alias del organigrama, la segunda
+    aserción cae — y el hallazgo dejaría de ser cierto al mismo tiempo."""
+    s, _ = _monta_em(tmp_path, monkeypatch)
+    (tmp_path / "DEMO-LEDGER.md").write_text(
+        "### [cto-A → em-bikeus · FYI] delegación al EM por su alias\ncuerpo\n")
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        r = c.get("/inbox/em-bikeus")
+        sec = _seis(c.get("/doctor").text)
+    assert r.status_code == 200, f"la identidad ya no resuelve: {r.status_code}"
+    assert "delegación al EM" not in r.text, (
+        "el parser ahora SÍ enruta ese alias — el hallazgo dejó de ser cierto y "
+        "el informe tiene que dejar de declararlo")
+    assert "em-bikeus" in sec and "NO PARSEABLE" in sec, sec
