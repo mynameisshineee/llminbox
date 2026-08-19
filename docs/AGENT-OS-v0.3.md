@@ -327,16 +327,49 @@ active_org_revision  = 42
 
 Y al revés, el caso en que **sí** hay que parar: si la proyección **activa** no se puede demostrar contra su atestación —artefacto editado, hash que no cuadra— entonces **fail closed y no hay claim**. La diferencia importa: una fuente nueva sin atestar es trabajo en curso; una activa que no se sostiene es corrupción.
 
+### El conjunto que autoriza NO es el árbol de trabajo
+
+Separar fuente y activa **lógicamente** no basta si las dos comparten directorio. Con `generated/` como el conjunto que autoriza, compilar la 43 —sin atestar, sin activar— **sobrescribe** los artefactos de la 42, y a partir de ahí los hashes en disco ya no corresponden a la revisión activa: tras un reinicio el control plane no puede arrancar con la 42, que es exactamente lo que el falsador de arriba exige que pueda hacer. El propio F-A3 quedaba inalcanzable.
+
+Los artefactos se **direccionan por revisión** y son inmutables una vez escritos:
+
+```
+generated/              ← salida de trabajo del compilador. NO autoriza nada.
+org-revisions/42/       ← promovido en la ATESTACIÓN. Se escribe una vez.
+org-revisions/43/       ← la 43 vive aquí sin tocar la 42
+```
+
+Compilar produce `generated/`; **atestar promueve** esa salida a `org-revisions/<rev>/` y registra sus hashes; **activar** mueve un puntero. Compilar cien veces no altera la revisión activa, porque no escriben en el mismo sitio.
+
 ```sql
 CREATE TABLE org_activation (             -- una sola fila, la verdad del work plane
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   active_org_revision INTEGER NOT NULL REFERENCES org_attestations(org_revision),
-  activated_at_epoch INTEGER NOT NULL);
+  activated_at_epoch INTEGER NOT NULL,
+  -- INTEGRIDAD DEL CONJUNTO ACTIVO. El arranque no basta: una edición POSTERIOR
+  -- no cambia esta tabla, y el claim siguiente se concedía. Ahora el claim lee
+  -- este flag —una columna, no el filesystem— y el verificador lo baja.
+  integrity_ok INTEGER NOT NULL DEFAULT 1,
+  verified_at_epoch INTEGER NOT NULL);
 ```
 
-**Falsador F-A3** — dejar una revisión 43 sin atestar en disco: los claims siguen concediéndose bajo la 42, y `/organigrama` la reporta `pending`. Si los claims paran, la autoridad está atada al disco y no a lo activado.
+**Y la ventana se declara, no se disimula.** Hacer verdadero «el claim SIGUIENTE a la edición falla» exigiría rehashear el conjunto activo en cada claim, que es justo el coste que esta sección evita. Lo que el sistema puede sostener es más débil y hay que decirlo con su cota:
 
-**Falsador F-A4** — editar un byte de un artefacto de la revisión **activa**: el claim siguiente falla cerrado.
+```
+verificador: al arranque · por cadencia (≤60 s) · ante evento de fichero
+detecta divergencia → integrity_ok = 0, atómico, ANTES de autorizar nada más
+claims con integrity_ok = 0 → fail closed
+
+VENTANA DECLARADA: entre la edición y su detección puede concederse un claim.
+Cota: la cadencia del verificador. No es cero, y afirmar que lo es sería
+exactamente el tipo de promesa que §19 prohíbe.
+```
+
+**Falsador F-A4** — editar un byte de un artefacto de la revisión **activa** y esperar a que el verificador pase ⇒ el claim siguiente falla cerrado. Redactado así es comprobable; la versión anterior («el claim siguiente a la edición») no lo era con ninguna implementación que no hasheara por claim.
+
+**Falsador F-A5** — compilar la revisión 43 mientras la 42 está activa, y reiniciar ⇒ el control plane arranca con la 42 y sus artefactos verifican. Con `generated/` como conjunto activo, esto es rojo.
+
+**Falsador F-A3** — dejar una revisión 43 sin atestar en disco: los claims siguen concediéndose bajo la 42, y `/organigrama` la reporta `pending`. Si los claims paran, la autoridad está atada al disco y no a lo activado.
 
 Un compilado cuya fuente no tiene atestación vigente **no se despliega**: el control plane arranca con la última revisión atestada y avisa; nunca con contenido sin aprobar. Esto sustituye a `gate_delegado_por: ALBERT` como mecanismo — la delegación de gate pasa a ser **una concesión permanente registrada una vez** (§6.4), no una dependencia del operador en cada aprobación.
 
@@ -564,7 +597,9 @@ BEGIN IMMEDIATE;
 -- LA REVISIÓN QUE GOBIERNA, leída UNA vez y usada en todo el bloque. No se
 -- rehashea nada del filesystem aquí: `active_org_revision` ya es el resultado de
 -- haber verificado fuente + artefactos + compilador en la ACTIVACIÓN (§5).
-activa = SELECT active_org_revision FROM org_activation WHERE singleton = 1;
+activa, ok = SELECT active_org_revision, integrity_ok FROM org_activation WHERE singleton = 1;
+if not ok:
+    ROLLBACK; return 503 org_integrity_failed    -- el conjunto activo no se sostiene
 
 canonico = SELECT COALESCE(p.aliases_of, p.id) FROM principals p
             WHERE p.id = :principal AND p.org_revision = activa;
