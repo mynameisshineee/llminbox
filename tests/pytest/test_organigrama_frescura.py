@@ -303,7 +303,8 @@ def test_la_caida_a_rancio_se_anuncia_UNA_vez_y_se_rearma(tmp_path, monkeypatch,
         una_vez = capsys.readouterr().out
         assert una_vez.count("organigrama") >= 1, una_vez
 
-        _org(c); _org(c)                          # dos peticiones más, misma avería
+        _org(c)                                   # dos peticiones más,
+        _org(c)                                   # la misma avería
         assert "organigrama" not in capsys.readouterr().out.lower(), "repitió el aviso"
 
         ruta.write_text(json.dumps(ORG_INICIAL))  # se recupera

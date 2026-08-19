@@ -475,7 +475,12 @@ def huella_censo() -> str:
 # columna `raw_tipo` NO EXISTE y no hay sello — ninguna versión del derivador ha
 # llegado nunca a producción, así que "1" puede representar la implementación final
 # de esta rama. Si alguna hubiera corrido, esto tendría que ser "2".
-RAW_TIPO_V = "1"
+# v2 (2026-08-19): `raw_tipo_de` aprendió la forma SPOKE sin corchetes. Sin subir
+# esto el arreglo es INERTE sobre lo ya indexado —el sello de v1 hace `return` y
+# los ledgers dormidos no vuelven a pasar por `reindex()`—, que es literalmente el
+# defecto que esta migración nació para cerrar. Medido sobre una copia de la base
+# viva: la re-pasada rescata 66 entradas y no pierde ninguna.
+RAW_TIPO_V = "2"
 
 
 def migrar_raw_tipo(con) -> None:

@@ -446,3 +446,122 @@ def test_la_migracion_que_falla_no_deja_nada_escrito(tmp_path, monkeypatch):
     assert ver.execute("SELECT COUNT(*) c FROM meta "
                        "WHERE k='raw_tipo_v'").fetchone()["c"] == 0, \
         "se selló como migrada una base que no lo está"
+
+
+# ── la forma spoke sin corchetes (CodeRabbit, Major, sobre #9 ya desplegada) ──
+
+SPOKE_CON_TIPO = "## 2026-07-06T11:45Z · transcribo → wiki-vault · PRODUCED"
+SPOKE_RUTA     = "## 2026-07-06T11:45Z · transcribo → wiki-vault"
+
+
+def test_la_cabecera_spoke_sin_corchetes_tambien_declara_su_tipo():
+    """`H_ENTRY` acepta `## <ISO> · a → b · TIPO` — sin corchetes. `RAW_TIPO`
+    exige `]`, así que esa cabecera VÁLIDA devolvía None, y ni `reindex()` ni la
+    migración podían rellenarla: `/lint` la contaba como «sin tipo declarado»
+    teniéndolo escrito en la posición canónica. Es exactamente el hueco que #9
+    venía a cerrar, en la otra forma de cabecera.
+
+    Medido sobre producción el 2026-08-19: 556 cabeceras spoke sin corchetes, de
+    las que 66 llevan un tipo con forma válida y quedaron en NULL.
+
+    FALSADOR: sin la rama spoke, la primera aserción da None.
+    """
+    assert _raw(SPOKE_CON_TIPO) == "PRODUCED"
+    for h, esperado in (
+            ("## 2026-07-06T13:06Z · wiki-vault → transcribo · INGESTED", "INGESTED"),
+            ("## 2026-07-06T13:06Z · wiki-vault → transcribo · ACK", "ACK")):
+        assert _raw(h) == esperado, h
+
+
+def test_la_rama_spoke_no_captura_la_ruta_como_tipo():
+    """CONTROL, y es el que importa: la misma medición que motivó `_es_token_de_tipo`
+    mostró que soltar el capturador se traga 7.570 rutas y prosa. La rama nueva
+    corre el MISMO guarda de forma, así que una cabecera spoke cuyo último campo
+    es la ruta —no un tipo— sigue devolviendo None.
+
+    FALSADOR: una rama spoke que devuelva el último campo sin pasar por
+    `_es_token_de_tipo` captura `wiki-vault` como si fuera un tipo.
+    """
+    assert _raw(SPOKE_RUTA) is None
+    assert _raw("## 2026-07-06T11:45Z · a → b · BARRIDO CERRADO x→y") is None
+    assert _raw("## 2026-07-06T11:45Z · a → b · bikeus→security ∧ Albert") is None
+
+
+def test_la_forma_con_corchetes_manda_sobre_la_spoke():
+    """CONTROL de precedencia: si la cabecera trae corchetes, el tipo sale de
+    DENTRO, no del último campo de la línea.
+
+    La precedencia sale del ORDEN de las dos ramas, no de un guarda: el `mb is
+    None` que escribí delante resultó no decidir nada (mutante superviviente) y
+    está retirado.
+
+    FALSADOR: poner la rama spoke ANTES de `RAW_TIPO` devuelve el campo de fuera.
+    """
+    assert _raw("### [cto → be · DONE] · cola de fuera") == "DONE"
+
+
+def test_el_fallo_de_la_migracion_no_se_lleva_por_delante_la_columna(tmp_path, monkeypatch):
+    """GUARDA DE MECANISMO, no arreglo de un fallo: hoy no lo hay, y la razón
+    por la que no lo hay es una configuración que se puede cambiar sin querer.
+
+    CodeRabbit lo dio por Major revisando #9: `_preparar_indice()` añade
+    `entries.raw_tipo` con un `ALTER TABLE` y NO commitea antes de llamar a la
+    migración, así que —decía— el `con.rollback()` del camino de fallo se lleva
+    también el DDL, el arranque continúa, y `/lint` queda consultando una columna
+    que ya no existe.
+
+    Medido antes de tocar nada: NO ocurre. `sqlite3.connect(DB, timeout=30)` deja
+    `isolation_level=''` (modo legacy), y ahí el módulo abre transacción implícita
+    sólo ante DML — un `ALTER TABLE` corre en autocommit (`in_transaction` sigue
+    en `False`) y ningún `rollback` posterior puede revertirlo. La premisa del
+    hallazgo era que el DDL va dentro de la transacción; en esta conexión no va.
+
+    Pero la protección es una PROPIEDAD DE LA CONFIGURACIÓN, no del código, y no
+    estaba escrita en ninguna parte. Con `autocommit=False` (el modo PEP 249, que
+    es hacia donde empuja Python) o `isolation_level=None` mal puesto, el hallazgo
+    pasa a ser cierto y el daño es el que describe. Este test ata las dos mitades
+    para que ese cambio se vea aquí y no en `/lint` en producción.
+
+    FALSADOR: cambiar la conexión a `autocommit=False` pone en rojo la aserción
+    del modo Y la de la columna.
+    """
+    import sqlite3
+    s = construir(tmp_path, monkeypatch)
+    (tmp_path / "DEMO-LEDGER.md").write_text(CABECERAS)
+    with TestClient(s.app):
+        s.barrido()
+
+    con = db_directa(s)
+    con.execute("ALTER TABLE entries DROP COLUMN raw_tipo")
+    con.execute("DELETE FROM meta WHERE k='raw_tipo_v'")
+    con.commit()
+
+    class _FallaSoloEnLaMigracion:
+        """Deja pasar todo el arranque y revienta EXACTAMENTE en el `UPDATE` de
+        `raw_tipo`, que es la forma real del fallo que se quiere aguantar."""
+        def __init__(self, real):
+            self._r = real
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+        def executemany(self, sql, seq):
+            if "raw_tipo" in sql:
+                raise sqlite3.OperationalError("disk I/O error (simulado)")
+            return self._r.executemany(sql, seq)
+
+    s._preparar_indice(_FallaSoloEnLaMigracion(con))
+    con.commit()                       # el commit ajeno del paso siguiente
+
+    cols = {r[1] for r in db_directa(s).execute("PRAGMA table_info(entries)")}
+    assert "raw_tipo" in cols, \
+        "el rollback de la migración se llevó el ALTER TABLE: /lint quedaría roto"
+
+    # LA OTRA MITAD, y sin ella lo de arriba pasa sin explicar por qué: el DDL
+    # sobrevive porque la conexión está en modo legacy. Atarlo aquí convierte un
+    # cambio de configuración silencioso en un test rojo.
+    assert con.isolation_level == "", (
+        "la conexión dejó el modo legacy: ahora el ALTER TABLE SÍ entra en la "
+        "transacción y el rollback de la migración se lo lleva — hay que sellar "
+        "las columnas con un commit antes de llamar a migrar_raw_tipo()")
+    sonda = db_directa(s)
+    sonda.execute("ALTER TABLE entries ADD COLUMN _sonda_ddl TEXT")
+    assert sonda.in_transaction is False, "el DDL abrió transacción: ver arriba"

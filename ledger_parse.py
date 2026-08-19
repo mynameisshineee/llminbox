@@ -655,6 +655,11 @@ class Entrada:
         return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
 
 
+# La misma alternativa spoke que ya lleva `H_ENTRY`, aparte para que las dos no
+# puedan divergir en silencio.
+_SPOKE = re.compile(r"^## \d{4}-\d{2}-\d{2}T[\d:]+Z\s*·")
+
+
 def raw_tipo_de(head: str) -> str | None:
     """El lexema escrito en una posición COMPATIBLE CON LA GRAMÁTICA DE TIPO.
 
@@ -698,6 +703,26 @@ def raw_tipo_de(head: str) -> str | None:
     m = RAW_TIPO.search(inner)
     if m and _es_token_de_tipo(m.group(1)):
         return m.group(1)
+    # La forma SPOKE no lleva corchetes: `## <ISO> · a → b · TIPO`. `H_ENTRY` la
+    # acepta, pero `RAW_TIPO` exige `]`, así que una cabecera válida devolvía None
+    # y quedaba en NULL para siempre —ni `reindex()` ni la migración pueden
+    # rellenar lo que esta función no ve—, y `/lint` la contaba como «sin tipo
+    # declarado» teniéndolo escrito en su posición canónica. Medido el 2026-08-19
+    # sobre producción: 556 cabeceras spoke sin corchetes, 66 con tipo válido
+    # perdido. Lo señaló CodeRabbit revisando #9, ya desplegada.
+    #
+    # La precedencia la da el ORDEN, no un guarda: va DESPUÉS de `RAW_TIPO`, así
+    # que la forma con corchetes manda —su tipo está DENTRO, no en el último campo
+    # de la línea—. Escribí además un `mb is None` delante y el mutante que lo
+    # quitaba SOBREVIVIÓ: `mb` exige `[` justo tras `##` y `_SPOKE` exige un
+    # dígito ahí, así que no pueden casar a la vez y la condición no decidía nada.
+    # Fuera: una comprobación sin falsador es adorno. Pasa por el MISMO guarda —
+    # sin él esta rama se tragaría las rutas, que es el 7.570 medido que dio
+    # origen a `_es_token_de_tipo`.
+    if _SPOKE.match(inner):
+        cand = inner.rsplit("·", 1)[-1].strip()
+        if 0 < len(cand) <= 64 and _es_token_de_tipo(cand):
+            return cand
     # Si el último campo NO era un tipo, la cabecera todavía puede declararlo al
     # frente (`### [DONE algo · bikeus→security ∧ Albert]`). Cortar en seco aquí
     # sería descartar de más por el otro lado.
