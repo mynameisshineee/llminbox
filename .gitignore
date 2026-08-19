@@ -34,3 +34,7 @@ web/tsconfig.tsbuildinfo
 *.bak-*
 *.CONVERGIDO-*
 *.lock
+
+# Estado que `llmi up` copia para el contenedor (censo + mapa de montajes).
+# Derivado: se regenera en cada arranque. No es config y no se versiona.
+.llminbox-state/
