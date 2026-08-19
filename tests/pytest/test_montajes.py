@@ -27,7 +27,20 @@ import re
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parents[2]
-COMPOSES = ("docker-compose.yml", "docker-compose.override.yml")
+# SÓLO lo versionado. `docker-compose.override.yml` es GENERADO y está en
+# `.gitignore` junto a `roster.json` y `.llmi-mounts.json`: en un checkout limpio
+# no existe, así que exigirle propiedades desde aquí hacía que el test demostrase
+# localmente algo que en CI no podía demostrar — verde en mi máquina, rojo en el
+# runner, y la propiedad sin verificar en ninguno de los dos.
+#
+# Tres contratos distintos, tres niveles (el CI los encontró mezclados):
+#
+#   ① el PARSER y los canarios  → fixtures sintéticos, herméticos
+#   ② la composición PUBLICADA  → docker-compose.yml y nada más
+#   ③ el override GENERADO      → se ejecuta el generador en un tmp y se mira
+#                                  su salida; así una regresión de `llmi init`
+#                                  también se pone roja
+COMPOSES = ("docker-compose.yml",)
 
 # Extensiones que delatan un FICHERO. Se miran los DOS extremos: un `source` sin
 # extensión con `target: /censo.json` sigue siendo un mount de fichero.
@@ -124,7 +137,7 @@ def _es_fichero(origen: str, destino: str) -> bool:
 
 
 def test_ningun_bind_mount_de_fichero_unico():
-    """El falsador de la clase entera.
+    """② La composición PUBLICADA — sólo lo que está en Git.
 
     FALSADOR: devolver `- ./roster.json:/censo.json:ro` —en cualquiera de las dos
     formas— pone esto rojo con el nombre del fichero."""
@@ -144,41 +157,35 @@ def test_ningun_bind_mount_de_fichero_unico():
         "dentro:\n  " + "\n  ".join(culpables))
 
 
-def test_el_guarda_ve_de_verdad_los_montajes():
-    """CONTROL, y no es ceremonia: si el parser no reconociera ninguna línea de
-    volumen, el test de arriba pasaría siempre — verde por no mirar. Ese es el
-    modo de fallo más caro de este repo y tiene su propia cicatriz."""
-    vistos = []
-    for nombre in COMPOSES:
-        ruta = RAIZ / nombre
-        if ruta.exists():
-            vistos += list(_montajes(ruta.read_text()))
-    assert len(vistos) >= 2, f"el parser no ve los volúmenes: {vistos}"
-    assert any(d.startswith("/") and not _es_fichero(o, d) for o, d in vistos), (
-        f"no reconoce ningún mount de directorio: {vistos}")
+FIXTURE = """services:
+  x:
+    volumes:
+      - llminbox-data:/data
+      - "./algo:/repo:ro"
+      - "/host/roles.json:/shared/roles.json:ro"
+      - type: bind
+        source: ./roster.json
+        target: /censo.json
+        read_only: true
+"""
 
 
-def test_el_riesgo_aceptado_sigue_aplicando():
-    """CONTROL de la lista de riesgos aceptados. Uno que ya no casa con nada es
-    deuda invisible: parece cubrir algo y no cubre nada, y el día que alguien
-    reintroduzca ese montaje lo tapará sin que nadie lo note.
+def test_el_parser_ve_las_dos_formas_y_no_confunde_volumenes_nombrados():
+    """CONTROL del parser, sobre un fixture SINTÉTICO — no sobre ficheros que en
+    CI pueden no existir. Si el parser no reconociera ningún volumen, el guarda
+    pasaría siempre: verde por no mirar, que es el modo de fallo más caro de este
+    repo y tiene su propia cicatriz.
 
-    FALSADOR: cuando los ledgers dejen de montarse como fichero —que es el
-    objetivo—, esto se pone rojo y obliga a RETIRAR la entrada."""
-    usados = set()
-    for nombre in COMPOSES:
-        ruta = RAIZ / nombre
-        if not ruta.exists():
-            continue
-        for origen, destino in _montajes(ruta.read_text()):
-            if _es_fichero(origen, destino):
-                m = _aceptado(origen, destino)
-                if m:
-                    usados.add(m)
-    huerfanos = {m for _, _, m in RIESGO_ACEPTADO} - usados
-    assert not huerfanos, (
-        f"riesgos aceptados que ya no cubren nada: {sorted(huerfanos)} — retíralos "
-        "en vez de dejarlos tapando algo que ya no existe")
+    Antes este control leía la composición real, incluido el override GENERADO.
+    En CI ese fichero no existe (`.gitignore`), así que el test demostraba
+    localmente una propiedad que en el runner no podía demostrar. Lo cazó el CI,
+    no yo."""
+    vistos = list(_montajes(FIXTURE))
+    assert ("llminbox-data", "/data") not in vistos, "cuenta un volumen NOMBRADO"
+    assert ("./algo", "/repo") in vistos, f"pierde la forma corta: {vistos}"
+    assert ("/host/roles.json", "/shared/roles.json") in vistos, vistos
+    assert ("./roster.json", "/censo.json") in vistos, f"pierde la forma larga: {vistos}"
+    assert any(not _es_fichero(o, d) for o, d in vistos), "no ve ningún directorio"
 
 
 CANARIO_CORTO = '      - "./roster.json:/censo.json:ro"\n'
@@ -218,3 +225,72 @@ def test_el_canario_se_caza_en_LAS_DOS_formas():
         assert _aceptado(origen, destino) is None, (
             f"un riesgo aceptado se tragó el canario en forma {etiqueta} "
             f"({origen} → {destino}): el guarda ya no protege de nada")
+
+
+# ── ③ el override GENERADO ───────────────────────────────────────────────────
+
+def test_el_generador_no_introduce_mounts_de_fichero_de_CONFIG(tmp_path):
+    """El tercer contrato, y el único que puede hablar del override: no una copia
+    estática, sino EJECUTAR el generador y mirar lo que produce. Así una regresión
+    de `llmi init` —volver a montar un fichero de configuración suelto— también se
+    pone roja.
+
+    Corre hermético: se copia `llmi` a un tmp (su `DIR` sale de su propia ruta) y
+    se le da un `HOME` propio, así que no toca el repo ni la máquina. Verificado
+    antes de escribirlo, porque `llmi init` está marcado ⛔ en este repo por lo que
+    destruye si se ejecuta en el sitio equivocado.
+
+    FALSADOR: que el generador emita `- ./roster.json:/censo.json:ro` pone esto
+    rojo — y ése es exactamente el montaje que rompió el organigrama."""
+    import shutil
+    import subprocess
+    repo, casa = tmp_path / "repo", tmp_path / "home"
+    repo.mkdir(); casa.mkdir()
+    for f in ("llmi", "docker-compose.yml", "roster.example.json"):
+        shutil.copy(RAIZ / f, repo / f)
+    (casa / "LEDGER.md").write_text("### [cto-A → backend · FYI] uno\ncuerpo\n")
+
+    r = subprocess.run([str(repo / "llmi"), "init", "--demo"], cwd=repo,
+                       env={"HOME": str(casa), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+                       capture_output=True, text=True, timeout=180)
+    override = repo / "docker-compose.override.yml"
+    assert override.exists(), f"el generador no produjo override:\n{r.stdout}{r.stderr}"
+
+    montajes = list(_montajes(override.read_text()))
+    assert montajes, "el override generado no trae volúmenes reconocibles"
+    ficheros = [(o, d) for o, d in montajes if _es_fichero(o, d)]
+    # Los ledgers SÍ salen como fichero — es el riesgo aceptado y documentado.
+    # Cualquier OTRO fichero suelto es una regresión del generador.
+    fuera = [f"{o} → {d}" for o, d in ficheros if not _aceptado(o, d)]
+    assert not fuera, (
+        "`llmi init` genera bind-mounts de FICHERO fuera del riesgo aceptado:\n  "
+        + "\n  ".join(fuera))
+    assert ficheros, "no generó NINGÚN mount de fichero: el control no mide nada"
+
+
+def test_el_riesgo_aceptado_sigue_cubriendo_algo_real(tmp_path):
+    """CONTROL del riesgo aceptado, y vive AQUÍ y no arriba: sólo se puede
+    comprobar contra un override de verdad, y el único que este test puede exigir
+    es el que él mismo genera.
+
+    Un riesgo aceptado que ya no casa con nada es deuda invisible: parece cubrir
+    algo, no cubre nada, y tapará el día que alguien reintroduzca ese montaje.
+
+    FALSADOR: cuando los ledgers dejen de montarse como fichero —que es el
+    objetivo— esto se pone rojo y obliga a RETIRAR la entrada."""
+    import shutil
+    import subprocess
+    repo, casa = tmp_path / "repo", tmp_path / "home"
+    repo.mkdir(); casa.mkdir()
+    for f in ("llmi", "docker-compose.yml", "roster.example.json"):
+        shutil.copy(RAIZ / f, repo / f)
+    (casa / "LEDGER.md").write_text("### [cto-A → backend · FYI] uno\ncuerpo\n")
+    subprocess.run([str(repo / "llmi"), "init", "--demo"], cwd=repo,
+                   env={"HOME": str(casa), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+                   capture_output=True, text=True, timeout=180)
+    usados = {_aceptado(o, d) for o, d in _montajes(
+        (repo / "docker-compose.override.yml").read_text()) if _es_fichero(o, d)}
+    huerfanos = {m for _, _, m in RIESGO_ACEPTADO} - usados
+    assert not huerfanos, (
+        f"riesgos aceptados que ya no cubren nada: {sorted(huerfanos)} — retíralos "
+        "en vez de dejarlos tapando algo que ya no existe")
