@@ -23,6 +23,7 @@ acuerde; un test falla solo cuando alguien no se acuerda.
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -484,8 +485,11 @@ def _up_hermetico(tmp_path, roster_json, estado_previo=None):
         (repo / ".llminbox-state" / "roster.json").write_text(estado_previo)
         (repo / ".llminbox-state" / "mounts.json").write_text("{}")
     args = tmp_path / "docker-args.txt"
+    # `docker ps` devuelve VACÍO a propósito: simula a la vez un nombre de
+    # contenedor personalizado (`LLMINBOX_NAME`) y un fallo temporal del daemon.
+    # Con el detector que preguntaba a Docker, los dos casos impedían la recarga.
     (binfalso / "docker").write_text(
-        f'#!/bin/sh\n[ "$1" = "ps" ] && {{ echo llminbox; exit 0; }}\n'
+        f'#!/bin/sh\n[ "$1" = "ps" ] && exit 0\n'
         f'echo "$@" >> "{args}"\nexit 0\n')
     (binfalso / "docker").chmod(0o755)
     r = subprocess.run([str(repo / "llmi"), "up"], cwd=repo,
@@ -522,7 +526,7 @@ def test_si_el_censo_cambia_el_contenedor_se_RECREA(tmp_path):
     assert "--force-recreate" in args, (
         f"el censo cambió y no se recrea el contenedor: el proceso seguiría con el "
         f"anterior.\nargumentos de docker: {args!r}")
-    assert "CAMBIARON" in r.stdout, (
+    assert "cambió estado" in r.stdout, (
         "recrea sin decirlo: cortar la bandeja de la flota no puede ser un efecto "
         "colateral silencioso")
 
@@ -538,3 +542,99 @@ def test_si_el_censo_NO_cambia_no_se_corta_la_bandeja_de_la_flota(tmp_path):
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
     assert "--force-recreate" not in args, (
         f"recrea sin motivo: corta la bandeja de la flota en cada `up`.\n{args!r}")
+
+
+def test_ni_un_nombre_distinto_ni_un_docker_mudo_impiden_la_recarga(tmp_path):
+    """El detector preguntaba a Docker si había contenedor vivo, y eso fallaba dos
+    veces: fijaba el nombre `llminbox` —cuando Compose soporta `LLMINBOX_NAME`
+    para una segunda instancia— y trataba «no pude determinar si está vivo» como
+    «no está vivo». Fail-OPEN en el camino que promete frescura.
+
+    Aquí `docker ps` devuelve vacío, que es lo que se ve con un nombre distinto Y
+    con un daemon que falla. El estado cambió: hay que recargar igual.
+
+    FALSADOR: devolver el `docker ps ... | grep -q llminbox` deja el recreate
+    fuera y el proceso arranca con el censo anterior."""
+    r, args = _up_hermetico(tmp_path, B, estado_previo=A)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "--force-recreate" in args, (
+        f"con `docker ps` mudo no recarga: un nombre personalizado o un daemon "
+        f"con hipo dejarían el proceso rancio.\n{args!r}")
+
+
+def test_lo_anunciado_corresponde_a_los_BYTES_INSTALADOS(tmp_path):
+    """El TOCTOU, convertido en invariante comprobable.
+
+    Comparar la FUENTE y copiarla después permite que otra sesión la sustituya en
+    medio: `/state` acaba con B, el proceso conserva A, y `llmi up` sale con éxito
+    sin recrear. El detector reintroducía la clase de fallo que esta rama cierra.
+
+    La propiedad que se fija: **lo que se anuncia describe los bytes que quedaron
+    instalados**. Se comprueban las dos direcciones sobre el fichero publicado.
+
+    ⚠️ Esto NO demuestra ausencia de carrera —haría falta interponer entre medida
+    y publicación—: fija la invariante que el staging hace cierta bajo
+    concurrencia. Lo digo porque afirmar lo contrario sería el defecto del día."""
+    r, _ = _up_hermetico(tmp_path, B, estado_previo=A)
+    instalado = (tmp_path / "repo" / ".llminbox-state" / "roster.json").read_text()
+    assert instalado == B, "publicó unos bytes distintos de los que iba a instalar"
+    assert "cambió estado" in r.stdout, "instaló bytes nuevos y no lo anunció"
+
+    otro = tmp_path / "b"
+    otro.mkdir()
+    r2, _ = _up_hermetico(otro, B, estado_previo=B)
+    assert "cambió estado" not in r2.stdout, "anunció un cambio que no existió"
+
+
+def test_una_escritura_entre_medir_y_publicar_no_puede_pasar_desapercibida(tmp_path):
+    """EL TOCTOU, falsado de forma DETERMINISTA — sin dormir ni carreras reales.
+
+    La ventana es exactamente ésta: otra sesión sustituye `roster.json` DESPUÉS de
+    que midas y ANTES de que publiques. Se reproduce interponiendo un `cmp` falso
+    que, tras comparar, reescribe la fuente. Eso coloca la escritura ajena justo
+    en el hueco, sin depender del reloj.
+
+    · Comparando la FUENTE (el defecto): `cmp` ve A==A → «sin cambios» → no
+      recrea; luego `cp` copia la B que apareció en medio. Queda instalado B con
+      el proceso en A y `llmi up` diciendo que no pasó nada. Silencioso y verde.
+
+    · Comparando los bytes YA PREPARADOS: la copia se hizo antes, así que lo
+      medido y lo publicado son los mismos bytes. Lo que se anuncia describe lo
+      que queda instalado, pase lo que pase con la fuente en medio.
+
+    FALSADOR: volver a `cmp -s "$ROSTER" ...` deja instalado B con «sin cambios»
+    anunciado, y las dos aserciones caen."""
+    import shutil
+    import subprocess
+    repo, casa, binfalso = tmp_path / "repo", tmp_path / "home", tmp_path / "bin"
+    for d in (repo, casa, binfalso):
+        d.mkdir()
+    for f in ("llmi", "docker-compose.yml", "roster.example.json"):
+        shutil.copy(RAIZ / f, repo / f)
+    (repo / "roster.json").write_text(A)
+    (repo / ".llmi-mounts.json").write_text("{}")
+    (casa / ".llminbox.token").write_text("token-de-prueba")
+    (repo / ".llminbox-state").mkdir()
+    (repo / ".llminbox-state" / "roster.json").write_text(A)
+    (repo / ".llminbox-state" / "mounts.json").write_text("{}")
+    (binfalso / "docker").write_text("#!/bin/sh\nexit 0\n")
+    (binfalso / "docker").chmod(0o755)
+    # `cmp` real primero, y DESPUÉS la escritura ajena: la ventana exacta.
+    (binfalso / "cmp").write_text(
+        f'#!/bin/sh\n/usr/bin/cmp "$@"\n_rc=$?\n'
+        f'printf %s {json.dumps(B)!r} > "{repo}/roster.json"\nexit $_rc\n'
+        .replace("'", ""))
+    (binfalso / "cmp").chmod(0o755)
+
+    r = subprocess.run([str(repo / "llmi"), "up"], cwd=repo,
+                       env={"HOME": str(casa),
+                            "PATH": f"{binfalso}:/usr/bin:/bin:/usr/sbin:/sbin"},
+                       capture_output=True, text=True, timeout=120, check=False)
+    instalado = (repo / ".llminbox-state" / "roster.json").read_text()
+    anuncio = "cambió estado" in r.stdout
+    assert (instalado != A) == anuncio, (
+        f"lo instalado y lo anunciado no coinciden: instalado={'B' if instalado != A else 'A'}, "
+        f"anunciado_cambio={anuncio}\n{r.stdout}")
+    assert instalado == A, (
+        "publicó bytes que nunca midió: la escritura ajena entró entre la medida y "
+        "la publicación")

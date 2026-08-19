@@ -983,29 +983,44 @@ if resto > 0:
           # estado roto es peor que no arrancar.
           _ST="$DIR/.llminbox-state"
           mkdir -p "$_ST" || { echo "· no pude crear $_ST" >&2; exit 1; }
-          # ¿CAMBIÓ el estado? Se compara ANTES de copiar. El servicio lee censo y
-          # mapa de carriles AL IMPORTAR: si cambian y el contenedor se reutiliza,
-          # el proceso sigue con lo viejo — se habría arreglado el inodo del mount
-          # y recreado el mismo estado rancio una capa más adentro, en las
-          # estructuras de Python. `docker compose up -d --build` REUTILIZA el
-          # contenedor cuando imagen y config no cambian, y estos ficheros no son
-          # config de Compose: van dentro de un directorio montado.
+          # SE COPIA A STAGING Y SE COMPARAN LOS BYTES QUE SE VAN A INSTALAR, no la
+          # fuente. Comparar la fuente y copiarla después abre un TOCTOU real: otra
+          # sesión sustituye `roster.json` entre el `cmp` y el `cp`, y entonces
+          # `/state` acaba con B mientras el proceso conserva A y `llmi up` sale con
+          # éxito — exactamente la clase de fallo que esta rama existe para cerrar,
+          # reintroducida por el detector.
+          #
+          # La regla: el falsador tiene que alterar la MISMA condición que la
+          # implementación afirma haber medido. Aquí lo medido son los bytes
+          # publicados, así que se miden ésos.
+          _NEXT="$_ST/.next.$$"
+          mkdir -p "$_NEXT" || { echo "· no pude crear $_NEXT" >&2; exit 1; }
+          cp -f "$ROSTER" "$_NEXT/roster.json" \
+            || { echo "· no pude preparar el censo" >&2; rm -rf "$_NEXT"; exit 1; }
+          cp -f "$DIR/.llmi-mounts.json" "$_NEXT/mounts.json" \
+            || { echo "· no pude preparar el mapa de montajes" >&2; rm -rf "$_NEXT"; exit 1; }
           _cambio=0
-          cmp -s "$ROSTER" "$_ST/roster.json" || _cambio=1
-          cmp -s "$DIR/.llmi-mounts.json" "$_ST/mounts.json" || _cambio=1
-          cp -f "$ROSTER" "$_ST/roster.json" \
-            || { echo "· no pude copiar el censo a $_ST" >&2; exit 1; }
-          cp -f "$DIR/.llmi-mounts.json" "$_ST/mounts.json" \
-            || { echo "· no pude copiar el mapa de montajes a $_ST" >&2; exit 1; }
-          # El recreate va SÓLO si algo cambió, y SE DICE. No `--force-recreate`
-          # siempre: reiniciar este contenedor corta la bandeja de TODA la flota,
-          # y esconder eso dentro de un comando de uso diario es cómo se convierte
-          # una operación que afecta a 20 agentes en un efecto colateral que nadie
-          # decidió. Deliberado cuando toca, invisible nunca.
+          cmp -s "$_NEXT/roster.json" "$_ST/roster.json" || _cambio=1
+          cmp -s "$_NEXT/mounts.json" "$_ST/mounts.json" || _cambio=1
+          mv -f "$_NEXT/roster.json" "$_ST/roster.json" \
+            || { echo "· no pude publicar el censo" >&2; rm -rf "$_NEXT"; exit 1; }
+          mv -f "$_NEXT/mounts.json" "$_ST/mounts.json" \
+            || { echo "· no pude publicar el mapa de montajes" >&2; rm -rf "$_NEXT"; exit 1; }
+          rmdir "$_NEXT" 2>/dev/null
+          # NO SE LE PREGUNTA A DOCKER SI HAY ALGO CORRIENDO. Preguntarlo tenía dos
+          # fallos: fijaba el nombre `llminbox` cuando el propio Compose soporta
+          # `LLMINBOX_NAME` para una segunda instancia, y trataba «no pude
+          # determinar si está vivo» como «no está vivo» — fail-OPEN justo en el
+          # camino que promete frescura.
+          #
+          # La regla queda más simple y más fuerte: cambió el estado ⇒ recreate.
+          # Si no hay contenedor, `--force-recreate` no corta nada; si está parado,
+          # tampoco; si está vivo, el corte es EXACTAMENTE el necesario para que el
+          # cambio surta efecto. Y del nombre real se ocupa Compose.
           _extra=""
-          if [ "$_cambio" = "1" ] && docker ps --filter name=llminbox --format '{{.Names}}' 2>/dev/null | grep -q llminbox; then
-            echo "· censo o mapa de montajes CAMBIARON y el servicio los lee al arrancar:"
-            echo "  recreo el contenedor (corta la bandeja de la flota unos segundos)"
+          if [ "$_cambio" = "1" ]; then
+            echo "· cambió estado que el servicio lee AL ARRANCAR (censo o montajes):"
+            echo "  se recrea el contenedor — corta la bandeja de la flota unos segundos"
             _extra="--force-recreate"
           fi
           (cd "$DIR" && LLMINBOX_TOKEN="$TOKEN" docker compose up -d --build $_extra) ;;
