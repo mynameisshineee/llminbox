@@ -3849,30 +3849,17 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
         out.append(f"⑥ COHERENCIA DE PROYECCIONES — {len(filas)} principal(es) que "
                    f"las tres proyecciones no declaran igual")
         out.append(f"   {'principal':<24}{'roster':<8}{'org_alias':<11}"
-                   f"{'jerarquia':<11}{'resuelve':<10}{'enrutable':<11}"
-                   f"{'cursor':<8}{'correo':<8}tipo")
-        # Los nombres de CADA proyección, no sólo los del roster: un principal que
-        # existe únicamente en el organigrama tiene nombres, y contarlos como cero
-        # haría que su fila mintiera en dos columnas.
+                   f"{'jerarquia':<11}{'resuelve':<10}{'cursor':<8}{'correo':<8}tipo")
+        # `correo` cuenta lo que la BANDEJA de ese principal entregaría, y la
+        # bandeja expande firmas con `escuchados()`, que deriva del ROSTER. Unir
+        # aquí los nombres del organigrama fabricaba un falso verde: medido, un rol
+        # que sólo existe en `rol_por_alias` daba `correo=sí` y `GET /inbox/<rol>`
+        # NO traía esa entrada — `escuchados()` sólo se escuchaba a sí mismo.
+        # Contar correo que la bandeja no va a entregar es peor que no contarlo.
         nombres_de: dict[str, set[str]] = {}
         for nombre, rol in lp.ROL_DE.items():
             nombres_de.setdefault(norm(rol), set()).add(norm(nombre))
-        for nombre, rol in (foto["roles_alias"] or {}).items():
-            nombres_de.setdefault(norm(rol), set()).add(norm(nombre))
         si = lambda b: "sí" if b else "no"              # noqa: E731
-        # ENRUTABLE ≠ RESUELVE, y el caso vivo lo demuestra: `em-bikeus` resuelve
-        # como identidad (`/inbox` da 200) y NO es una dirección de correo — el
-        # vocabulario del parser (`AGENTES`) son los NOMBRES del roster, así que
-        # `→ em-bikeus` parsea a lista vacía y esa entrada no llega a nadie.
-        # Medido: los 5 nombres que sólo existen en el organigrama no aparecen ni
-        # una vez en `recipients`, sobre 54 destinatarios distintos.
-        #
-        # Se calcula APARTE de `roster` aunque hoy coincidan, y no es ceremonia: la
-        # coincidencia es una propiedad del vocabulario actual, no una identidad.
-        # El día que el parser tome sus destinatarios de otra fuente, esta columna
-        # sigue siendo cierta y la otra no.
-        enrutable_de = {r: any(n in lp.CANON for n in ns)
-                        for r, ns in nombres_de.items()}
         for rol in filas[:25]:
             ns = sorted(nombres_de.get(rol, set()))
             cur = con.execute("SELECT COUNT(*) n FROM cursors WHERE agent=?",
@@ -3885,7 +3872,6 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
                     tuple(ns)).fetchone()["n"]
             out.append(f"   {rol:<24}{si(rol in roster):<8}{si(rol in alias):<11}"
                        f"{si(rol in jer):<11}{si(rol in roster or rol in alias):<10}"
-                       f"{si(enrutable_de.get(rol)):<11}"
                        f"{si(cur):<8}{si(correo):<8}UNCLASSIFIED")
         if len(filas) > 25:
             out.append(f"   … y {len(filas) - 25} fila(s) más sin listar "
@@ -3893,16 +3879,27 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
         sin_gobierno = len((roster | alias) - jer)
         inejecutable = len(jer - (roster | alias))
         deriva = len(roster ^ alias)
-        mudos = sorted(r for r in (roster | alias)
-                       if not enrutable_de.get(r))
+        # A NIVEL DE ALIAS, no de rol. Escribí primero una columna `enrutable` por
+        # principal y era un FALSO VERDE DE GOBIERNO: decía «sí» para un rol cuyo
+        # nombre el parser reconoce, sin poder sostener que la bandeja de ESE rol
+        # entregue esa entrada — medido, no entrega, porque `escuchados()` deriva
+        # del roster. «El parser produce un destinatario para un nombre» tampoco
+        # equivale a «la bandeja de este principal recibe ese destinatario»: son
+        # dos capas distintas y las junté.
+        #
+        # Esto es lo único exactamente demostrable con lo que hay: nombres que
+        # `canon_identidad()` acepta y que `→ nombre` NO puede producir como
+        # destinatario, porque el vocabulario del parser son los nombres del censo.
+        mudos = sorted(n for n in (foto["roles_alias"] or {}) if n not in lp.CANON)
         out.append(f"   patologías: {sin_gobierno} identidad(es) sin gobierno · "
                    f"{inejecutable} rol(es) sin identidad (no pueden recibir "
-                   f"trabajo) · {deriva} en deriva roster↔org_alias · "
-                   f"{len(mudos)} RESUELVEN PERO NO SON ENRUTABLES")
+                   f"trabajo) · {deriva} en deriva roster↔org_alias")
         if mudos:
-            out.append(f"   🔴 resuelve=sí + enrutable=no → {', '.join(mudos[:6])}: su "
-                       f"bandeja contesta, pero `→ <nombre>` en un ledger NO les "
-                       f"entrega nada. El correo dirigido a ellos se PIERDE.")
+            out.append(f"   🔴 {len(mudos)} ALIAS RESOLUBLE(S) PERO NO PARSEABLE(S) COMO "
+                       f"DESTINO: {', '.join(mudos[:6])}")
+            out.append("      `canon_identidad()` los acepta —su bandeja contesta— y "
+                       "`→ <nombre>` en un ledger NO produce destinatario: esa entrada "
+                       "queda huérfana. Delegar con esos nombres pierde el correo.")
         out.append("   El tipo lo adjudica el operador — esto encuentra, no "
                    "clasifica, y un alias no implica scope.")
         # El aviso que impide que un cero se lea como una garantía que el sistema

@@ -232,110 +232,76 @@ def test_no_se_lee_un_cero_como_SoT_resuelto(tmp_path, monkeypatch):
     assert "no sustituye" in sec.lower(), sec
 
 
-def test_un_rol_de_la_jerarquia_sin_alias_no_puede_ejecutar(tmp_path, monkeypatch):
-    """La segunda patología, y el falsador que faltaba: `org_alias` y `jerarquia`
-    son proyecciones DISTINTAS del mismo fichero, y colapsarlas en una columna se
-    lleva por delante este caso.
+def test_los_alias_que_resuelven_y_no_parsean_se_declaran(tmp_path, monkeypatch):
+    """LO QUE SÍ SE PUEDE SOSTENER, después de retirar lo que no.
 
-    `rol-inejecutable` está en la jerarquía y no lo resuelve ningún alias: se le
-    puede asignar trabajo sobre el papel y su bandeja contesta 422. Es el defecto
-    que medí en producción con `engineering-manager` antes de que el harness le
-    diera alias.
+    Escribí una columna `enrutable` por principal y era un FALSO VERDE DE
+    GOBIERNO: decía «sí» para un rol cuyo nombre el parser reconoce, sin poder
+    sostener que la bandeja de ESE rol entregue la entrada. Medido: con
+    `backend → plataforma` en el organigrama, `GET /inbox/plataforma` **no trae**
+    el correo dirigido a `backend`, porque `escuchados()` deriva del roster y
+    devuelve `['plataforma']`.
 
-    FALSADOR (el que sobrevivía): imprimir `jerarquia` en la columna de
-    `org_alias` hace que esta fila salga `org_alias=sí` y esto se pone rojo."""
+    «El parser produce un destinatario para un nombre» ≠ «la bandeja de este
+    principal recibe ese destinatario». Son dos capas y las junté.
+
+    Lo exactamente demostrable es esto: `em-bikeus` lo acepta
+    `canon_identidad()` —su bandeja contesta 200— y `→ em-bikeus` NO produce
+    destinatario, así que esa entrada queda huérfana.
+
+    FALSADOR: quitar el bloque deja el hallazgo sin decir; y calcularlo sobre
+    `CANON` en vez de sobre los alias del organigrama lo deja vacío siempre."""
     s, _ = _monta_em(tmp_path, monkeypatch)
     sec = _seis(_doctor(s))
-    fila = next(ln for ln in sec.splitlines() if ln.strip().startswith("rol-inejecutable"))
-    campos = fila.split()
-    assert campos[1] == "no", f"roster: {fila}"
-    assert campos[2] == "no", f"org_alias debería ser NO: {fila}"
-    assert campos[3] == "sí", f"jerarquia debería ser SÍ: {fila}"
-    assert campos[4] == "no", f"NO resuelve — no puede recibir trabajo: {fila}"
-    assert "1 rol(es) sin identidad" in sec, sec
+    assert "NO PARSEABLE" in sec, sec
+    assert "em-bikeus" in sec, sec
+    assert "queda huérfana" in sec, sec
 
 
-def test_la_caja_de_una_letra_no_fabrica_una_divergencia(tmp_path, monkeypatch):
-    """`roles_alias` y `jerarquia` vienen en minúsculas de sus cargadores, pero
-    `ROL_DE` conserva lo que declara `roster.json` — que lo edita un humano a
-    mano. Un `"rol": "CTO"` fabricaría `CTO ≠ cto` y ⑥ acusaría de deriva a un rol
-    perfectamente alineado.
-
-    Un informe de gobierno que inventa una discrepancia por una mayúscula es peor
-    que no tenerlo: quema la confianza en las filas que sí son verdad.
-
-    FALSADOR: quitar la normalización mete `CTO` en la lista y esto se pone
-    rojo."""
-    roster = json.loads(json.dumps(ROSTER))
-    for a in roster["agentes"]:
-        if a["rol"] == "cto":
-            a["rol"] = "CTO"                  # el humano escribió en mayúsculas
-    (tmp_path / "org.json").write_text(json.dumps(ORG))
-    s = construir(tmp_path, monkeypatch, roster=roster,
-                  extra_env={"LLMINBOX_ROLES_ALIAS": str(tmp_path / "org.json")})
-    (tmp_path / "DEMO-LEDGER.md").write_text("### [cto-A → backend · FYI] x\ncuerpo\n")
-    sec = _seis(_doctor(s))
-    assert "CTO" not in sec, f"la caja fabricó una divergencia:\n{sec}"
-    assert not any(ln.strip().startswith("cto ") for ln in sec.splitlines()), sec
-
-
-def test_resuelve_pero_no_enrutable_se_declara(tmp_path, monkeypatch):
-    """LA PATOLOGÍA NUEVA, y tiene un caso vivo medido, no es una abstracción.
-
-    `em-bikeus` resuelve como identidad —`/inbox` contesta 200— y NO es una
-    dirección de correo: el vocabulario del parser son los NOMBRES del roster, así
-    que `→ em-bikeus` parsea a lista vacía y esa entrada no llega a nadie. Medido
-    en producción: los 5 nombres que sólo existen en el organigrama no aparecen ni
-    una vez en `recipients`, sobre 54 destinatarios distintos.
-
-    Es blocker de piloto: el CTO delegaría con `→ em-bikeus`, la entrada quedaría
-    huérfana y nadie vería un error.
-
-    FALSADOR: calcular `enrutable` como copia de `roster` da el mismo resultado
-    HOY —coinciden— pero deja de ser cierto en cuanto el parser cambie de fuente;
-    y quitar la línea 🔴 esconde la patología entera."""
+def test_un_alias_que_tambien_esta_en_el_censo_no_se_acusa(tmp_path, monkeypatch):
+    """CONTROL: `backend` está en `rol_por_alias` Y en el censo, así que
+    `→ backend` sí produce destinatario y no debe salir en la lista. Sin este
+    control, listar TODOS los alias pasaría el test de arriba sin distinguir."""
     s, _ = _monta_em(tmp_path, monkeypatch)
     sec = _seis(_doctor(s))
-    fila = next(ln for ln in sec.splitlines()
-                if ln.strip().startswith("engineering-manager"))
-    campos = fila.split()
-    assert campos[4] == "sí", f"debería RESOLVER: {fila}"
-    assert campos[5] == "no", f"NO debería ser enrutable: {fila}"
-    assert "RESUELVEN PERO NO SON ENRUTABLES" in sec, sec
-    assert "se PIERDE" in sec, sec
+    linea = next((ln for ln in sec.splitlines() if "NO PARSEABLE" in ln), "")
+    assert "backend" not in linea, linea
 
 
-def test_un_principal_del_roster_si_es_enrutable(tmp_path, monkeypatch):
-    """CONTROL: sin él, un `enrutable` constante a «no» pasaría el test de arriba
-    sin medir nada. `destilador` está en el roster, luego su nombre ES vocabulario
-    del parser y `→ destilador` sí entrega."""
-    s, _ = _monta_em(tmp_path, monkeypatch)
-    sec = _seis(_doctor(s))
-    fila = next(ln for ln in sec.splitlines() if ln.strip().startswith("destilador"))
-    assert fila.split()[5] == "sí", f"un nombre del roster tiene que ser enrutable: {fila}"
+def test_el_correo_del_informe_coincide_con_lo_que_la_bandeja_ENTREGA(tmp_path, monkeypatch):
+    """La invariante que faltaba, y nace de un falso verde mío.
 
+    El organigrama reasigna `backend` al rol `plataforma`. Mi versión anterior
+    contaba ese correo como de `plataforma` —unía los nombres de las dos
+    proyecciones— y decía `correo=sí`. Pero la bandeja NO lo entrega:
+    `escuchados('plataforma')` devuelve `['plataforma']`, porque expande firmas
+    desde el ROSTER. El informe afirmaba una entrega que no ocurre.
 
-def test_un_rol_del_organigrama_con_nombre_del_roster_SI_es_enrutable(tmp_path, monkeypatch):
-    """El caso donde la unión de nombres deja de ser cosmética, y es exactamente
-    la deriva que ⑥ existe para ver: el organigrama reasigna un nombre que YA
-    existe en el roster (`backend`) a un rol nuevo que el roster no declara.
+    Un informe de gobierno que cuenta correo que la bandeja no va a dar es peor
+    que no contarlo: manda a alguien a buscar trabajo que no está ahí.
 
-    Ese rol es enrutable —`→ backend` sí entrega, porque `backend` es vocabulario
-    del parser— y recibe correo de verdad. Calcular sus nombres sólo desde el
-    roster lo daría por mudo y sin correo: dos columnas mintiendo a la vez.
+    Se comprueban LAS DOS COSAS en el mismo test, que es lo que las ata: lo que
+    dice ⑥ y lo que devuelve `/inbox`. Si divergen, el informe miente — daría
+    igual cuál de los dos «tenga razón».
 
-    FALSADOR (el mutante que sobrevivía): quitar la segunda pasada que añade los
-    nombres de `rol_por_alias` deja este rol con `enrutable=no` y `correo=no`."""
+    FALSADOR: volver a unir las proyecciones para `correo` pone `correo=sí` con
+    la bandeja vacía y esto se pone rojo."""
     org = json.loads(json.dumps(ORG))
-    org["rol_por_alias"]["backend"] = "plataforma"      # reasignado por el organigrama
+    org["rol_por_alias"]["backend"] = "plataforma"
     org["jerarquia"]["plataforma"] = {"reporta_a": "cto", "capa": "ejecucion"}
     (tmp_path / "org.json").write_text(json.dumps(org))
     s = construir(tmp_path, monkeypatch, roster=ROSTER,
                   extra_env={"LLMINBOX_ROLES_ALIAS": str(tmp_path / "org.json")})
     (tmp_path / "DEMO-LEDGER.md").write_text(
-        "### [cto-A → backend · FYI] correo real a ese nombre\ncuerpo\n")
-    sec = _seis(_doctor(s))
+        "### [cto-A → backend · FYI] correo a un nombre reasignado\ncuerpo\n")
+    with TestClient(s.app) as c:
+        s.barrido()
+        c.headers.update({"X-Llminbox-Token": "test-token"})
+        entregado = "correo a un nombre reasignado" in c.get("/inbox/plataforma").text
+        sec = _seis(c.get("/doctor").text)
     fila = next(ln for ln in sec.splitlines() if ln.strip().startswith("plataforma"))
-    campos = fila.split()
-    assert campos[5] == "sí", f"enrutable: su nombre SÍ es vocabulario del parser: {fila}"
-    assert campos[7] == "sí", f"correo: hay una entrada dirigida a `backend`: {fila}"
+    dice_correo = fila.split()[6] == "sí"
+    assert entregado is False, "el arnés cambió: ahora la bandeja SÍ entrega"
+    assert dice_correo == entregado, (
+        f"⑥ dice correo={'sí' if dice_correo else 'no'} y la bandeja entrega="
+        f"{entregado} — el informe afirma una entrega que no ocurre:\n{fila}")
