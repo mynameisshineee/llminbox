@@ -99,8 +99,11 @@ def _montajes(texto: str):
             i += 1
             continue
         sangria, resto = len(m.group(1)), m.group(2)
-        # ── forma larga: el item abre un mapa con `type:`/`source:`/`target:` ──
-        if re.match(r"(type|source|target|read_only)\s*:", resto):
+        # ── forma larga: el item abre un MAPA. Se acepta cualquier clave y
+        #    cualquier ORDEN — exigir que empiece por `type:` hacía que un
+        #    montaje perfectamente válido con las claves en otro orden fuera
+        #    invisible, y un guarda que se rodea sin querer da permiso.
+        if re.match(r"[A-Za-z_][\w-]*\s*:", resto):
             bloque = [resto]
             j = i + 1
             while j < len(lineas):
@@ -199,6 +202,13 @@ CANARIO_LARGO = """      - type: bind
         target: /censo.json
         read_only: true
 """
+# El MISMO montaje con las claves en otro orden. Es Compose igual de válido, y el
+# parser anterior no lo veía porque exigía que el item empezara por `type:`.
+CANARIO_LARGO_DESORDENADO = """      - read_only: true
+        target: /censo.json
+        source: ./roster.json
+        type: bind
+"""
 
 
 def test_el_canario_se_caza_en_LAS_DOS_formas():
@@ -209,14 +219,18 @@ def test_el_canario_se_caza_en_LAS_DOS_formas():
     · Un parser que sólo entiende la forma corta deja pasar la larga, que es
       Compose igual de válido. El mutante existía: reescribir el canario en forma
       larga sobrevivía al guarda anterior.
-    · Y mirar sólo el ORIGEN deja pasar `./censo:/censo.json`, que es un mount de
+    · Mirar sólo el ORIGEN deja pasar `./censo:/censo.json`, que es un mount de
       fichero con el origen disfrazado. Ese mutante también sobrevivía, porque en
       las composiciones de hoy los dos extremos llevan extensión.
+    · Y exigir que el mapa empiece por `type:` hacía invisible el MISMO montaje
+      con las claves en otro orden. El orden de las claves de un mapa YAML no
+      significa nada; que decidiera si el guarda mira, sí.
 
     El canario es el montaje EXACTO que rompió el organigrama. Si deja de cazarse
     en cualquiera de las dos formas, el guarda ya no protege de la clase que su
     nombre promete."""
     for etiqueta, texto in (("corta", CANARIO_CORTO), ("larga", CANARIO_LARGO),
+                            ("larga desordenada", CANARIO_LARGO_DESORDENADO),
                             ("sin extensión en el origen", CANARIO_SIN_EXT_EN_ORIGEN)):
         montajes = list(_montajes(texto))
         assert montajes, f"el parser no ve la forma {etiqueta}: {texto!r}"
@@ -245,14 +259,15 @@ def test_el_generador_no_introduce_mounts_de_fichero_de_CONFIG(tmp_path):
     import shutil
     import subprocess
     repo, casa = tmp_path / "repo", tmp_path / "home"
-    repo.mkdir(); casa.mkdir()
+    repo.mkdir()
+    casa.mkdir()
     for f in ("llmi", "docker-compose.yml", "roster.example.json"):
         shutil.copy(RAIZ / f, repo / f)
     (casa / "LEDGER.md").write_text("### [cto-A → backend · FYI] uno\ncuerpo\n")
 
     r = subprocess.run([str(repo / "llmi"), "init", "--demo"], cwd=repo,
                        env={"HOME": str(casa), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
-                       capture_output=True, text=True, timeout=180)
+                       capture_output=True, text=True, timeout=180, check=False)
     override = repo / "docker-compose.override.yml"
     assert override.exists(), f"el generador no produjo override:\n{r.stdout}{r.stderr}"
 
@@ -281,16 +296,37 @@ def test_el_riesgo_aceptado_sigue_cubriendo_algo_real(tmp_path):
     import shutil
     import subprocess
     repo, casa = tmp_path / "repo", tmp_path / "home"
-    repo.mkdir(); casa.mkdir()
+    repo.mkdir()
+    casa.mkdir()
     for f in ("llmi", "docker-compose.yml", "roster.example.json"):
         shutil.copy(RAIZ / f, repo / f)
     (casa / "LEDGER.md").write_text("### [cto-A → backend · FYI] uno\ncuerpo\n")
     subprocess.run([str(repo / "llmi"), "init", "--demo"], cwd=repo,
                    env={"HOME": str(casa), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
-                   capture_output=True, text=True, timeout=180)
+                   capture_output=True, text=True, timeout=180, check=False)
     usados = {_aceptado(o, d) for o, d in _montajes(
         (repo / "docker-compose.override.yml").read_text()) if _es_fichero(o, d)}
     huerfanos = {m for _, _, m in RIESGO_ACEPTADO} - usados
     assert not huerfanos, (
         f"riesgos aceptados que ya no cubren nada: {sorted(huerfanos)} — retíralos "
         "en vez de dejarlos tapando algo que ya no existe")
+
+
+def test_la_composicion_publicada_no_monta_el_checkout():
+    """El perímetro de lectura del proceso, como propiedad y no como comentario.
+
+    Mi primer intento montaba `.` entero para llegar a dos ficheros de estado. Eso
+    da acceso a `.git` —historial completo, que puede contener secretos retirados
+    en commits posteriores—, a los backups `*.bak-*` y al override con las rutas
+    reales de nueve repos. `:ro` limita la escritura, no la lectura: un path
+    traversal pasaría de alcanzar un fichero a alcanzar el checkout entero.
+
+    FALSADOR: devolver `- .:/repo:ro` pone esto rojo. El directorio dedicado
+    (`.llminbox-state/`, que `llmi up` rellena) cubre el mismo caso sin exponer
+    el resto."""
+    raiz = {".", "./", "..", "../"}
+    culpables = [f"{o} → {d}" for o, d in _montajes((RAIZ / "docker-compose.yml").read_text())
+                 if o.strip() in raiz]
+    assert not culpables, (
+        "la composición publicada monta el CHECKOUT ENTERO en el contenedor: "
+        + ", ".join(culpables))

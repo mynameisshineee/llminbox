@@ -966,6 +966,19 @@ if resto > 0:
           # `.llmi-mounts.json` no existe ANTES de `docker compose up`, Docker lo
           # sustituye por un directorio vacío en silencio.
           [ -r "$DIR/.llmi-mounts.json" ] || echo '{}' > "$DIR/.llmi-mounts.json"
+          # ── ESTADO PARA EL CONTENEDOR ───────────────────────────────────────
+          # Un directorio DEDICADO, y no el checkout entero. Montar `.` daba al
+          # proceso acceso de lectura a `.git` —con el historial completo, que
+          # puede contener secretos retirados en commits posteriores—, a los
+          # backups `*.bak-*` y al override con las rutas reales de nueve repos.
+          # `:ro` limita la escritura, no la lectura.
+          #
+          # Se COPIA en cada `up`, y eso no introduce deriva relevante: el
+          # servicio lee censo y montajes AL ARRANCAR, y `llmi up` ES el arranque.
+          # La copia se refresca exactamente cuando importa.
+          mkdir -p "$DIR/.llminbox-state"
+          cp -f "$ROSTER" "$DIR/.llminbox-state/roster.json"
+          cp -f "$DIR/.llmi-mounts.json" "$DIR/.llminbox-state/mounts.json"
           (cd "$DIR" && LLMINBOX_TOKEN="$TOKEN" docker compose up -d --build) ;;
   down)   (cd "$DIR" && docker compose down) ;;
   logs)   docker logs --tail "${1:-40}" llminbox ;;

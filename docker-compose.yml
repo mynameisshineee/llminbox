@@ -36,7 +36,7 @@ services:
       # sin `-f`) con el valor real y los bind-mounts que le corresponden a cada
       # uno — ver ese fichero, GENERADO, para el porqué de cada montaje.
       LLMINBOX_LEDGERS: "${LLMINBOX_LEDGERS:-}"
-      LLMINBOX_ROSTER: /repo/roster.json
+      LLMINBOX_ROSTER: /state/roster.json
       # Ámbito de carril (③): carriles.tsv (SoT de flota, fuera de este repo) ×
       # .llmi-mounts.json (nombre-de-este-servicio→ruta, lo escribe `llmi init`).
       # Vacío por defecto a propósito, mismo patrón que LLMINBOX_LEDGERS — quien
@@ -70,21 +70,23 @@ services:
       #    contenedor sirvió DOS DÍAS el censo viejo, sin un solo error. Un mount
       #    de directorio rehace la resolución del nombre en cada `open()`.
       #
-      # ⚠️ DEUDA DECLARADA, no solución final. Montar el checkout entero SÍ
-      #    ENSANCHA el perímetro de lectura del proceso: le da acceso a `.git`,
-      #    a los backups `*.bak-*`, a los overrides y a cualquier estado local que
-      #    la imagen no llevaba. Que sea `:ro` limita la escritura, no la lectura.
+      # DIRECTORIO DEDICADO, no el checkout. Dos razones, las dos cicatrices:
       #
-      #    Lo correcto es un directorio DEDICADO —`.llminbox-state/` con
-      #    `roster.json` y `mounts.json` dentro, montado solo— y así queda anotado
-      #    para v0.3.1. No se hace hoy porque `roster.json` está referenciado desde
-      #    seis sitios de código, README, SECURITY y `llmi init`, y lo tocan otras
-      #    sesiones: moverlo a la una de la mañana, en la misma tanda que el
-      #    hotfix del organigrama, cambia un riesgo conocido por uno nuevo.
+      #  · un bind-mount de FICHERO se ata al INODO: el 2026-08-18
+      #    `roles-por-alias.json` se reemplazó por rename en el host y el
+      #    contenedor sirvió DOS DÍAS el censo viejo, sin un solo error.
+      #  · y montar `.` entero (que fue mi primer intento) SÍ ensancha el
+      #    perímetro de lectura: `.git` con el historial completo —que puede
+      #    contener secretos retirados en commits posteriores—, los backups
+      #    `*.bak-*` y el override con las rutas reales de nueve repos. `:ro`
+      #    limita la escritura, no la lectura. Un path traversal pasaría de
+      #    alcanzar un fichero a alcanzar el checkout entero.
       #
-      #    Se acepta a sabiendas y se escribe. Lo que NO se hace es decir que no
-      #    ensancha nada, que era lo que ponía aquí.
-      - .:/repo:ro
+      # `llmi up` rellena este directorio antes de levantar. Un mount de
+      # DIRECTORIO ausente Docker lo crea vacío en vez de sustituirlo por otra
+      # cosa, así que la cicatriz del «fichero ausente → directorio vacío en
+      # silencio» tampoco aplica.
+      - ./.llminbox-state:/state:ro
     healthcheck:
       # Mira el CUERPO de /health, no solo el código HTTP: con el indexador
       # muerto en bucle (ledger roto, censo ilegible, …) /health sigue
