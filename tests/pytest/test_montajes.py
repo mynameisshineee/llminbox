@@ -464,7 +464,7 @@ def test_si_el_estado_no_se_puede_preparar_NO_se_levanta_el_contenedor(tmp_path)
         "silencio")
 
 
-def _up_hermetico(tmp_path, roster_json, estado_previo=None):
+def _up_hermetico(tmp_path, roster_json, estado_previo=None, aplicado=None):
     """`llmi up` con un `docker` FALSO que registra sus argumentos. Devuelve
     (returncode, argumentos_de_docker)."""
     import subprocess
@@ -480,6 +480,8 @@ def _up_hermetico(tmp_path, roster_json, estado_previo=None):
         (repo / ".llminbox-state").mkdir(exist_ok=True)
         (repo / ".llminbox-state" / "roster.json").write_text(estado_previo)
         (repo / ".llminbox-state" / "mounts.json").write_text("{}")
+    if aplicado is not None:
+        (repo / ".llmi-applied").write_text(aplicado)
     args = tmp_path / "docker-args.txt"
     # `docker ps` devuelve VACÍO a propósito: simula a la vez un nombre de
     # contenedor personalizado (`LLMINBOX_NAME`) y un fallo temporal del daemon.
@@ -522,7 +524,7 @@ def test_si_el_censo_cambia_el_contenedor_se_RECREA(tmp_path):
     assert "--force-recreate" in args, (
         f"el censo cambió y no se recrea el contenedor: el proceso seguiría con el "
         f"anterior.\nargumentos de docker: {args!r}")
-    assert "cambió estado" in r.stdout, (
+    assert "recreo el contenedor" in r.stdout, (
         "recrea sin decirlo: cortar la bandeja de la flota no puede ser un efecto "
         "colateral silencioso")
 
@@ -534,7 +536,7 @@ def test_si_el_censo_NO_cambia_no_se_corta_la_bandeja_de_la_flota(tmp_path):
     colateral de un comando genérico.
 
     FALSADOR: poner `--force-recreate` fijo pone esto rojo."""
-    r, args = _up_hermetico(tmp_path, A, estado_previo=A)
+    r, args = _up_hermetico(tmp_path, A, estado_previo=A, aplicado=_hash(A))
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
     assert "--force-recreate" not in args, (
         f"recrea sin motivo: corta la bandeja de la flota en cada `up`.\n{args!r}")
@@ -574,12 +576,12 @@ def test_lo_anunciado_corresponde_a_los_BYTES_INSTALADOS(tmp_path):
     r, _ = _up_hermetico(tmp_path, B, estado_previo=A)
     instalado = (tmp_path / "repo" / ".llminbox-state" / "roster.json").read_text()
     assert instalado == B, "publicó unos bytes distintos de los que iba a instalar"
-    assert "cambió estado" in r.stdout, "instaló bytes nuevos y no lo anunció"
+    assert "recreo el contenedor" in r.stdout, "instaló bytes nuevos y no lo anunció"
 
     otro = tmp_path / "b"
     otro.mkdir()
-    r2, _ = _up_hermetico(otro, B, estado_previo=B)
-    assert "cambió estado" not in r2.stdout, "anunció un cambio que no existió"
+    r2, _ = _up_hermetico(otro, B, estado_previo=B, aplicado=_hash(B))
+    assert "recreo el contenedor" not in r2.stdout, "anunció un cambio que no existió"
 
 
 def test_una_escritura_entre_medir_y_publicar_no_puede_pasar_desapercibida(tmp_path):
@@ -612,6 +614,9 @@ def test_una_escritura_entre_medir_y_publicar_no_puede_pasar_desapercibida(tmp_p
     (repo / ".llminbox-state").mkdir()
     (repo / ".llminbox-state" / "roster.json").write_text(A)
     (repo / ".llminbox-state" / "mounts.json").write_text("{}")
+    # El sello de APLICADO acredita que el proceso ya cargó A. Sin él, `up` recrea
+    # siempre —y con razón—, y este test dejaría de medir la ventana que busca.
+    (repo / ".llmi-applied").write_text(_hash(A))
     (binfalso / "docker").write_text("#!/bin/sh\nexit 0\n")
     (binfalso / "docker").chmod(0o755)
     # `cmp` real primero, y DESPUÉS la escritura ajena: la ventana exacta.
@@ -624,12 +629,16 @@ def test_una_escritura_entre_medir_y_publicar_no_puede_pasar_desapercibida(tmp_p
     aux = tmp_path / "roster-B.json"
     aux.write_text(B)
     marca = tmp_path / "escritura-ajena-ocurrio"
-    cmp_real = shutil.which("cmp", path="/usr/bin:/bin:/usr/local/bin")
-    assert cmp_real, "no encuentro `cmp` real: el arnés no puede montar la ventana"
-    (binfalso / "cmp").write_text(
-        f'#!/bin/sh\n"{cmp_real}" "$@"\n_rc=$?\n'
+    # Se interpone en `cat`, que es lo que LEE los bytes preparados para calcular
+    # el hash deseado. (La versión anterior interponía en `cmp`, y `cmp` ya no se
+    # usa: la comparación pasó a ser por hash. Un falsador que interpone donde ya
+    # no pasa nada no falsa nada — cazado al cambiar la implementación.)
+    cat_real = shutil.which("cat", path="/bin:/usr/bin:/usr/local/bin")
+    assert cat_real, "no encuentro `cat` real: el arnés no puede montar la ventana"
+    (binfalso / "cat").write_text(
+        f'#!/bin/sh\n"{cat_real}" "$@"\n_rc=$?\n'
         f'cp -f "{aux}" "{repo}/roster.json" && : > "{marca}"\nexit $_rc\n')
-    (binfalso / "cmp").chmod(0o755)
+    (binfalso / "cat").chmod(0o755)
 
     r = subprocess.run([str(repo / "llmi"), "up"], cwd=repo,
                        env={"HOME": str(casa),
@@ -644,7 +653,7 @@ def test_una_escritura_entre_medir_y_publicar_no_puede_pasar_desapercibida(tmp_p
     assert (repo / "roster.json").read_text() == B, (
         "la fuente no quedó en B: la escritura ajena escribió otra cosa")
     instalado = (repo / ".llminbox-state" / "roster.json").read_text()
-    anuncio = "cambió estado" in r.stdout
+    anuncio = "recreo el contenedor" in r.stdout
     assert (instalado != A) == anuncio, (
         f"lo instalado y lo anunciado no coinciden: instalado={'B' if instalado != A else 'A'}, "
         f"anunciado_cambio={anuncio}\n{r.stdout}")
@@ -673,7 +682,7 @@ def test_up_no_construye_y_build_es_una_decision_aparte(tmp_path):
 
     FALSADOR: devolver `--build` al `up` hace que aparezca en los argumentos y que
     `--no-build` desaparezca."""
-    r, args = _up_hermetico(tmp_path, A, estado_previo=A)
+    r, args = _up_hermetico(tmp_path, A, estado_previo=A, aplicado=_hash(A))
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
     assert "--no-build" in args, f"`up` puede construir: {args!r}"
     assert "compose build" not in args, f"`up` construyó sin que se lo pidieran: {args!r}"
@@ -753,3 +762,266 @@ def test_la_documentacion_no_promete_que_up_construya():
                        for ln in texto.splitlines()), (
                 f"{nombre} no enseña `llmi build` como comando, así que quien "
                 "siga el Quick Start no tendrá imagen que arrancar")
+
+
+# ── ESTADO DESEADO vs ESTADO APLICADO ────────────────────────────────────────
+# Los bytes publicados en `/state` NO acusan que el proceso los haya cargado.
+# Comparar «lo publicado con lo publicado» deja dos huecos, y los dos terminan en
+# un servicio VIVO sirviendo estado viejo sin decirlo.
+
+def _up(tmp_path, roster, *, args=(), build_falla=False, up_falla=False,
+        aplicado=None, estado=None):
+    """`llmi up` hermético. Devuelve (proceso, argumentos_docker, sello_aplicado)."""
+    import subprocess
+    repo, casa, binfalso = tmp_path / "repo", tmp_path / "home", tmp_path / "bin"
+    for d in (repo, casa, binfalso):
+        d.mkdir(parents=True, exist_ok=True)
+    for f in ("llmi", "docker-compose.yml", "roster.example.json"):
+        shutil.copy(RAIZ / f, repo / f)
+    (repo / "roster.json").write_text(roster)
+    (repo / ".llmi-mounts.json").write_text("{}")
+    (casa / ".llminbox.token").write_text("t")
+    if estado is not None:
+        (repo / ".llminbox-state").mkdir(exist_ok=True)
+        (repo / ".llminbox-state" / "roster.json").write_text(estado)
+        (repo / ".llminbox-state" / "mounts.json").write_text("{}")
+    if aplicado is not None:
+        (repo / ".llmi-applied").write_text(aplicado)
+    reg = tmp_path / "docker-args.txt"
+    fallos = []
+    if build_falla:
+        fallos.append('[ "$2" = "build" ] && exit 1')
+    if up_falla:
+        fallos.append('[ "$2" = "up" ] && exit 1')
+    (binfalso / "docker").write_text(
+        "#!/bin/sh\n" + "\n".join(fallos) + f'\necho "$@" >> "{reg}"\nexit 0\n')
+    (binfalso / "docker").chmod(0o755)
+    r = subprocess.run([str(repo / "llmi"), "up", *args], cwd=repo,
+                       env={"HOME": str(casa),
+                            "PATH": f"{binfalso}:/usr/bin:/bin:/usr/sbin:/sbin"},
+                       capture_output=True, text=True, timeout=120, check=False)
+    sello = (repo / ".llmi-applied")
+    return r, (reg.read_text() if reg.exists() else ""), (
+        sello.read_text() if sello.exists() else None)
+
+
+def _hash(roster):
+    import hashlib
+    return hashlib.sha256((roster + "{}").encode()).hexdigest()
+
+
+def test_si_el_BUILD_falla_el_sello_no_avanza_y_el_siguiente_up_recrea(tmp_path):
+    """El hueco que encontró CodeRabbit: se publicaba B, el build fallaba, el
+    script salía — y el siguiente `up` comparaba B con B, no recreaba, y el
+    proceso seguía sirviendo A. Vivo y en silencio.
+
+    FALSADOR: publicar antes de construir deja `/state` en B con el sello en A y
+    el aviso perdido; peor aún si además se avanzara el sello."""
+    r, args, sello = _up(tmp_path, B, args=("--build",), build_falla=True,
+                         aplicado=_hash(A), estado=A)
+    assert r.returncode != 0, f"el build falló y salió con éxito:\n{r.stdout}"
+    assert sello == _hash(A), f"el sello avanzó con el build roto: {sello}"
+    assert "compose up" not in args, "levantó pese a fallar el build"
+    assert (tmp_path / "repo" / ".llminbox-state" / "roster.json").read_text() == A, (
+        "publicó B con el build roto: el siguiente `up` compararía B con B")
+    # Y el siguiente intento, ya sin fallo, SÍ recrea.
+    _r2, args2, sello2 = _up(tmp_path / "2", B, aplicado=_hash(A), estado=A)
+    assert "--force-recreate" in args2, f"el siguiente `up` no recupera: {args2!r}"
+    assert sello2 == _hash(B)
+
+
+def test_si_el_UP_falla_el_sello_no_avanza(tmp_path):
+    """El segundo hueco, que mover el build NO cubre: `/state` ya tiene B y
+    `compose up` revienta, así que el contenedor viejo sigue vivo con A.
+    Comparando publicado-con-publicado, el siguiente `up` no recrearía nunca.
+
+    FALSADOR: avanzar el sello antes de que Docker termine bien — el mismo bug
+    con otra representación."""
+    r, _args, sello = _up(tmp_path, B, up_falla=True, aplicado=_hash(A), estado=A)
+    assert r.returncode != 0, "el `up` falló y salió con éxito"
+    assert sello == _hash(A), f"el sello avanzó con el `up` roto: {sello}"
+    _r2, args2, _ = _up(tmp_path / "2", B, aplicado=_hash(A), estado=B)
+    assert "--force-recreate" in args2, (
+        f"con /state ya en B y el proceso en A, no recupera: {args2!r}")
+
+
+def test_cuando_todo_va_bien_el_sello_avanza_y_el_siguiente_up_no_recrea(tmp_path):
+    """CONTROL, y es el que impide «recrear siempre» como solución perezosa: tras
+    un `up` exitoso el sello queda en B, y un `up` idéntico no debe tocar nada."""
+    r, args, sello = _up(tmp_path, B, aplicado=_hash(A), estado=A)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "--force-recreate" in args
+    assert sello == _hash(B), f"el sello no avanzó tras un `up` bueno: {sello}"
+    _r2, args2, sello2 = _up(tmp_path / "2", B, aplicado=_hash(B), estado=B)
+    assert "--force-recreate" not in args2, f"recrea sin motivo: {args2!r}"
+    assert sello2 == _hash(B)
+
+
+def test_un_typo_en_el_argumento_no_puede_parecerse_a_un_despliegue(tmp_path):
+    """`llmi up --buidl` se ignoraba en silencio y arrancaba la imagen ANTERIOR:
+    el operador cree que ha desplegado y no lo ha hecho.
+
+    FALSADOR: aceptar cualquier argumento deja rc=0 y llama a Docker."""
+    r, args, sello = _up(tmp_path, B, args=("--buidl",), aplicado=_hash(A), estado=A)
+    assert r.returncode == 2, f"un typo no dio mal uso: rc={r.returncode}"
+    assert "desconocido" in r.stderr, r.stderr
+    assert args == "", f"invocó a Docker con un argumento inválido: {args!r}"
+    assert sello == _hash(A), "tocó el sello con un argumento inválido"
+    assert (tmp_path / "repo" / ".llminbox-state" / "roster.json").read_text() == A, (
+        "publicó estado con un argumento inválido")
+
+
+def test_build_repetido_tambien_es_mal_uso(tmp_path):
+    """El contrato dice DOS formas, no «--build cuantas veces quieras». Aceptar
+    `up --build --build` es aceptar una tercera forma que nadie declaró, y una
+    interfaz que tolera lo que no documenta acaba documentándose por lo que
+    tolera.
+
+    FALSADOR: quitar la guarda deja rc=0 e invoca a Docker."""
+    r, args, sello = _up(tmp_path, B, args=("--build", "--build"),
+                         aplicado=_hash(A), estado=A)
+    assert r.returncode == 2, f"rc={r.returncode}"
+    assert "repetido" in r.stderr, r.stderr
+    assert args == "", f"invocó a Docker: {args!r}"
+    assert sello == _hash(A), "tocó el sello"
+
+
+def test_si_no_se_puede_calcular_el_hash_no_se_publica_ni_se_sella(tmp_path):
+    """El script lleva `set -uo pipefail` pero NO `set -e`. Sin cortar, un fallo
+    de `cat`/`python3` seguía adelante, publicaba el staging y escribía un sello
+    VACÍO — que ya no describe nada y hace que el gate mienta en la dirección que
+    más duele: un sello vacío coincide con otro sello vacío.
+
+    Se fuerza el fallo interponiendo un `python3` que revienta, que es lo que
+    calcula el hash.
+
+    FALSADOR: quitar el `||` deja el sello escrito y `/state` publicado con un
+    valor que no describe esos bytes."""
+    import subprocess
+    repo, casa, binfalso = tmp_path / "repo", tmp_path / "home", tmp_path / "bin"
+    for d in (repo, casa, binfalso):
+        d.mkdir()
+    for f in ("llmi", "docker-compose.yml", "roster.example.json"):
+        shutil.copy(RAIZ / f, repo / f)
+    (repo / "roster.json").write_text(B)
+    (repo / ".llmi-mounts.json").write_text("{}")
+    (casa / ".llminbox.token").write_text("t")
+    (repo / ".llminbox-state").mkdir()
+    (repo / ".llminbox-state" / "roster.json").write_text(A)
+    (repo / ".llminbox-state" / "mounts.json").write_text("{}")
+    (repo / ".llmi-applied").write_text(_hash(A))
+    reg = tmp_path / "docker-args.txt"
+    (binfalso / "docker").write_text(f'#!/bin/sh\necho "$@" >> "{reg}"\nexit 0\n')
+    (binfalso / "docker").chmod(0o755)
+    # `python3` revienta SÓLO al calcular el hash (recibe el script por -c).
+    py_real = shutil.which("python3", path="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+    assert py_real, "no encuentro python3 real"
+    (binfalso / "python3").write_text(
+        f'#!/bin/sh\ncase "$*" in *hashlib*) exit 1 ;; esac\nexec "{py_real}" "$@"\n')
+    (binfalso / "python3").chmod(0o755)
+
+    r = subprocess.run([str(repo / "llmi"), "up"], cwd=repo,
+                       env={"HOME": str(casa),
+                            "PATH": f"{binfalso}:/usr/bin:/bin:/usr/sbin:/sbin"},
+                       capture_output=True, text=True, timeout=120, check=False)
+    assert r.returncode != 0, f"siguió adelante sin poder calcular el hash:\n{r.stdout}"
+    assert (repo / ".llmi-applied").read_text() == _hash(A), "selló con el hash roto"
+    assert (repo / ".llminbox-state" / "roster.json").read_text() == A, (
+        "publicó estado sin poder describir qué publicaba")
+    assert not reg.exists(), f"invocó a Docker: {reg.read_text()!r}"
+
+
+def test_dos_up_a_la_vez_no_se_pisan_el_sello(tmp_path):
+    """Dos `llmi up` simultáneos —y en esta casa hay varias sesiones a la vez—
+    compiten por el sello: uno puede mover el temporal del otro y dejar
+    `.llmi-applied` describiendo un despliegue que no es el que corre.
+
+    Se RECHAZA en vez de esperar: dos despliegues a la vez no son una cola, son un
+    accidente, y adivinar cuál gana sería peor que negarse.
+
+    Se simula el cerrojo tomado por otro proceso creándolo antes.
+
+    FALSADOR: sin cerrojo, el segundo `up` entra y compite."""
+    import subprocess
+    repo, casa, binfalso = tmp_path / "repo", tmp_path / "home", tmp_path / "bin"
+    for d in (repo, casa, binfalso):
+        d.mkdir()
+    for f in ("llmi", "docker-compose.yml", "roster.example.json"):
+        shutil.copy(RAIZ / f, repo / f)
+    (repo / "roster.json").write_text(A)
+    (repo / ".llmi-mounts.json").write_text("{}")
+    (casa / ".llminbox.token").write_text("t")
+    (repo / ".llmi-lifecycle.lock").mkdir()          # otro `up` ya está dentro
+    reg = tmp_path / "docker-args.txt"
+    (binfalso / "docker").write_text(f'#!/bin/sh\necho "$@" >> "{reg}"\nexit 0\n')
+    (binfalso / "docker").chmod(0o755)
+    r = subprocess.run([str(repo / "llmi"), "up"], cwd=repo,
+                       env={"HOME": str(casa),
+                            "PATH": f"{binfalso}:/usr/bin:/bin:/usr/sbin:/sbin"},
+                       capture_output=True, text=True, timeout=120, check=False)
+    assert r.returncode != 0, "entró con el cerrojo tomado"
+    assert "otro `llmi up`" in r.stderr, r.stderr
+    assert not reg.exists(), f"invocó a Docker con el cerrojo tomado: {reg.read_text()!r}"
+    assert (repo / ".llmi-lifecycle.lock").exists(), "se llevó por delante el cerrojo ajeno"
+
+
+def test_sin_cerrojo_no_se_toca_NADA_ni_siquiera_el_bootstrap(tmp_path):
+    """El cerrojo tiene que proteger desde el PRIMER write, no desde la parte que
+    parecía peligrosa.
+
+    Con el token/roster/mounts creados fuera del cerrojo, dos `up` en un checkout
+    limpio todavía se pisaban: los dos ven que no hay token, los dos lo generan,
+    uno arranca Docker con el suyo y el disco acaba con el del otro — servicio
+    vivo con credenciales que ya no coinciden con las del cliente. El cerrojo
+    existía y no cubría eso.
+
+    «No conseguí exclusión» tiene que significar «no toqué nada».
+
+    FALSADOR: devolver la toma del cerrojo detrás del bootstrap hace que el token
+    y los ficheros aparezcan aunque el cerrojo esté ocupado."""
+    import subprocess
+    repo, casa, binfalso = tmp_path / "repo", tmp_path / "home", tmp_path / "bin"
+    for d in (repo, casa, binfalso):
+        d.mkdir()
+    for f in ("llmi", "docker-compose.yml", "roster.example.json"):
+        shutil.copy(RAIZ / f, repo / f)
+    (repo / ".llmi-lifecycle.lock").mkdir()        # otro proceso ya está dentro
+    reg = tmp_path / "docker-args.txt"
+    (binfalso / "docker").write_text(f'#!/bin/sh\necho "$@" >> "{reg}"\nexit 0\n')
+    (binfalso / "docker").chmod(0o755)
+    r = subprocess.run([str(repo / "llmi"), "up"], cwd=repo,
+                       env={"HOME": str(casa),
+                            "PATH": f"{binfalso}:/usr/bin:/bin:/usr/sbin:/sbin"},
+                       capture_output=True, text=True, timeout=120, check=False)
+    assert r.returncode != 0, "entró con el cerrojo ocupado"
+    assert not (casa / ".llminbox.token").exists(), "generó token sin exclusión"
+    assert not (repo / "roster.json").exists(), "creó el censo sin exclusión"
+    assert not (repo / ".llmi-mounts.json").exists(), "creó el mapa sin exclusión"
+    assert not (repo / ".llminbox-state").exists(), "creó el estado sin exclusión"
+    assert not reg.exists(), "invocó a Docker sin exclusión"
+    assert (repo / ".llmi-lifecycle.lock").exists(), "se llevó el cerrojo ajeno"
+
+
+def test_build_comparte_el_cerrojo_con_up(tmp_path):
+    """`build` y `up` son operaciones distintas del MISMO ciclo de vida mutable.
+    Un `build` que cambia la imagen mientras un `up` decide qué hacer con ella es
+    la misma carrera con otro disfraz — y `build` ignoraba el cerrojo.
+
+    FALSADOR: quitarle la toma de cerrojo a `build` deja que invoque a Docker con
+    un `up` en marcha."""
+    import subprocess
+    repo, casa, binfalso = tmp_path / "repo", tmp_path / "home", tmp_path / "bin"
+    for d in (repo, casa, binfalso):
+        d.mkdir()
+    for f in ("llmi", "docker-compose.yml", "roster.example.json"):
+        shutil.copy(RAIZ / f, repo / f)
+    (repo / ".llmi-lifecycle.lock").mkdir()
+    reg = tmp_path / "docker-args.txt"
+    (binfalso / "docker").write_text(f'#!/bin/sh\necho "$@" >> "{reg}"\nexit 0\n')
+    (binfalso / "docker").chmod(0o755)
+    r = subprocess.run([str(repo / "llmi"), "build"], cwd=repo,
+                       env={"HOME": str(casa),
+                            "PATH": f"{binfalso}:/usr/bin:/bin:/usr/sbin:/sbin"},
+                       capture_output=True, text=True, timeout=120, check=False)
+    assert r.returncode != 0, "construyó con el ciclo de vida ocupado"
+    assert not reg.exists(), f"invocó a Docker: {reg.read_text()!r}"
