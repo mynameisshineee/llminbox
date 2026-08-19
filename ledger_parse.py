@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import threading as _threading
 import unicodedata
 from dataclasses import dataclass, field
 
@@ -231,7 +232,15 @@ def _cargar_roles_por_alias():
     # Valores TAMBIÉN en minúsculas: `canon_identidad()` compara el nombre ya
     # bajado contra `.values()`, y un `"BE"` en el fichero firmado (que se edita
     # a mano, fuera de este repo) dejaría ese rol sin matchear en silencio.
+    return _mapa_alias(d)
+
+
+def _mapa_alias(d: dict) -> dict:
     return {k.lower(): v.lower() for k, v in d.get("rol_por_alias", {}).items()}
+
+
+def _mapa_jerarquia(d: dict) -> dict:
+    return {k.lower(): v for k, v in d.get("jerarquia", {}).items()}
 
 
 ROLES_ALIAS = _cargar_roles_por_alias()
@@ -257,7 +266,7 @@ def _cargar_jerarquia() -> dict:
         return {}
     try:
         with open(ruta, encoding="utf-8") as fh:
-            return {k.lower(): v for k, v in _json.load(fh).get("jerarquia", {}).items()}
+            return _mapa_jerarquia(_json.load(fh))
     except Exception as e:
         print(f"[jerarquia] no pude leer {ruta}: {e} — se sirve vacía y se avisa",
               flush=True)
@@ -265,6 +274,92 @@ def _cargar_jerarquia() -> dict:
 
 
 JERARQUIA = _cargar_jerarquia()
+
+# Lo que está EFECTIVAMENTE cargado, para poder contestar «¿de qué bytes hablo?».
+ORG_SHA: str | None = None
+ORG_CARGADO_EN: str | None = None
+ORG_REVISION = None
+
+
+_ORG_CERROJO = _threading.Lock()
+
+
+def _foto_org(montada: bool, source: str | None) -> dict:
+    """Instantánea INMUTABLE del organigrama. Se construye SIEMPRE dentro del
+    cerrojo, y el llamante no vuelve a mirar los globales.
+
+    Sin esto había una carrera —la misma del sello del PR #5, un piso más arriba—:
+    el refresco devolvía el hash de una revisión y el endpoint leía `JERARQUIA` y
+    `ORG_REVISION` de otra si una petición concurrente recargaba en medio. Servir
+    el hash de una con la jerarquía de otra no es un organigrama viejo: es uno
+    IMPOSIBLE, y firmado.
+    """
+    return {"montada": montada, "source_sha256": source,
+            "loaded_sha256": ORG_SHA, "jerarquia": dict(JERARQUIA),
+            "revision": ORG_REVISION, "cargado_en": ORG_CARGADO_EN}
+
+
+def refrescar_organigrama() -> dict:
+    """Relee la fuente firmada si sus bytes cambiaron y devuelve UNA instantánea.
+
+    Nació de un fallo de producción (2026-08-18): el bind-mount de FICHERO ÚNICO
+    quedó apuntando a un inodo borrado cuando el host reemplazó el fichero por
+    rename, y `/organigrama` siguió sirviendo 15 roles de hacía dos días **sin
+    avisar** — porque el fichero sí se había leído al arrancar: se leyó el viejo.
+
+    Tres decisiones que salen de ahí:
+
+    · **Se abre por RUTA en cada petición.** Resolver la ruta de nuevo es lo que
+      derrota al inodo borrado: con el mount roto, `open()` da ENOENT y el fallo
+      se vuelve visible en vez de silencioso. Cachear un descriptor lo reeditaría.
+    · **Sin TTL.** Una ventana en la que la fuente ya cambió y esto contesta
+      «fresco» es exactamente la mentira que había. Hashear 6 KB por petición
+      cuesta menos que afirmar frescura que no se tiene.
+    · **La FORMA se valida dentro del bloque protegido.** `json.loads` acepta `[]`
+      y `"texto"`: son JSON válido y no son un organigrama. Derivar los mapas
+      fuera del `try` convertía eso en un 500, y un 500 no es «rancio» — es que el
+      endpoint se cae. Una fuente con forma ajena es indistinguible de una
+      ilegible: no se puede derivar nada de ella, y se trata igual.
+
+    Si la fuente no se deja leer se CONSERVA lo último bueno y se marca rancio:
+    servir una jerarquía vacía sería peor —el agente leería «no reporto a nadie»,
+    que es lo contrario de la verdad—, pero servirla como buena es lo que falló.
+    """
+    global ROLES_ALIAS, JERARQUIA, ORG_SHA, ORG_CARGADO_EN, ORG_REVISION
+    import hashlib as _h
+    import json as _json
+    import os as _os
+    from datetime import datetime as _dt, timezone as _tz
+
+    ruta = _os.environ.get("LLMINBOX_ROLES_ALIAS", "")
+    with _ORG_CERROJO:
+        if not ruta:
+            return _foto_org(False, None)
+        try:
+            with open(ruta, "rb") as fh:
+                crudo = fh.read()
+            sha = _h.sha256(crudo).hexdigest()
+            d = _json.loads(crudo.decode("utf-8"))
+            # LOS MAPAS SE DERIVAN AQUÍ DENTRO, y eso es todo lo que hace falta:
+            # si `d` es `[]`, `"texto"` o `5`, o si sus campos no son mapas, el
+            # `.get()`/`.items()` revienta AQUÍ y lo recoge el `except`. Un
+            # `isinstance(d, dict)` explícito delante sería código muerto — lo
+            # escribí, y el mutante que lo quitaba sobrevivió: no cambiaba nada.
+            # Una comprobación sin falsador es adorno.
+            alias, jer = _mapa_alias(d), _mapa_jerarquia(d)
+        except Exception:
+            # Ilegible, corrupta o con forma ajena: NO se toca el estado bueno.
+            return _foto_org(True, None)
+        if sha != ORG_SHA:
+            # Los DOS mapas salen del MISMO fichero, así que se publican juntos.
+            # Si sólo se refrescara la jerarquía, `engineering-manager` seguiría
+            # saliendo en el organigrama y dando 422 en la bandeja: un rol que no
+            # puede recibir trabajo. Ese caso está medido, no es hipotético.
+            ROLES_ALIAS, JERARQUIA = alias, jer
+            ORG_REVISION = d.get("_revision")
+            ORG_SHA = sha
+            ORG_CARGADO_EN = _dt.now(_tz.utc).isoformat(timespec="seconds")
+        return _foto_org(True, sha)
 
 
 def canon_identidad(nombre: str) -> str | None:
@@ -430,6 +525,42 @@ RE_AGENTE = re.compile(
 # **3.441 de 23.496 entradas (14,6%)** con el actor sustituido por la etiqueta, así
 # que `/entries?actor=alice-backend` perdía todos sus heartbeats. Se saltan antes de
 # buscar el actor, y se recogen como tipo.
+# La posición canónica del tipo: `### [origen → destino · TIPO] titular`. Se
+# captura el lexema TAL CUAL —sin validarlo contra `TIPOS` y SIN normalizarlo—,
+# porque validar aquí es lo que hacía que 641 entradas perdieran lo que sí habían
+# declarado, y normalizar es ya interpretar: decidir que `Medido` y `MEDIDO` son
+# la misma palabra le toca al registro canónico, con su revisión anotada, no al
+# troceador por su cuenta.
+#
+# Sin clase de caracteres «permitidos»: la primera versión aceptaba sólo letras,
+# `_`, `/` y `-`, o sea traía su propio vocabulario implícito y perdía `REVIEW.V2`
+# — el mismo fallo una capa más abajo. Se acota por LONGITUD, no por alfabeto.
+#
+# `·` sí queda fuera de la clase, y eso no es vocabulario: hace que capture el
+# ÚLTIMO campo de la cabecera. Sin esa exclusión, un `a · b · TIPO]` devolvería
+# «b · TIPO».
+RAW_TIPO = re.compile(r"·\s*([^·\]\r\n]{1,64}?)\s*\]")
+
+# Operadores de RUTA del propio formato. Excluirlos no es vocabulario de palabras:
+# es respetar la sintaxis de la cabecera, donde `→`/`∧` separan actores.
+OPERADORES_RUTA = ("→", "->", "←", "<-", "∧", "&")
+
+
+def _es_token_de_tipo(v: str) -> bool:
+    """Un tipo es UN SOLO TOKEN. Espacios y operadores de ruta lo descalifican.
+
+    Nace de medir la otra cara del filo: liberar el capturador de su vocabulario
+    cerrado (que perdía 641 tipos reales) lo dejó capturando 38.848 valores, de
+    los que **7.570 eran RUTAS o prosa** — `bikeus→security ∧ Albert`, `BARRIDO
+    CERRADO security→bikeus`—, porque `·` se usa como separador general y el
+    último campo no siempre es el tipo.
+
+    La regla NO es una lista negra de flechas: eso deja pasar 3.855 rutas con
+    espacios y sin flecha. Es la FORMA. Medido: con esta guarda sobreviven los
+    31.273 que sí lo son, y los tipos del hallazgo enteros (MEDIDO 376,
+    MEASURED 340, ADJUDICADO 90, VEREDICTO 27).
+    """
+    return bool(v) and not re.search(r"\s", v) and not any(o in v for o in OPERADORES_RUTA)
 ETIQUETAS = re.compile(r"^\s*(HEARTBEAT|CARRY-FORWARD|CLAIM|CANON|CERT|DONE|RESP|AVISO|MSG|ASK|ACK|STATUS|INFO|HANDOFF)"
                        r"(?:[/·\-]\s*(?:HEARTBEAT|CARRY-FORWARD|CLAIM|CANON|CERT|DONE|RESP|AVISO|MSG|ASK|ACK|STATUS|INFO|HANDOFF))*\s*",
                        re.IGNORECASE)
@@ -489,17 +620,78 @@ class Entrada:
     # rompe a quien solo mire `.to`.
     difusion: list[str] = field(default_factory=list)
     tipo: str | None = None
+    # El lexema escrito en una posición COMPATIBLE CON LA GRAMÁTICA DE TIPO — no
+    # «todo lo escrito», que es distinto y se documenta en `raw_tipo_de`. `tipo` es
+    # lo que el sistema INTERPRETA de él. Existen los dos porque medí que no
+    # coinciden: 641 entradas del ledger piloto (8,2 %) declaran un tipo en posición
+    # canónica que este parser tiraba —MEDIDO, MEASURED, ADJUDICADO, VEREDICTO…—, y
+    # `lint` las contaba como «no declaran nada» cuando declaran de sobra.
+    # El literal íntegro no se pierde: `head` se guarda entero.
+    raw_tipo: str | None = None
 
     @property
     def sha(self) -> str:
         return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
 
 
-def _campos(head: str, cola: str) -> tuple[str | None, str | None, list[str], list[str], str | None]:
-    """Extrae (ts, actor, destinatarios, difusion, tipo, por_arroba).
+def raw_tipo_de(head: str) -> str | None:
+    """El lexema escrito en una posición COMPATIBLE CON LA GRAMÁTICA DE TIPO.
+
+    El nombre importa: esto no es «todo lo que había escrito». Es el último campo
+    de la cabecera **si además tiene forma de token de tipo** (ver
+    `_es_token_de_tipo`), que ya es una clasificación SINTÁCTICA — no semántica,
+    pero clasificación. Llamarlo «el literal, sin más» sería afirmar de más:
+    `bikeus→security ∧ Albert` también estaba escrito ahí y aquí devuelve None.
+
+    El literal COMPLETO no se pierde: vive en `head`, que se guarda entero y
+    permite reproducir esta clasificación en cualquier momento. Por eso no hace
+    falta una columna más para conservarlo.
+
+    Las capas, para que nadie las mezcle:
+
+        head            lo escrito, íntegro
+          ↓
+        último campo    candidato tras el `·`
+          ↓ forma
+        raw_tipo        el candidato SI tiene forma de tipo (esto)
+          ↓ registro versionado
+        canonical_kind  semántica del Agent OS   (+ kind_registry_rev)
+
+        tipo            aparte: el vocabulario legacy que este servicio reconoce
+
+    UNA sola fuente para la primera flecha.
+
+    Se expone aparte de `_campos` porque el backfill del corpus ya indexado lo
+    necesita **sin volver a leer el fichero**: `head` está guardado en la base, y
+    `barrido()` salta un ledger entero cuando su tamaño y mtime no cambiaron —
+    así que confiar la migración a una re-indexación dejaría sin rellenar todos
+    los ledgers dormidos, para siempre.
+    """
+    inner = head
+    mb = re.match(r"^#{2,3} \[(.*)$", head or "")
+    if mb:
+        inner = mb.group(1)
+    inner = _sin_emoji(inner)
+    cierre = inner.find("]")
+    inner = inner[:cierre + 1] if cierre != -1 else inner
+    m = RAW_TIPO.search(inner)
+    if m and _es_token_de_tipo(m.group(1)):
+        return m.group(1)
+    # Si el último campo NO era un tipo, la cabecera todavía puede declararlo al
+    # frente (`### [DONE algo · bikeus→security ∧ Albert]`). Cortar en seco aquí
+    # sería descartar de más por el otro lado.
+    et = ETIQUETAS.match(inner)
+    return et.group(1) if et else None
+
+
+def _campos(head: str, cola: str) -> tuple[
+        str | None, str | None, list[str], list[str], str | None, bool, str | None]:
+    """Extrae (ts, actor, destinatarios, difusion, tipo, por_arroba, raw_tipo).
 
     Devuelve None en lo que no se pueda leer. `por_arroba` dice si los destinatarios
     salieron de un `@` en una cabecera sin flecha — ver el campo del mismo nombre.
+    `raw_tipo` es el LEXEMA escrito en la posición del tipo, se entienda o no
+    (ver `raw_tipo_de`); `tipo` es lo que el sistema interpreta de él.
     """
     m = TS.search(head) or TS.search(cola)
     ts = m.group(1) if m else None
@@ -601,7 +793,10 @@ def _campos(head: str, cola: str) -> tuple[str | None, str | None, list[str], li
     tipo = next((t for t in TIPOS if t in head), None)
     if tipo is None and etiqueta:
         tipo = etiqueta.group(1).upper()
-    return ts, actor, to, difusion, tipo, por_arroba
+    # Lo escrito, se entienda o no. Se mira la posición canónica (`· TOKEN]`)
+    # antes que la etiqueta al frente, porque es donde la flota lo pone.
+    raw = raw_tipo_de(head)
+    return ts, actor, to, difusion, tipo, por_arroba, raw
 
 
 def parse(path: str, desde_byte: int = 0):
@@ -629,10 +824,10 @@ def parse(path: str, desde_byte: int = 0):
         text = "".join(lines[i:end]).rstrip() + "\n"
         head = lines[i].rstrip("\n")
         cola = "".join(lines[i + 1:i + 4])
-        ts, actor, to, difusion, tipo, por_arroba = _campos(head, cola)
+        ts, actor, to, difusion, tipo, por_arroba, raw_tipo = _campos(head, cola)
         out.append(Entrada(seq=n, line_no=i + 1, byte_off=offs[i], head=head,
                            text=text, ts=ts, actor=actor, to=to, difusion=difusion,
-                           tipo=tipo, por_arroba=por_arroba))
+                           tipo=tipo, por_arroba=por_arroba, raw_tipo=raw_tipo))
     return out, acc
 
 

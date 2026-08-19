@@ -36,13 +36,17 @@ services:
       # sin `-f`) con el valor real y los bind-mounts que le corresponden a cada
       # uno — ver ese fichero, GENERADO, para el porqué de cada montaje.
       LLMINBOX_LEDGERS: "${LLMINBOX_LEDGERS:-}"
-      LLMINBOX_ROSTER: /censo.json
+      LLMINBOX_ROSTER: /state/roster.json
       # Ámbito de carril (③): carriles.tsv (SoT de flota, fuera de este repo) ×
       # .llmi-mounts.json (nombre-de-este-servicio→ruta, lo escribe `llmi init`).
       # Vacío por defecto a propósito, mismo patrón que LLMINBOX_LEDGERS — quien
       # clone esto no se encuentra un feature encendido sin haberlo montado.
       LLMINBOX_CARRILES: "${LLMINBOX_CARRILES:-}"
-      LLMINBOX_MOUNTS_JSON: "${LLMINBOX_MOUNTS_JSON:-}"
+      # Deja de ser opcional-externo: `llmi up` SIEMPRE lo deja en `/state`, así
+      # que la composición publicada puede —y debe— apuntar ahí. Con el default
+      # vacío, `_cargar_carriles()` devolvía {} aunque el fichero estuviera
+      # montado: la variable no señalaba a ninguna parte y nadie lo veía.
+      LLMINBOX_MOUNTS_JSON: /state/mounts.json
       # Fuente FIRMADA del censo (①/② — review×3 2026-08-10, MAJOR code): la
       # unión de `canon_identidad()` prefiere `roles-por-alias.json` a
       # `roster.json` cuando está montado, porque los dos pueden divergir sin
@@ -60,12 +64,33 @@ services:
       # que clone este repo lo tiene ya en el sitio correcto, sea cual sea su
       # usuario o dónde puso el checkout.
       #
-      # TIENE que existir ANTES de `docker compose up`: un bind-mount de FICHERO
-      # ausente, Docker lo sustituye en silencio por un DIRECTORIO vacío, y el
-      # extractor dentonces no reconoce a nadie (`[censo] no pude leer /censo.json:
-      # Is a directory`). Por eso `llmi init` y `llmi up` lo crean los dos
-      # (copiando `roster.example.json` si hace falta) antes de tocar Docker.
-      - ./roster.json:/censo.json:ro
+      # DIRECTORIO, no fichero, y las dos razones son cicatrices de este repo:
+      #
+      #  · un bind-mount de FICHERO ausente Docker lo sustituye en silencio por un
+      #    DIRECTORIO vacío, y el extractor no reconoce a nadie (`[censo] no pude
+      #    leer …: Is a directory`). Por eso `llmi init`/`llmi up` lo crean antes.
+      #  · y un bind-mount de FICHERO se ata al INODO: el 2026-08-18
+      #    `roles-por-alias.json` se reemplazó por rename en el host y el
+      #    contenedor sirvió DOS DÍAS el censo viejo, sin un solo error. Un mount
+      #    de directorio rehace la resolución del nombre en cada `open()`.
+      #
+      # DIRECTORIO DEDICADO, no el checkout. Dos razones, las dos cicatrices:
+      #
+      #  · un bind-mount de FICHERO se ata al INODO: el 2026-08-18
+      #    `roles-por-alias.json` se reemplazó por rename en el host y el
+      #    contenedor sirvió DOS DÍAS el censo viejo, sin un solo error.
+      #  · y montar `.` entero (que fue mi primer intento) SÍ ensancha el
+      #    perímetro de lectura: `.git` con el historial completo —que puede
+      #    contener secretos retirados en commits posteriores—, los backups
+      #    `*.bak-*` y el override con las rutas reales de nueve repos. `:ro`
+      #    limita la escritura, no la lectura. Un path traversal pasaría de
+      #    alcanzar un fichero a alcanzar el checkout entero.
+      #
+      # `llmi up` rellena este directorio antes de levantar. Un mount de
+      # DIRECTORIO ausente Docker lo crea vacío en vez de sustituirlo por otra
+      # cosa, así que la cicatriz del «fichero ausente → directorio vacío en
+      # silencio» tampoco aplica.
+      - ./.llminbox-state:/state:ro
     healthcheck:
       # Mira el CUERPO de /health, no solo el código HTTP: con el indexador
       # muerto en bucle (ledger roto, censo ilegible, …) /health sigue

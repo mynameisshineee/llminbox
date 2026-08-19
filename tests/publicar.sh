@@ -130,7 +130,7 @@ S="$(python3 -c "
 import sys; sys.path.insert(0,'.')
 import ledger_parse as lp
 cab = [l for l in open('$T/L.md') if l.startswith('### [')][-1]
-ts, actor, to, dif, tipo, arroba = lp._campos(cab.rstrip(), '')
+ts, actor, to, dif, tipo, arroba, _raw = lp._campos(cab.rstrip(), '')
 print(f'{actor}|{\",\".join(to)}|{tipo}|{bool(ts)}')")"
 [ "$S" = "cto-A|qa,security|PRODUCED|True" ] \
   && bien "el troceador saca actor, destinatarios, tipo y sello de lo publicado" \

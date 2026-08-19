@@ -145,12 +145,47 @@ sin_servicio() {
   return 3          # 3 = servicio ausente. Distinto de 1 (hallazgo) y 2 (uso).
 }
 
+# ── CERROJO DE CICLO DE VIDA ──────────────────────────────────────────────────
+# `build` y `up` son operaciones DISTINTAS del MISMO ciclo de vida mutable, así que
+# comparten cerrojo: un `build` que cambia la imagen mientras un `up` decide qué
+# hacer con ella es la misma carrera con otro disfraz.
+#
+# Se toma ANTES del primer efecto lateral, no antes de la parte que parecía
+# peligrosa. Con el token/roster/mounts creados fuera del cerrojo, dos `up` en un
+# checkout limpio todavía podían pisarse: los dos ven que no hay token, los dos lo
+# generan, uno arranca Docker con el suyo y el disco acaba con el del otro —
+# servicio vivo con credenciales que ya no coinciden con las del cliente.
+#
+# «No conseguí exclusión» tiene que significar «no toqué nada».
+#
+# `mkdir` es atómico en POSIX y no necesita `flock`, que no está en macOS. Se
+# RECHAZA en vez de esperar: dos despliegues a la vez no son una cola, son un
+# accidente. Sin TTL: el `trap` libera los fallos controlados, y un cerrojo huérfano
+# (SIGKILL, caída de la máquina) se limpia a mano — un vencimiento automático
+# volvería a ser una heurística.
+_tomar_cerrojo() {
+  _LOCK="$DIR/.llmi-lifecycle.lock"
+  mkdir "$_LOCK" 2>/dev/null || {
+    echo "· hay otro \`llmi up\` o \`llmi build\` en marcha" >&2
+    echo "  (o quedó un cerrojo de uno que murió sin poder limpiarlo)" >&2
+    echo "  si estás seguro de que no corre ninguno: rmdir $_LOCK" >&2
+    exit 1; }
+  trap 'rmdir "$_LOCK" 2>/dev/null' EXIT
+}
+
+
 uso() {
   cat <<'EOF'
 llmi — consulta la red de ledgers de la flota sin quemarte la ventana
 
   llmi init                 día uno: descubre tus ledgers, arma el compose
-  llmi up | down | logs     ciclo de vida del contenedor
+  llmi build                construye la imagen. SEPARADO de `up` a propósito:
+                            construir puede recrear el contenedor y cortar la
+                            bandeja de la flota, así que es una decisión, no un
+                            efecto de «asegúrate de que está levantado».
+  llmi up [--build]         levanta SIN construir. Recrea sólo si cambió el censo
+                            o el mapa de montajes (que el servicio lee al arrancar)
+  llmi down | logs          el resto del ciclo de vida
   llmi inbox <agente> [n] [--carril <c>]   lo NUEVO dirigido a ti (avanza tu cursor;
                                             con --carril, SOLO consume el cursor del
                                             ledger de ese carril — o usa BIK_CARRIL)
@@ -955,7 +990,24 @@ if resto > 0:
           LLMI_DIR="$DIR" LLMI_CARRILES="${LLMI_CARRILES:-${LLMINBOX_CARRILES:-}}" \
           python3 "$DIR/publicar.py"
           exit $? ;;
-    up)     [ -r "$TOKFILE" ] || { python3 -c "import secrets;print(secrets.token_urlsafe(32))" > "$TOKFILE"
+    up)     # FAIL-CLOSED con los argumentos. `llmi up --buidl` se ignoraba en
+          # silencio y arrancaba la imagen ANTERIOR: el operador cree que ha
+          # desplegado y no lo ha hecho. Un typo no puede parecerse a un éxito.
+          _con_build=0
+          for _a in "$@"; do
+            case "$_a" in
+              --build) [ "$_con_build" = "1" ] && {
+                         echo "· \`--build\` repetido" >&2
+                         echo "  las únicas formas válidas son \`llmi up\` y \`llmi up --build\`" >&2
+                         mal_uso; }
+                       _con_build=1 ;;
+              *) echo "· argumento desconocido para \`up\`: $_a" >&2
+                 echo "  las únicas formas válidas son \`llmi up\` y \`llmi up --build\`" >&2
+                 mal_uso ;;
+            esac
+          done
+          _tomar_cerrojo          # ANTES del primer efecto lateral
+          [ -r "$TOKFILE" ] || { python3 -c "import secrets;print(secrets.token_urlsafe(32))" > "$TOKFILE"
             chmod 600 "$TOKFILE"; echo "· token generado en $TOKFILE (0600)"; TOKEN="$(tr -d "\n" < "$TOKFILE")"; }
           # Sin esto, un `llmi up` sin `init` previo deja que Docker sustituya
           # el mount de `./roster.json` por un directorio vacío en silencio (ver
@@ -966,7 +1018,106 @@ if resto > 0:
           # `.llmi-mounts.json` no existe ANTES de `docker compose up`, Docker lo
           # sustituye por un directorio vacío en silencio.
           [ -r "$DIR/.llmi-mounts.json" ] || echo '{}' > "$DIR/.llmi-mounts.json"
-          (cd "$DIR" && LLMINBOX_TOKEN="$TOKEN" docker compose up -d --build) ;;
+          # ── ESTADO PARA EL CONTENEDOR ───────────────────────────────────────
+          # Un directorio DEDICADO, y no el checkout entero. Montar `.` daba al
+          # proceso acceso de lectura a `.git` —con el historial completo, que
+          # puede contener secretos retirados en commits posteriores—, a los
+          # backups `*.bak-*` y al override con las rutas reales de nueve repos.
+          # `:ro` limita la escritura, no la lectura.
+          #
+          # Se COPIA en cada `up`, y eso no introduce deriva relevante: el
+          # servicio lee censo y montajes AL ARRANCAR, y `llmi up` ES el arranque.
+          # La copia se refresca exactamente cuando importa.
+          # FAIL-CLOSED EXPLÍCITO. El script lleva `set -uo pipefail`, NO `set -e`:
+          # sin estos `|| exit`, un `mkdir` o un `cp` que falle sigue adelante y
+          # levanta el contenedor con el estado a medias o vacío — censo ausente,
+          # mapa de carriles vacío, y todo degradando en silencio. Arrancar con el
+          # estado roto es peor que no arrancar.
+          _ST="$DIR/.llminbox-state"
+          mkdir -p "$_ST" || { echo "· no pude crear $_ST" >&2; exit 1; }
+          # SE COPIA A STAGING Y SE COMPARAN LOS BYTES QUE SE VAN A INSTALAR, no la
+          # fuente. Comparar la fuente y copiarla después abre un TOCTOU real: otra
+          # sesión sustituye `roster.json` entre el `cmp` y el `cp`, y entonces
+          # `/state` acaba con B mientras el proceso conserva A y `llmi up` sale con
+          # éxito — exactamente la clase de fallo que esta rama existe para cerrar,
+          # reintroducida por el detector.
+          #
+          # La regla: el falsador tiene que alterar la MISMA condición que la
+          # implementación afirma haber medido. Aquí lo medido son los bytes
+          # publicados, así que se miden ésos.
+          # ── ESTADO DESEADO vs ESTADO APLICADO ────────────────────────────
+          # Los bytes publicados en `/state` NO son un acuse de que el proceso los
+          # haya cargado. Comparar «lo publicado con lo publicado» deja dos huecos
+          # reales, y los dos acaban con un servicio VIVO sirviendo estado viejo
+          # sin decirlo:
+          #
+          #   · publico B · el build falla · salgo → el siguiente `up` compara B
+          #     con B, no recrea, y el proceso sigue en A;
+          #   · publico B · `compose up` falla · el contenedor viejo sigue vivo →
+          #     mismo final por otra puerta.
+          #
+          # La pregunta correcta no es «¿cambió lo publicado?» sino «¿lo DESEADO
+          # coincide con lo último APLICADO con éxito?». El sello de aplicado sólo
+          # avanza DESPUÉS de que Docker termine bien.
+          _APPLIED="$DIR/.llmi-applied"
+          _NEXT="$_ST/.next.$$"
+          mkdir -p "$_NEXT" || { echo "· no pude crear $_NEXT" >&2; exit 1; }
+          cp -f "$ROSTER" "$_NEXT/roster.json" \
+            || { echo "· no pude preparar el censo" >&2; rm -rf "$_NEXT"; exit 1; }
+          cp -f "$DIR/.llmi-mounts.json" "$_NEXT/mounts.json" \
+            || { echo "· no pude preparar el mapa de montajes" >&2; rm -rf "$_NEXT"; exit 1; }
+          # SI EL HASH NO SE PUEDE CALCULAR, SE CORTA. El script lleva
+          # `set -uo pipefail` pero NO `set -e`: sin este `||`, un fallo de `cat` o
+          # de `python3` seguía adelante, publicaba el staging y escribía un sello
+          # VACÍO — que ya no describe nada y hace que el gate mienta en la
+          # dirección que más duele.
+          _deseado="$(cat "$_NEXT/roster.json" "$_NEXT/mounts.json" \
+                      | python3 -c 'import hashlib,sys;print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')" \
+            || { echo "· no pude calcular el estado deseado: no publico ni sello" >&2
+                 rm -rf "$_NEXT"; exit 1; }
+          case "$_deseado" in
+            ????????????????????????????????????????????????????????????????) ;;
+            *) echo "· el estado deseado no parece un sha256: no publico ni sello" >&2
+               rm -rf "$_NEXT"; exit 1 ;;
+          esac
+
+          # EL BUILD VA ANTES DE PUBLICAR. Si falla, no se ha tocado nada: ni
+          # `/state` ni el sello. El siguiente `up` vuelve a ver la diferencia.
+          if [ "${_con_build:-0}" = "1" ]; then
+            echo "· --build: construyo imagen nueva. Esto PUEDE recrear el contenedor"
+            echo "  y cortar la bandeja de la flota unos segundos."
+            (cd "$DIR" && LLMINBOX_TOKEN="$TOKEN" docker compose build) \
+              || { echo "· el build falló: no publico estado ni toco el sello" >&2
+                   rm -rf "$_NEXT"; exit 1; }
+          fi
+
+          mv -f "$_NEXT/roster.json" "$_ST/roster.json" \
+            || { echo "· no pude publicar el censo" >&2; rm -rf "$_NEXT"; exit 1; }
+          mv -f "$_NEXT/mounts.json" "$_ST/mounts.json" \
+            || { echo "· no pude publicar el mapa de montajes" >&2; rm -rf "$_NEXT"; exit 1; }
+          rmdir "$_NEXT" 2>/dev/null
+
+          _aplicado="$(cat "$_APPLIED" 2>/dev/null || true)"
+          _extra=""
+          if [ "$_aplicado" != "$_deseado" ]; then
+            echo "· el estado deseado no coincide con el último APLICADO con éxito:"
+            echo "  recreo el contenedor — corta la bandeja de la flota unos segundos"
+            _extra="--force-recreate"
+          fi
+          (cd "$DIR" && LLMINBOX_TOKEN="$TOKEN" docker compose up -d --no-build $_extra) \
+            || { echo "· \`compose up\` falló: el sello de aplicado NO avanza, así que" >&2
+                 echo "  el próximo \`llmi up\` volverá a forzar la recreación" >&2; exit 1; }
+          # EL ACUSE, y sólo aquí: después de que Docker haya terminado bien.
+          # el nombre único del temporal es defensa en profundidad: quien de verdad
+          # impide la carrera es el CERROJO de arriba. Se deja porque no cuesta
+          # nada, y se dice para que nadie lo tome por la protección.
+          printf %s "$_deseado" > "$_APPLIED.tmp.$$" && mv -f "$_APPLIED.tmp.$$" "$_APPLIED" ;;
+  build)  # Construir es una DECISIÓN, no un efecto secundario de «asegúrate de que
+          # está levantado». Consecuencia buscada: cambiar `servicio.py` y hacer
+          # sólo `llmi up` NO despliega el código nuevo. Hay que pedirlo.
+          _tomar_cerrojo
+          echo "· construyo imagen nueva; el siguiente \`up\` puede recrear el servicio"
+          (cd "$DIR" && LLMINBOX_TOKEN="${TOKEN:-x}" docker compose build) ;;
   down)   (cd "$DIR" && docker compose down) ;;
   logs)   docker logs --tail "${1:-40}" llminbox ;;
   -h|--help|help) uso ;;
