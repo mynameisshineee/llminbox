@@ -525,6 +525,42 @@ RE_AGENTE = re.compile(
 # **3.441 de 23.496 entradas (14,6%)** con el actor sustituido por la etiqueta, así
 # que `/entries?actor=alice-backend` perdía todos sus heartbeats. Se saltan antes de
 # buscar el actor, y se recogen como tipo.
+# La posición canónica del tipo: `### [origen → destino · TIPO] titular`. Se
+# captura el lexema TAL CUAL —sin validarlo contra `TIPOS` y SIN normalizarlo—,
+# porque validar aquí es lo que hacía que 641 entradas perdieran lo que sí habían
+# declarado, y normalizar es ya interpretar: decidir que `Medido` y `MEDIDO` son
+# la misma palabra le toca al registro canónico, con su revisión anotada, no al
+# troceador por su cuenta.
+#
+# Sin clase de caracteres «permitidos»: la primera versión aceptaba sólo letras,
+# `_`, `/` y `-`, o sea traía su propio vocabulario implícito y perdía `REVIEW.V2`
+# — el mismo fallo una capa más abajo. Se acota por LONGITUD, no por alfabeto.
+#
+# `·` sí queda fuera de la clase, y eso no es vocabulario: hace que capture el
+# ÚLTIMO campo de la cabecera. Sin esa exclusión, un `a · b · TIPO]` devolvería
+# «b · TIPO».
+RAW_TIPO = re.compile(r"·\s*([^·\]\r\n]{1,64}?)\s*\]")
+
+# Operadores de RUTA del propio formato. Excluirlos no es vocabulario de palabras:
+# es respetar la sintaxis de la cabecera, donde `→`/`∧` separan actores.
+OPERADORES_RUTA = ("→", "->", "←", "<-", "∧", "&")
+
+
+def _es_token_de_tipo(v: str) -> bool:
+    """Un tipo es UN SOLO TOKEN. Espacios y operadores de ruta lo descalifican.
+
+    Nace de medir la otra cara del filo: liberar el capturador de su vocabulario
+    cerrado (que perdía 641 tipos reales) lo dejó capturando 38.848 valores, de
+    los que **7.570 eran RUTAS o prosa** — `bikeus→security ∧ Albert`, `BARRIDO
+    CERRADO security→bikeus`—, porque `·` se usa como separador general y el
+    último campo no siempre es el tipo.
+
+    La regla NO es una lista negra de flechas: eso deja pasar 3.855 rutas con
+    espacios y sin flecha. Es la FORMA. Medido: con esta guarda sobreviven los
+    31.273 que sí lo son, y los tipos del hallazgo enteros (MEDIDO 376,
+    MEASURED 340, ADJUDICADO 90, VEREDICTO 27).
+    """
+    return bool(v) and not re.search(r"\s", v) and not any(o in v for o in OPERADORES_RUTA)
 ETIQUETAS = re.compile(r"^\s*(HEARTBEAT|CARRY-FORWARD|CLAIM|CANON|CERT|DONE|RESP|AVISO|MSG|ASK|ACK|STATUS|INFO|HANDOFF)"
                        r"(?:[/·\-]\s*(?:HEARTBEAT|CARRY-FORWARD|CLAIM|CANON|CERT|DONE|RESP|AVISO|MSG|ASK|ACK|STATUS|INFO|HANDOFF))*\s*",
                        re.IGNORECASE)
@@ -584,17 +620,78 @@ class Entrada:
     # rompe a quien solo mire `.to`.
     difusion: list[str] = field(default_factory=list)
     tipo: str | None = None
+    # El lexema escrito en una posición COMPATIBLE CON LA GRAMÁTICA DE TIPO — no
+    # «todo lo escrito», que es distinto y se documenta en `raw_tipo_de`. `tipo` es
+    # lo que el sistema INTERPRETA de él. Existen los dos porque medí que no
+    # coinciden: 641 entradas del ledger piloto (8,2 %) declaran un tipo en posición
+    # canónica que este parser tiraba —MEDIDO, MEASURED, ADJUDICADO, VEREDICTO…—, y
+    # `lint` las contaba como «no declaran nada» cuando declaran de sobra.
+    # El literal íntegro no se pierde: `head` se guarda entero.
+    raw_tipo: str | None = None
 
     @property
     def sha(self) -> str:
         return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
 
 
-def _campos(head: str, cola: str) -> tuple[str | None, str | None, list[str], list[str], str | None]:
-    """Extrae (ts, actor, destinatarios, difusion, tipo, por_arroba).
+def raw_tipo_de(head: str) -> str | None:
+    """El lexema escrito en una posición COMPATIBLE CON LA GRAMÁTICA DE TIPO.
+
+    El nombre importa: esto no es «todo lo que había escrito». Es el último campo
+    de la cabecera **si además tiene forma de token de tipo** (ver
+    `_es_token_de_tipo`), que ya es una clasificación SINTÁCTICA — no semántica,
+    pero clasificación. Llamarlo «el literal, sin más» sería afirmar de más:
+    `bikeus→security ∧ Albert` también estaba escrito ahí y aquí devuelve None.
+
+    El literal COMPLETO no se pierde: vive en `head`, que se guarda entero y
+    permite reproducir esta clasificación en cualquier momento. Por eso no hace
+    falta una columna más para conservarlo.
+
+    Las capas, para que nadie las mezcle:
+
+        head            lo escrito, íntegro
+          ↓
+        último campo    candidato tras el `·`
+          ↓ forma
+        raw_tipo        el candidato SI tiene forma de tipo (esto)
+          ↓ registro versionado
+        canonical_kind  semántica del Agent OS   (+ kind_registry_rev)
+
+        tipo            aparte: el vocabulario legacy que este servicio reconoce
+
+    UNA sola fuente para la primera flecha.
+
+    Se expone aparte de `_campos` porque el backfill del corpus ya indexado lo
+    necesita **sin volver a leer el fichero**: `head` está guardado en la base, y
+    `barrido()` salta un ledger entero cuando su tamaño y mtime no cambiaron —
+    así que confiar la migración a una re-indexación dejaría sin rellenar todos
+    los ledgers dormidos, para siempre.
+    """
+    inner = head
+    mb = re.match(r"^#{2,3} \[(.*)$", head or "")
+    if mb:
+        inner = mb.group(1)
+    inner = _sin_emoji(inner)
+    cierre = inner.find("]")
+    inner = inner[:cierre + 1] if cierre != -1 else inner
+    m = RAW_TIPO.search(inner)
+    if m and _es_token_de_tipo(m.group(1)):
+        return m.group(1)
+    # Si el último campo NO era un tipo, la cabecera todavía puede declararlo al
+    # frente (`### [DONE algo · bikeus→security ∧ Albert]`). Cortar en seco aquí
+    # sería descartar de más por el otro lado.
+    et = ETIQUETAS.match(inner)
+    return et.group(1) if et else None
+
+
+def _campos(head: str, cola: str) -> tuple[
+        str | None, str | None, list[str], list[str], str | None, bool, str | None]:
+    """Extrae (ts, actor, destinatarios, difusion, tipo, por_arroba, raw_tipo).
 
     Devuelve None en lo que no se pueda leer. `por_arroba` dice si los destinatarios
     salieron de un `@` en una cabecera sin flecha — ver el campo del mismo nombre.
+    `raw_tipo` es el LEXEMA escrito en la posición del tipo, se entienda o no
+    (ver `raw_tipo_de`); `tipo` es lo que el sistema interpreta de él.
     """
     m = TS.search(head) or TS.search(cola)
     ts = m.group(1) if m else None
@@ -696,7 +793,10 @@ def _campos(head: str, cola: str) -> tuple[str | None, str | None, list[str], li
     tipo = next((t for t in TIPOS if t in head), None)
     if tipo is None and etiqueta:
         tipo = etiqueta.group(1).upper()
-    return ts, actor, to, difusion, tipo, por_arroba
+    # Lo escrito, se entienda o no. Se mira la posición canónica (`· TOKEN]`)
+    # antes que la etiqueta al frente, porque es donde la flota lo pone.
+    raw = raw_tipo_de(head)
+    return ts, actor, to, difusion, tipo, por_arroba, raw
 
 
 def parse(path: str, desde_byte: int = 0):
@@ -724,10 +824,10 @@ def parse(path: str, desde_byte: int = 0):
         text = "".join(lines[i:end]).rstrip() + "\n"
         head = lines[i].rstrip("\n")
         cola = "".join(lines[i + 1:i + 4])
-        ts, actor, to, difusion, tipo, por_arroba = _campos(head, cola)
+        ts, actor, to, difusion, tipo, por_arroba, raw_tipo = _campos(head, cola)
         out.append(Entrada(seq=n, line_no=i + 1, byte_off=offs[i], head=head,
                            text=text, ts=ts, actor=actor, to=to, difusion=difusion,
-                           tipo=tipo, por_arroba=por_arroba))
+                           tipo=tipo, por_arroba=por_arroba, raw_tipo=raw_tipo))
     return out, acc
 
 

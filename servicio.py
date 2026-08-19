@@ -465,6 +465,91 @@ def huella_censo() -> str:
     return hashlib.sha256(",".join(sorted(lp.AGENTES)).encode()).hexdigest()[:16]
 
 
+# Versión del DERIVADOR de `raw_tipo`. Súbela si cambia CÓMO se deriva del head —
+# incluida la guarda de forma (`_es_token_de_tipo`), que es parte de la derivación:
+# una regla nueva puede convertir en NULL lo que antes fue un falso positivo, y una
+# migración que sólo rellene huecos no lo arreglaría. Subirla RECALCULA el corpus
+# entero en las dos direcciones (ver la función).
+#
+# Se queda en "1" a propósito: verificado contra la base viva el 2026-08-19, la
+# columna `raw_tipo` NO EXISTE y no hay sello — ninguna versión del derivador ha
+# llegado nunca a producción, así que "1" puede representar la implementación final
+# de esta rama. Si alguna hubiera corrido, esto tendría que ser "2".
+RAW_TIPO_V = "1"
+
+
+def migrar_raw_tipo(con) -> None:
+    """Rellena `raw_tipo` del corpus que YA estaba indexado.
+
+    Sin esto el cambio es inerte justo donde importa: las entradas del hallazgo
+    llevan meses en la base, y la tupla del volcado sólo corre para eids
+    NUEVOS. Lo señaló CodeRabbit — y su arreglo (meter `raw_tipo` en la
+    comparación de la rama «ya conocida») es necesario pero NO suficiente:
+    `barrido()` salta un ledger entero cuando su tamaño y su mtime no han
+    cambiado, así que los ledgers dormidos no se re-examinan nunca. Confiarle la
+    migración a una re-indexación los dejaría en NULL para siempre.
+
+    Por eso se deriva del `head` YA GUARDADO: no toca ficheros, no depende de que
+    un ledger reciba tráfico, y corre una sola vez (sellada en `meta`).
+
+    Medido el 2026-08-19 sobre una copia de la base viva (66.492 entradas):
+    32.704 quedan con lexema, de las cuales 2.021 NO tenían tipo canónico — ese
+    subconjunto es el rescate. Coste: 3,0 s y 41 MB de pico, e idempotente (una
+    segunda pasada calcula 0 cambios). Las cifras son una FOTO de esa fecha y
+    envejecen con el corpus; no las creas, re-derívalas:
+        SELECT COUNT(*) FROM entries WHERE raw_tipo IS NOT NULL
+                                       AND (tipo IS NULL OR tipo='');
+    Un número sin fecha ni consulta que lo reproduzca es una afirmación que nadie
+    puede falsar: este docstring decía «16.099 de 65.186» y hoy no reproduce, no
+    porque el corpus creciera, sino porque `raw_tipo_de` ganó el respaldo a
+    `ETIQUETAS` después de medirlo.
+
+    `canonical_kind`/`kind_registry_rev` NO se tocan: son interpretación, y su
+    revisión, no re-derivables del markdown.
+    """
+    try:
+        fila = con.execute("SELECT v FROM meta WHERE k='raw_tipo_v'").fetchone()
+        if fila and fila["v"] == RAW_TIPO_V:
+            return
+        # SE RECALCULA TODO, no sólo los NULL. Un `WHERE raw_tipo IS NULL`
+        # funciona para v0→v1 y MIENTE en cualquier revisión posterior: las filas
+        # que ya tienen valor no se volverían a mirar, así que subir `RAW_TIPO_V`
+        # no arreglaría nada de lo ya escrito. Y es justo donde más duele, porque
+        # los ledgers dormidos tampoco vuelven a pasar por `reindex`: el valor
+        # incorrecto se fosilizaría para siempre.
+        #
+        # Incluye el sentido INVERSO: una revisión nueva puede descubrir FALSOS
+        # POSITIVOS (algo que se tomó por tipo y no lo era — el titular con
+        # `· trampa]`), así que `derivado is None` con valor guardado también es
+        # un cambio que hay que escribir.
+        cambios = [(d, r["ledger"], r["eid"])
+                   for r in con.execute("SELECT ledger, eid, head, raw_tipo FROM entries")
+                   if (d := lp.raw_tipo_de(r["head"])) != r["raw_tipo"]]
+        if cambios:
+            con.executemany("UPDATE entries SET raw_tipo=? WHERE ledger=? AND eid=?", cambios)
+        # El sello va en la MISMA transacción que los datos: un `commit` entre
+        # medias dejaría una base a medio migrar sellada como migrada.
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('raw_tipo_v', ?)", (RAW_TIPO_V,))
+        con.commit()
+        print(f"[migración] raw_tipo v{RAW_TIPO_V}: {len(cambios)} entradas recalculadas "
+              f"desde su cabecera guardada", flush=True)
+    except sqlite3.OperationalError as e:
+        # ROLLBACK ANTES DE SALIR, y no es defensivo: sin él, un fallo a mitad del
+        # `executemany` dejaba la transacción de escritura ABIERTA, y el siguiente
+        # paso del arranque (`migrar_alias_a_rol`) hace su backup y COMMITEA — o
+        # sea que las filas ya recalculadas se confirmaban SIN el sello de versión,
+        # que es justo la propiedad «todo o nada» que el comentario de arriba
+        # afirma. El cerrojo de escritura, además, se quedaba tomado hasta ese
+        # commit ajeno. Cazado por CodeRabbit.
+        #
+        # Base sin la columna todavía (orden de arranque) tampoco es fatal: el
+        # ALTER corre antes, pero esto NO puede tumbar el servicio por una columna
+        # de diagnóstico.
+        con.rollback()
+        print(f"[migración] raw_tipo: no pude migrar ({e}) — nada escrito, se "
+              f"reintenta al próximo arranque", flush=True)
+
+
 # ── MIGRACIÓN alias→rol de `cursors` (②) ───────────────────────────────────────
 # Antes de esto, `backend`, `backend-biklabs` y (donde apliquen) sus otros alias
 # tenían CADA UNO su propia fila de cursor por ledger — el mismo humano/rol leyendo
@@ -633,7 +718,20 @@ def es_corrupcion(e: BaseException) -> bool:
 # producción no existe.
 COLUMNAS_ANADIDAS = (("coste", "maximo", "INTEGER DEFAULT 0"),
                      ("claims", "motivo", "TEXT"),
-                     ("claims", "cerrado_por", "TEXT"))
+                     ("claims", "cerrado_por", "TEXT"),
+                     # Lo ESCRITO en la posición del tipo, se entienda o no (641
+                     # entradas del ledger piloto se perdían aquí). Las otras dos
+                     # se crean vacías A PROPÓSITO: el día que se interprete
+                     # `MEDIDO → MEASUREMENT` hay que poder decir CON QUÉ revisión
+                     # del registro se hizo, o cambiar la taxonomía cambiaría en
+                     # silencio las métricas históricas.
+                     #
+                     # Van por la vía ADITIVA y no en `SCHEMA`: un cambio de huella
+                     # de esquema TIRA `cursors` (ver arranque), o sea le borra a
+                     # los 20 su posición de lectura por una columna.
+                     ("entries", "raw_tipo", "TEXT"),
+                     ("entries", "canonical_kind", "TEXT"),
+                     ("entries", "kind_registry_rev", "INTEGER"))
 
 DERIVADAS = ("entries", "recipients", "files", "pages", "citas")
 # ⚠️ LAS COLUMNAS SE ENUMERAN, y la lista de columnas se queda vieja igual que se
@@ -1021,8 +1119,8 @@ def reindex(ledger: str, path: str, con) -> dict:
         vivos.setdefault(e.sha, e)          # duplicado exacto = la misma entrada
 
     previos = {r["eid"]: r for r in con.execute(
-        "SELECT eid, ausente, provisional, seq, line_no, byte_off FROM entries "
-        "WHERE ledger=?", (ledger,))}
+        "SELECT eid, ausente, provisional, seq, line_no, byte_off, raw_tipo "
+        "FROM entries WHERE ledger=?", (ledger,))}
     ahora = datetime.now(timezone.utc).isoformat(timespec="seconds")
     prox = (con.execute("SELECT COALESCE(MAX(arrival), -1) + 1 m FROM entries "
                         "WHERE ledger=?", (ledger,)).fetchone()["m"])
@@ -1063,12 +1161,29 @@ def reindex(ledger: str, path: str, con) -> dict:
             # añadirlo a la comparación o se quedará fosilizado en silencio.
             prev = previos[e.sha]
             prov = 1 if pos == len(ents) - 1 else 0
+            # `raw_tipo` ENTRA EN LA COMPARACIÓN, y es lo que hace que el cambio
+            # llegue al corpus que ya existe. Sin esto, la tupla de arriba sólo
+            # corre para eids NUEVOS: en producción las 641 entradas del hallazgo
+            # ya están indexadas, así que se habrían quedado NULL para siempre y
+            # `/lint` seguiría llamándolas «sin tipo» — el arreglo, inerte justo
+            # sobre los datos para los que se hizo. Cazado por CodeRabbit; el
+            # comentario de arriba ya lo predecía («si algún día un campo de estos
+            # empieza a derivarse de otra cosa, hay que añadirlo a la comparación
+            # o se quedará fosilizado en silencio»), y aun así se me pasó.
+            #
+            # Coste: una sola pasada de backfill, 16.099 filas medidas sobre la
+            # base viva repartidas en 12 ledgers. Después la comparación vuelve a
+            # dar falso y no se escribe nada.
+            #
+            # `canonical_kind`/`kind_registry_rev` NO se tocan: son interpretación
+            # y su revisión, no re-derivables del markdown (ver NO_SE_RESCATAN).
             if (prev["seq"] != pos or prev["line_no"] != e.line_no
                     or prev["byte_off"] != e.byte_off
-                    or prev["provisional"] != prov or prev["ausente"] is not None):
+                    or prev["provisional"] != prov or prev["ausente"] is not None
+                    or prev["raw_tipo"] != e.raw_tipo):
                 con.execute("UPDATE entries SET seq=?, line_no=?, byte_off=?, ausente=NULL, "
-                            "provisional=? WHERE ledger=? AND eid=?",
-                            (pos, e.line_no, e.byte_off, prov, ledger, e.sha))
+                            "provisional=?, raw_tipo=? WHERE ledger=? AND eid=?",
+                            (pos, e.line_no, e.byte_off, prov, e.raw_tipo, ledger, e.sha))
                 refrescadas += 1
             # RE-DERIVAR SÍ respeta el corte, y aquí está su razón de ser: recalcular
             # el histórico con el router de `@` añadiría 1.679 entradas de golpe a las
@@ -1104,7 +1219,7 @@ def reindex(ledger: str, path: str, con) -> dict:
         # cuando termine de escribirse.
         filas.append((ledger, e.sha, prox + nuevas, pos, e.line_no, e.byte_off,
                       e.ts, e.actor, e.tipo, e.head[:600], e.text, ahora, None,
-                      1 if pos == len(ents) - 1 else 0))
+                      1 if pos == len(ents) - 1 else 0, e.raw_tipo))
         # ¿SE ENRUTA POR `@`? La pregunta no es «¿es nueva?» —en la PRIMERA
         # indexación de un ledger TODO es nuevo, y eso volcaría el histórico entero
         # en las bandejas: 12.442 entradas de golpe, medido—. La pregunta es si esto
@@ -1139,8 +1254,9 @@ def reindex(ledger: str, path: str, con) -> dict:
         nuevas += 1
 
     con.executemany("INSERT OR REPLACE INTO entries (ledger,eid,arrival,seq,line_no,"
-                    "byte_off,ts,actor,tipo,head,body,visto,ausente,provisional) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", filas)
+                    "byte_off,ts,actor,tipo,head,body,visto,ausente,provisional,"
+                    "raw_tipo) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", filas)
     con.executemany("INSERT OR REPLACE INTO recipients VALUES (?,?,?)", dest)
 
     # Las que estaban y ya no: NO se borran. Un ledger de sólo-apéndice no pierde
@@ -1786,6 +1902,7 @@ def _preparar_indice(con: sqlite3.Connection) -> None:
                 print(f"[arranque] {tabla}: columna {col} añadida", flush=True)
         except sqlite3.OperationalError as e:
             print(f"[arranque] no pude añadir {tabla}.{col}: {e}", flush=True)
+    migrar_raw_tipo(con)           # rellena el corpus ya indexado (ver la función)
     migrar_alias_a_rol(con)        # ② — después de SCHEMA (tablas garantizadas),
                                     # antes de CENSO cambiado (orden no crítico entre
                                     # ambas, pero así quedan agrupados: migraciones de
@@ -3815,7 +3932,13 @@ def lint(ledger: str | None = None, limit: int = Query(10, le=100)):
         if not n:
             continue
         faltas = {
-            "sin tipo declarado": "tipo IS NULL",
+            # Dos deudas DISTINTAS que antes caían en el mismo saco: «no declara
+            # nada» se arregla enseñando a escribir; «declara algo que no entiendo»
+            # se arregla ampliando el registro, o cerrando el camino por el que
+            # entró. Medido: 641 de las 5.210 «sin tipo» del ledger piloto eran en
+            # realidad de la segunda clase.
+            "sin tipo declarado": "tipo IS NULL AND raw_tipo IS NULL",
+            "declara un tipo que no entiendo": "tipo IS NULL AND raw_tipo IS NOT NULL",
             "sin sello de hora": "ts IS NULL",
             "sin actor legible": "actor IS NULL",
             # NOT EXISTS, no `seq NOT IN (SELECT …)`: el NOT IN correlacionado
@@ -3863,7 +3986,7 @@ def lint(ledger: str | None = None, limit: int = Query(10, le=100)):
             (name,)).fetchall()
         perdidas = []
         for r in candidatos:
-            _, _, to, difusion, _, por_arroba = lp._campos(r["head"], "")
+            _, _, to, difusion, _, por_arroba, _ = lp._campos(r["head"], "")
             if (to or difusion) and not por_arroba:
                 perdidas.append(r)
         c = len(perdidas)

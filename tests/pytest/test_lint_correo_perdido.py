@@ -163,8 +163,12 @@ def test_mutante_filtro_arroba_neutralizado_se_ve(cliente_seg, monkeypatch):
     original = s.lp._campos
 
     def sin_por_arroba(head, cola):
-        ts, actor, to, difusion, tipo, _ = original(head, cola)
-        return ts, actor, to, difusion, tipo, False
+        # El stub tiene que devolver la MISMA forma que producción: cuando
+        # `_campos` ganó `raw_tipo`, un stub de 6 campos hacía reventar el
+        # endpoint con «too many values to unpack» y el test dejaba de medir
+        # el mutante para medir su propio andamio.
+        ts, actor, to, difusion, tipo, _, raw = original(head, cola)
+        return ts, actor, to, difusion, tipo, False, raw
 
     monkeypatch.setattr(s.lp, "_campos", sin_por_arroba)
 
