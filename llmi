@@ -983,11 +983,32 @@ if resto > 0:
           # estado roto es peor que no arrancar.
           _ST="$DIR/.llminbox-state"
           mkdir -p "$_ST" || { echo "· no pude crear $_ST" >&2; exit 1; }
+          # ¿CAMBIÓ el estado? Se compara ANTES de copiar. El servicio lee censo y
+          # mapa de carriles AL IMPORTAR: si cambian y el contenedor se reutiliza,
+          # el proceso sigue con lo viejo — se habría arreglado el inodo del mount
+          # y recreado el mismo estado rancio una capa más adentro, en las
+          # estructuras de Python. `docker compose up -d --build` REUTILIZA el
+          # contenedor cuando imagen y config no cambian, y estos ficheros no son
+          # config de Compose: van dentro de un directorio montado.
+          _cambio=0
+          cmp -s "$ROSTER" "$_ST/roster.json" || _cambio=1
+          cmp -s "$DIR/.llmi-mounts.json" "$_ST/mounts.json" || _cambio=1
           cp -f "$ROSTER" "$_ST/roster.json" \
             || { echo "· no pude copiar el censo a $_ST" >&2; exit 1; }
           cp -f "$DIR/.llmi-mounts.json" "$_ST/mounts.json" \
             || { echo "· no pude copiar el mapa de montajes a $_ST" >&2; exit 1; }
-          (cd "$DIR" && LLMINBOX_TOKEN="$TOKEN" docker compose up -d --build) ;;
+          # El recreate va SÓLO si algo cambió, y SE DICE. No `--force-recreate`
+          # siempre: reiniciar este contenedor corta la bandeja de TODA la flota,
+          # y esconder eso dentro de un comando de uso diario es cómo se convierte
+          # una operación que afecta a 20 agentes en un efecto colateral que nadie
+          # decidió. Deliberado cuando toca, invisible nunca.
+          _extra=""
+          if [ "$_cambio" = "1" ] && docker ps --filter name=llminbox --format '{{.Names}}' 2>/dev/null | grep -q llminbox; then
+            echo "· censo o mapa de montajes CAMBIARON y el servicio los lee al arrancar:"
+            echo "  recreo el contenedor (corta la bandeja de la flota unos segundos)"
+            _extra="--force-recreate"
+          fi
+          (cd "$DIR" && LLMINBOX_TOKEN="$TOKEN" docker compose up -d --build $_extra) ;;
   down)   (cd "$DIR" && docker compose down) ;;
   logs)   docker logs --tail "${1:-40}" llminbox ;;
   -h|--help|help) uso ;;

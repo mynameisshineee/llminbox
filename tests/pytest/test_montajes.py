@@ -464,3 +464,77 @@ def test_si_el_estado_no_se_puede_preparar_NO_se_levanta_el_contenedor(tmp_path)
         "se invocó a Docker con el estado sin preparar: el contenedor habría "
         "arrancado con censo ausente y mapa de carriles vacío, degradando en "
         "silencio")
+
+
+def _up_hermetico(tmp_path, roster_json, estado_previo=None):
+    """`llmi up` con un `docker` FALSO que registra sus argumentos. Devuelve
+    (returncode, argumentos_de_docker)."""
+    import shutil
+    import subprocess
+    repo, casa, binfalso = tmp_path / "repo", tmp_path / "home", tmp_path / "bin"
+    for d in (repo, casa, binfalso):
+        d.mkdir(exist_ok=True)
+    for f in ("llmi", "docker-compose.yml", "roster.example.json"):
+        shutil.copy(RAIZ / f, repo / f)
+    (repo / "roster.json").write_text(roster_json)
+    (repo / ".llmi-mounts.json").write_text("{}")
+    (casa / ".llminbox.token").write_text("token-de-prueba")
+    if estado_previo is not None:
+        (repo / ".llminbox-state").mkdir(exist_ok=True)
+        (repo / ".llminbox-state" / "roster.json").write_text(estado_previo)
+        (repo / ".llminbox-state" / "mounts.json").write_text("{}")
+    args = tmp_path / "docker-args.txt"
+    (binfalso / "docker").write_text(
+        f'#!/bin/sh\n[ "$1" = "ps" ] && {{ echo llminbox; exit 0; }}\n'
+        f'echo "$@" >> "{args}"\nexit 0\n')
+    (binfalso / "docker").chmod(0o755)
+    r = subprocess.run([str(repo / "llmi"), "up"], cwd=repo,
+                       env={"HOME": str(casa),
+                            "PATH": f"{binfalso}:/usr/bin:/bin:/usr/sbin:/sbin"},
+                       capture_output=True, text=True, timeout=120, check=False)
+    return r, (args.read_text() if args.exists() else "")
+
+
+A = '{"agentes": [{"nombre": "backend", "humano": "a", "clave": "", "rol": "be"}], "humanos": [], "difusion": []}'
+B = ('{"agentes": [{"nombre": "backend", "humano": "a", "clave": "", "rol": "be"},'
+     ' {"nombre": "prueba-nueva", "humano": "a", "clave": "", "rol": "prueba"}],'
+     ' "humanos": [], "difusion": []}')
+
+
+def test_si_el_censo_cambia_el_contenedor_se_RECREA(tmp_path):
+    """El agujero que quedaba, y es el que decide si el piloto del EM funciona.
+
+    `llmi up` copia el estado a `/state`, pero el reinicio lo delega en
+    `docker compose up -d --build`, que **reutiliza** el contenedor cuando imagen
+    y config no cambian — y estos ficheros no son config de Compose: viven dentro
+    de un directorio montado. El servicio lee censo y mapa de carriles AL
+    IMPORTAR, así que el proceso seguiría con el censo viejo: se habría arreglado
+    el inodo del mount y recreado el MISMO estado rancio una capa más adentro, en
+    las estructuras de Python.
+
+    Es exactamente lo que el alta del EM necesita: cambias el roster y el proceso
+    tiene que observarlo.
+
+    FALSADOR: quitar el `--force-recreate` condicional deja los argumentos sin él
+    y el proceso arrancaría con el censo anterior."""
+    r, args = _up_hermetico(tmp_path, B, estado_previo=A)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "--force-recreate" in args, (
+        f"el censo cambió y no se recrea el contenedor: el proceso seguiría con el "
+        f"anterior.\nargumentos de docker: {args!r}")
+    assert "CAMBIARON" in r.stdout, (
+        "recrea sin decirlo: cortar la bandeja de la flota no puede ser un efecto "
+        "colateral silencioso")
+
+
+def test_si_el_censo_NO_cambia_no_se_corta_la_bandeja_de_la_flota(tmp_path):
+    """CONTROL, y no es simetría decorativa: `--force-recreate` incondicional
+    reiniciaría el buzón compartido en CADA `llmi up`, que es un comando de uso
+    diario. Cortar la bandeja de 20 agentes tiene que ser deliberado, no un efecto
+    colateral de un comando genérico.
+
+    FALSADOR: poner `--force-recreate` fijo pone esto rojo."""
+    r, args = _up_hermetico(tmp_path, A, estado_previo=A)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "--force-recreate" not in args, (
+        f"recrea sin motivo: corta la bandeja de la flota en cada `up`.\n{args!r}")
