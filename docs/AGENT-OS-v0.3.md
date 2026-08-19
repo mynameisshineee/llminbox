@@ -198,6 +198,10 @@ Por qué importa, y no es purismo: si un `role` puede tomar el lease, el fencing
 
 **Falsador F-P2 (control negativo)** — un principal `type=agent` con contrato válido, `lifecycle=active` y `can_claim_jobs=1` **sí** reclama. Sin este control, F-P1 pasaría con un sistema que deniega a todo el mundo.
 
+**Falsador F-A3** — un `alias` de `backend#03` reclama un job de `backend` ⇒ **se concede**, y la fila de `job_leases` sale a nombre de `backend#03`, **no** del alias. Sin la canonicalización, el alias recibe un 409 y la spec dice una cosa mientras el sistema hace otra.
+
+**Falsador F-A4** — un `alias` que apunta a un `role` (no a un `agent`) intenta reclamar ⇒ `409`. Es el que impide que la canonicalización se convierta en un rodeo para que un rol reclame.
+
 **Falsador F-P4** — `backend#03` (agente de `backend`, con alcance en el proyecto) intenta reclamar un job cuyo `owner_role` es `db-migrations` ⇒ `409`. Sin él, «un agente ejecuta en nombre de UN rol» es una frase: el alcance por proyecto no acota el rol, y cualquier agente del proyecto podría tomar cualquier job de él.
 
 **Falsador F-P3** — un principal `type=role`, con contrato válido y activo, intenta `claim` ⇒ `409`. Es el que impide que la separación de §3 se deshaga por la puerta de atrás: sin él, «sólo agent reclama» es una frase del documento y no una propiedad del sistema. Sin este control, F-P1 pasaría con un sistema que deniega a todo el mundo.
@@ -508,13 +512,41 @@ Que vuelva a `READY` y no a `CLAIMED` es la decisión que importa: devolverlo a 
 ```sql
 BEGIN IMMEDIATE;
 
+-- CANONICALIZACIÓN DEL ALIAS, PRIMERO Y DENTRO DE LA TRANSACCIÓN. §3 dice que un
+-- alias no reclama COMO alias, y eso hasta aquí era prosa: el flujo usaba
+-- `:principal` tal cual contra `principal_scopes`, `principals` y `job_leases`,
+-- así que un alias simplemente fallaba `p.type='agent'` y recibía un 409 opaco —
+-- «no puedes reclamar» en vez de resolverse al agente que representa.
+--
+-- Se resuelve UN SALTO, no una cadena: `aliases_of` apuntando a otro alias es un
+-- ciclo esperando a existir, y el compilador del Org SoT (§4) ya rechaza esa
+-- forma. Si tras el salto no hay un `agent`, se rechaza explícitamente.
+canonico = SELECT COALESCE(p.aliases_of, p.id) FROM principals p WHERE p.id = :principal;
+if canonico is None:
+    ROLLBACK; return 409 unknown_principal
+
+-- A partir de aquí TODO usa `canonico`, nunca `:principal`. El lease lo firma el
+-- principal canónico: si lo firmara el alias, el fencing, el watchdog y
+-- `agent-hour` contarían dos ejecutores donde hay un proceso.
+
+-- ⚠️ EL `:job` VA EN EL SELECT. Sin él, este bloque autoriza un job y reclama
+-- OTRO: todas las comprobaciones de abajo —proyecto, rol, dependencias, alcance,
+-- admisión— caen sobre la fila que el SELECT elige, mientras el UPDATE toca la
+-- que el cliente nombró en `POST /jobs/{id}/claim`. Un worker pasaba el id de un
+-- job de otro proyecto o de otro rol y se lo llevaba: el UPDATE sólo miraba
+-- `status='READY'`. Era un bypass de autorización completo, y lo introduje yo al
+-- meter las comprobaciones en el SELECT sin atar el objetivo.
+--
+-- `:job` es NULL en `/work/next` (el servidor elige) y lleva valor en
+-- `POST /jobs/{id}/claim` (lo elige el cliente). El resto es idéntico.
 SELECT id FROM jobs
  WHERE status = 'READY'
+   AND (:job IS NULL OR id = :job)                     -- ← el objetivo, atado
    AND project_id = :project
    AND owner_role = :role
    AND id NOT IN (SELECT job_id FROM job_dependencies WHERE satisfied = 0)
     AND EXISTS (SELECT 1 FROM principal_scopes ps          -- §6: aislamiento EJECUTABLE
-                WHERE ps.principal_id = :principal
+                WHERE ps.principal_id = canonico
                   AND ps.project_id   = jobs.project_id)
    -- Y LA ADMISIÓN AL WORK PLANE, EN LA MISMA TRANSACCIÓN. El alcance dice a QUÉ
    -- proyectos, no SI puede reclamar: un principal deshabilitado o un `role` que
@@ -522,7 +554,7 @@ SELECT id FROM jobs
    -- o no vive en ninguna parte — comprobarla en la capa de aplicación deja una
    -- ventana entre la comprobación y el UPDATE.
    AND EXISTS (SELECT 1 FROM principals p
-                WHERE p.id = :principal
+                WHERE p.id = canonico
                   AND p.type           = 'agent'        -- §3: un rol NO ejecuta
                   AND p.lifecycle      = 'active'
                   AND p.can_claim_jobs = 1
@@ -530,10 +562,18 @@ SELECT id FROM jobs
  ORDER BY priority DESC, created_at ASC
  LIMIT 1;
 
+elegido = <la fila del SELECT>
+if elegido is None:
+    ROLLBACK
+    return 409                              -- no hay job autorizado que reclamar
+
+-- Y EL UPDATE APUNTA A ESA FILA, no a `:job`. Repetir aquí `status='READY'` no es
+-- redundante: es lo que detecta que otro worker ganó entre el SELECT y esta
+-- línea. Lo que no puede repetirse es el objetivo — tiene que ser el MISMO.
 row = UPDATE jobs
          SET status = 'CLAIMED',
              lease_generation = lease_generation + 1
-       WHERE id = :job AND status = 'READY'
+       WHERE id = elegido.id AND status = 'READY'
    RETURNING lease_generation;
 
 -- UN SOLO MECANISMO demuestra que se ganó el claim: la fila devuelta. Si no hay
@@ -548,7 +588,7 @@ gen = row.lease_generation                  -- la generación REAL, capturada
 
 INSERT INTO job_leases (job_id, principal_id, lease_generation,
                         claimed_at_epoch, expires_at_epoch, ttl_seconds)
-VALUES (:job, :principal, gen, :now_epoch, :now_epoch + :ttl_seconds, :ttl_seconds);
+VALUES (elegido.id, canonico, gen, :now_epoch, :now_epoch + :ttl_seconds, :ttl_seconds);
 
 COMMIT;
 ```
@@ -747,18 +787,24 @@ en cualquier otro caso ⇒ 409, y el job NO transiciona
 
 | sello | cuándo | regla |
 |---|---|---|
-| `jobs.ready_at` | primera entrada en `READY` | **no se reescribe** al volver de un `unblock`. Si se reescribiera, bloquear un job mejoraría su latencia y la métrica premiaría bloquear. |
-| `jobs.done_at` | transición a `DONE` | única, terminal. |
+| `jobs.ready_at_epoch` | primera entrada en `READY` | **no se reescribe** al volver de un `unblock`. Si se reescribiera, bloquear un job mejoraría su latencia y la métrica premiaría bloquear. |
+| `jobs.done_at_epoch` | transición a `DONE` | única, terminal. |
 
 **Denominador de `agent-hour`:** tiempo de lease **efectivamente sostenido**, no tiempo de reloj ni sesiones abiertas. Un agente con el proceso arrancado y sin lease no consume agent-hour — si contara, apagar agentes ociosos «mejoraría» la productividad sin entregar nada más.
 
 Y hay que decir **cómo se calcula un lease que sigue vivo**, porque `released_at − claimed_at` sobre un lease activo da NULL y lo excluye del sumatorio en silencio:
 
 ```
-Σ ( COALESCE(released_at_epoch, min(now_epoch, expires_at_epoch)) − claimed_at_epoch )
+Σ ( COALESCE(released_at_epoch, min(now_epoch, expires_at_epoch)) − claimed_at_epoch ) / 3600.0
+                                                                     ^^^^^^^^^^
+                          la resta da SEGUNDOS, y la métrica se llama agent-HORA
 ```
 
-Con dos exigencias que lo hacen calculable: el **instante de corte** de un lease vivo es `min(now, expires_at)` —nunca más allá de su expiración, o un proceso muerto acumularía horas para siempre—, y el **watchdog escribe `released_at`** al expirar (ver §10), de modo que un lease sólo permanece sin sellar mientras de verdad está sostenido.
+La división por 3.600 no es cosmética: sin ella el denominador va inflado ×3.600 y `accepted_jobs / agent-hour` sale mil veces menor de lo que es. Un North Star con un factor constante mal puesto no se detecta comparándolo consigo mismo — sólo cuando alguien intenta contrastarlo con la realidad, meses después.
+
+Y los dos extremos del otro KPI van también en **epoch INTEGER** (`ready_at_epoch`, `done_at_epoch`): `median(READY → ACCEPTED)` necesita restar, y restar exige una unidad. Con `TEXT` la resta o falla o —peor— coacciona y da un número.
+
+Con dos exigencias más que lo hacen calculable: el **instante de corte** de un lease vivo es `min(now, expires_at)` —nunca más allá de su expiración, o un proceso muerto acumularía horas para siempre—, y el **watchdog escribe `released_at`** al expirar (ver §10), de modo que un lease sólo permanece sin sellar mientras de verdad está sostenido.
 
 **Falsador F-N1** — un job que termina en `FAILED` y otro al que le falta un gate: ninguno de los dos puede llegar a `DONE`. Si alguno llega, la regla está en la métrica y no en el servidor, que es donde la versión anterior la puso.
 
@@ -874,7 +920,7 @@ CREATE TABLE jobs (
   -- con una FK COMPUESTA contra una clave que incluye el job.
   context_pack_id TEXT,                                 -- §11: QUÉ contexto recibió
   FOREIGN KEY (id, context_pack_id) REFERENCES context_packs(job_id, id),
-  ready_at TEXT, done_at TEXT,                          -- §14: los dos extremos del KPI
+  ready_at_epoch INTEGER, done_at_epoch INTEGER,         -- §14: los dos extremos del KPI
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 
 CREATE TABLE job_dependencies (
@@ -893,7 +939,11 @@ CREATE TABLE job_leases (
   claimed_at_epoch  INTEGER NOT NULL,
   expires_at_epoch  INTEGER NOT NULL,
   released_at_epoch INTEGER,                -- NULL = sostenido
-  ttl_seconds       INTEGER NOT NULL,
+  ttl_seconds       INTEGER NOT NULL CHECK (ttl_seconds > 0),
+  -- `NOT NULL` no impide 0 ni negativos, y con cualquiera de los dos el lease
+  -- nace ya expirado: el watchdog lo desaloja en su primera pasada y el job entra
+  -- en un ciclo de claim-y-desalojo que parece contención y es aritmética.
+  CHECK (expires_at_epoch > claimed_at_epoch),
   PRIMARY KEY (job_id, lease_generation));
 
 -- GOBERNANZA
@@ -961,6 +1011,13 @@ CREATE TABLE context_pack_invalidations (
   reason TEXT NOT NULL);                 -- QUÉ dependencia cambió, en claro
 CREATE TRIGGER cpi_no_update BEFORE UPDATE ON context_pack_invalidations
   BEGIN SELECT RAISE(ABORT, 'la invalidación es un hecho, no se edita'); END;
+-- Y TAMPOCO SE BORRA: con `stale(pack)` definido como «existe fila aquí», un
+-- DELETE resucita un pack invalidado sin crear versión nueva — el sistema vuelve
+-- a servir contexto que se declaró caduco, y se pierde el rastro del evento que
+-- lo invalidó. Prohibir el UPDATE y dejar el DELETE es cerrar una puerta y abrir
+-- la de al lado.
+CREATE TRIGGER cpi_no_delete BEFORE DELETE ON context_pack_invalidations
+  BEGIN SELECT RAISE(ABORT, 'la invalidación no se borra: crea otra versión del pack'); END;
 
 CREATE TABLE consults (
   id TEXT PRIMARY KEY, job_id TEXT NOT NULL,
@@ -1034,15 +1091,27 @@ buscar (principal_id, operation, idempotency_key)
 COMMIT
 ```
 
-El segundo request queda **esperando el write lock**; cuando entra, la primera ya ha commiteado y encuentra la respuesta hecha. No hace falta inventar una fila `PENDING` en v1: el cerrojo ya da la exclusión, y un estado «en curso» añadiría un modo de fallo propio —quién lo limpia si el proceso muere— a cambio de nada que el cerrojo no dé ya.
+**`BEGIN IMMEDIATE` no espera por sí solo.** Sin `busy_timeout`, SQLite devuelve `SQLITE_BUSY` («database is locked») **de inmediato** en vez de bloquear — así que «el segundo request espera» es falso por defecto, y lo que ocurre es que el reintento del cliente recibe un error de base de datos donde esperaba su respuesta. El contrato de conexión lo fija:
 
-**Falsador F-I3 (concurrente, obligatorio)** — **20** peticiones simultáneas con la misma clave y el mismo cuerpo ⇒ **una** mutación, **un** event, **una** fila de outbox y **20 respuestas idénticas**. Es el único de los tres que se pone rojo con la versión «comprobar y luego ejecutar»: F-I1 y F-I2 pasan secuencialmente con la carrera abierta, y por eso dos falsadores en verde no bastaban.
+```
+PRAGMA busy_timeout = 5000;          -- ms: el cerrojo se ESPERA, no se rebota
+reintentos: 3, backoff exponencial con jitter (50 · 2^n ms)
+agotados  → 503 + Retry-After         -- «no pude serializar», NO 500
+```
+
+`503` y no `500` porque no es un fallo: es contención, el cliente puede reintentar y la operación sigue siendo idempotente. Un `500` empuja al cliente a rendirse o a reintentar sin clave, que es peor.
+
+Con eso sí: el segundo request queda **esperando el write lock**; cuando entra, la primera ya ha commiteado y encuentra la respuesta hecha. No hace falta inventar una fila `PENDING` en v1: el cerrojo ya da la exclusión, y un estado «en curso» añadiría un modo de fallo propio —quién lo limpia si el proceso muere— a cambio de nada que el cerrojo no dé ya.
+
+**Falsador F-I3 (concurrente, obligatorio)** — **20** peticiones simultáneas con la misma clave y el mismo cuerpo ⇒ **una** mutación, **un** event, **una** fila de outbox y **20 respuestas idénticas**, y **ninguna** de las 20 es un `SQLITE_BUSY`. Sin `busy_timeout` este falsador se pone rojo por ahí antes que por la idempotencia, que es justamente lo que hace falta ver. Es el único de los tres que se pone rojo con la versión «comprobar y luego ejecutar»: F-I1 y F-I2 pasan secuencialmente con la carrera abierta, y por eso dos falsadores en verde no bastaban.
 
 **Falsador F-I1** — enviar dos veces la misma mutación con la misma clave y el mismo cuerpo: la segunda devuelve **el mismo status y el mismo payload** que la primera, y `events` no crece. Si la segunda devuelve `409` o un error de restricción, hay UNIQUE pero no idempotencia.
 
 **Falsador F-I2** — misma clave, cuerpo distinto ⇒ `409 IDEMPOTENCY_KEY_REUSED`, y **no** se ejecuta la segunda.
 
 **`PRAGMA foreign_keys = ON` en CADA conexión, y es parte del contrato de inicialización.** SQLite las trae **desactivadas por defecto**: sin este pragma, todos los `REFERENCES` de arriba son documentación. Un `jobs.context_pack_id` apuntando a un pack inexistente se inserta sin protestar, y la referencia que hace verificable «qué contexto recibió este job» deja de verificar nada. No es una opción de despliegue — una conexión sin el pragma sirve un modelo de datos distinto del que esta sección describe.
+
+**Falsador F-C1** — invalidar un pack y luego intentar `DELETE` sobre su fila de invalidación ⇒ la base lo rechaza, y `stale(pack)` sigue siendo cierto.
 
 **Falsador F-DB1** — insertar un `jobs.context_pack_id` que no existe en `context_packs` ⇒ la base lo rechaza. Con el pragma apagado, esa inserción pasa: el falsador mide el pragma tanto como la FK.
 
