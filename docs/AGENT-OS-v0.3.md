@@ -212,6 +212,13 @@ en cualquier otro caso  ⇒  409 not_a_work_principal  + evento
 llmi org compile          # regenera todo bajo generated/
 git diff --exit-code generated/
 # ≠0 ⇒ CI FAIL: "una proyección diverge de la fuente"
+
+# Y la mitad que `git diff` NO ve: un fichero NUEVO sin rastrear. El compilador
+# puede emitir una proyección de más —una que nadie declaró— y el diff pasa en
+# verde, porque git no compara lo que no conoce. Un detector de deriva ciego a
+# las adiciones deja entrar exactamente la copia rancia que viene a prohibir.
+test -z "$(git status --porcelain -- generated/)"
+# ≠0 ⇒ CI FAIL: "hay ficheros sin rastrear bajo generated/"
 ```
 
 Esto es obligatorio: **SoT + generación sin detector de deriva produce N copias rancias**, que es exactamente el estado actual (`roster.json` + 7 `.bak` + `roster.discovered.json` + `roles-por-alias.json` + `ORGANIGRAMA.md`).
@@ -227,6 +234,12 @@ El fallo de §1.4 tiene tres causas y las tres se cierran:
 3. **El aviso sólo cubre "ilegible", no "rancio"** → `/organigrama` devuelve siempre `org_revision`, `content_sha256` y `loaded_at`; si el hash en disco difiere del cargado, `stale: true` **en la respuesta**.
 
 **Falsador F-O1** — modificar la fuente en el host y volver a pedir `/organigrama` sin reiniciar ⇒ o refleja el cambio, o devuelve `stale: true`. Servir contenido viejo con `stale: false` es el fallo que hoy ocurre y que este falsador prohíbe.
+
+**Y sin TTL, que no es un detalle de implementación sino parte del contrato.** F-O1 tal como está admite una tercera salida que lo cumple y traiciona su propósito: una caché con TTL corto devuelve contenido viejo con `stale: false` durante toda la ventana, y el falsador pasa si se prueba fuera de ella. Por eso `stale: false` sólo se puede afirmar **habiendo leído la fuente en ESTA petición y coincidiendo el hash**; cualquier otra cosa —ilegible, distinta, no montada, cacheada sin verificar— es `stale: true`. La frescura se comprueba por respuesta, no por reloj.
+
+> Ya implementado y medido: `refrescar_organigrama()` (PR #11) lee **por RUTA en cada petición** y no tiene TTL. Leer por ruta y no por descriptor es lo que derrota al inodo muerto — un bind-mount de FICHERO se queda clavado al inode viejo cuando el host reescribe por `rename`, y ése fue el fallo real: el organigrama estuvo dos días rancio sirviéndose como bueno.
+
+**Falsador F-O1b** — servir dos peticiones separadas por menos que cualquier TTL plausible, con la fuente cambiada entre medias, y exigir que la segunda YA lo refleje. Un caché de N segundos pone esto en rojo; F-O1 a secas no lo distingue.
 
 ---
 
@@ -248,7 +261,21 @@ contenido cambia → hash cambia → la aprobación deja de aplicar
 
 Un compilado cuya fuente no tiene atestación vigente **no se despliega**: el control plane arranca con la última revisión atestada y avisa; nunca con contenido sin aprobar. Esto sustituye a `gate_delegado_por: ALBERT` como mecanismo — la delegación de gate pasa a ser **una concesión permanente registrada una vez** (§6.4), no una dependencia del operador en cada aprobación.
 
-**Falsador F-A1** — editar un byte de la fuente y desplegar sin re-atestar ⇒ el arranque rechaza el compilado. Si arranca, la atestación es decorativa.
+**La atestación cubre la fuente Y la salida, o no cubre nada.** `content_sha256` identifica la fuente canónica y sólo eso. Entre `compile` y `deploy` hay una brecha: la proyección bajo `generated/` puede quedarse atrás —o editarse a mano— mientras la atestación de la fuente sigue siendo válida y el arranque la acepta. Se estaría verificando la firma de un original que nadie sirve. Por eso la atestación registra las tres cosas y el arranque las comprueba juntas:
+
+```json
+{ "org_revision":     42,
+  "content_sha256":   "<sha de la FUENTE canónica>",
+  "artifacts": { "generated/roster.json":        "<sha256>",
+                 "generated/roles-por-alias.json":"<sha256>" },
+  "compiler_version": "<sha del compilador que las produjo>" }
+```
+
+El arranque recomputa el hash de cada artefacto en disco y lo compara con el atestado. Divergencia ⇒ no arranca. Y `compiler_version` va dentro porque un compilador distinto sobre la misma fuente puede emitir otra proyección: sin él, «la fuente está firmada» no implica «esta salida se deriva de ella».
+
+**Falsador F-A1** — editar un byte de la fuente y desplegar sin re-atestar ⇒ el arranque rechaza el compilado.
+
+**Falsador F-A2** — dejar la fuente y su atestación INTACTAS y editar un byte de `generated/roster.json` ⇒ el arranque rechaza igual. Sin este segundo falsador, F-A1 pasa en verde con la mitad del contrato sin cubrir. Si arranca, la atestación es decorativa.
 
 ---
 
@@ -316,9 +343,17 @@ gate:
 El Gate Engine devuelve **siempre** una policy identificada:
 
 ```json
-{ "matched_policy": "POL-127", "gates": [] }
-{ "matched_policy": "POL-921", "gates": ["qa", "security"] }
+{ "matched_policy": "POL-127", "policy_revision": 7,
+  "policy_sha256": "<sha de los bytes evaluados>", "gates": [] }
+{ "matched_policy": "POL-921", "policy_revision": 3,
+  "policy_sha256": "<sha de los bytes evaluados>", "gates": ["qa", "security"] }
 ```
+
+**El identificador solo no basta, y es un fallo de auditoría, no de estilo.** `POL-127` nombra una policy, no unos bytes. Si mañana se edita, el job de ayer queda registrado como «lo aprobó POL-127» y ya no se puede demostrar POR QUÉ avanzó: la policy que se lee hoy no es la que corrió. La pregunta que el audit plane tiene que poder responder —«¿qué regla exacta dejó pasar esto?»— se vuelve incontestable justo cuando alguien la hace, que es después del incidente.
+
+Por eso el job persiste `policy_revision` y `policy_sha256` **junto al veredicto**, no una referencia a un registro mutable. Con eso, reevaluar un job histórico con su policy original es reproducible; sin eso, el registro es una etiqueta.
+
+**Falsador F-G3** — evaluar un job, editar la policy que casó, y reconstruir la decisión desde lo persistido en el job. Si no se puede recuperar el texto exacto que corrió, el registro no sirve para auditar.
 
 Y nunca:
 
@@ -367,6 +402,20 @@ raw type desconocido  →  kind = LEGACY_UNKNOWN
                           raw_type = "FOOBAR"     ← se conserva SIEMPRE
 ```
 
+**Las tres capas viven en tres columnas, y la tercera es la que hace reproducible a las otras dos:**
+
+```sql
+ALTER TABLE entries ADD COLUMN raw_tipo          TEXT;     -- el lexema escrito
+ALTER TABLE entries ADD COLUMN canonical_kind    TEXT;     -- la interpretación
+ALTER TABLE entries ADD COLUMN kind_registry_rev INTEGER;  -- BAJO QUÉ registro
+```
+
+`kind_registry_rev` no es metadato decorativo. El registro de tipos es versionado y va a cambiar: sin grabar bajo qué revisión se interpretó cada entrada, una actualización del registro **reinterpreta el pasado en silencio** — una entrada archivada como `LEGACY_UNKNOWN` en la rev 3 pasa a `MEASURED` en la rev 4 sin que nada lo registre, y los informes históricos cambian de valor sin que nadie haya tocado un dato. Con la revisión grabada, reinterpretar es una migración explícita y fechada, no un efecto lateral.
+
+Separación de responsabilidades entre las tres: `raw_tipo` es **derivable** del `head` guardado en cualquier momento (es sintaxis); `canonical_kind` y `kind_registry_rev` **NO lo son** (son interpretación, y su revisión), así que se persisten y no se recalculan.
+
+> Ya en producción: las tres columnas se añadieron en PR #9 por la vía aditiva —no tocan `huella_esquema()`, así que los cursores sobreviven al despliegue— y la migración de `raw_tipo` recomputa el corpus entero desde el `head` guardado, sellada en `meta`. Medido: 32.725 entradas recalculadas, 2.037 de ellas rescatadas de un `tipo` que el lector tiraba. `canonical_kind` y `kind_registry_rev` quedan creadas y **vacías**, esperando al registro de §8.
+
 El comportamiento actual (`tipo = NULL` y la etiqueta se pierde) se elimina. Es lo que hace que 641 entradas parezcan no declarar nada cuando declaran de sobra, y lo que rompe cualquier instrumento que clasifique por tipo.
 
 ### 8.3 · El markdown crudo deja de ser una puerta lateral
@@ -398,6 +447,19 @@ DRAFT → QUEUED → READY → CLAIMED → RUNNING → RESULT_SUBMITTED
 
 Terminales adicionales: `FAILED` · `CANCELLED`. `ESCALATED` **no es un estado**: es una dimensión independiente (`escalation_open: bool`) que convive con `RUNNING` o `BLOCKED`.
 
+**`unblock` es una transición con contrato, no un botón.** La API expone `POST /jobs/{id}/unblock` y §9 no decía de dónde sale ni adónde va, que es justo lo que un worker necesita saber para no quedarse esperando un lease que ya no tiene:
+
+| | |
+|---|---|
+| estado origen | `BLOCKED`, y **sólo** `BLOCKED`. Desde cualquier otro ⇒ `409`. |
+| estado destino | `READY`. No vuelve a `CLAIMED`: el que lo bloqueó puede llevar horas muerto. |
+| lease | **se libera** en la misma transacción, y `lease_generation` se incrementa. |
+| quién puede | el actor autorizado por la policy del gate que lo bloqueó, no necesariamente quien lo reclamó. |
+
+Que vuelva a `READY` y no a `CLAIMED` es la decisión que importa: devolverlo a su dueño anterior supone que ese dueño sigue vivo y sigue siendo el correcto, y las dos suposiciones fallan justo en el caso que motiva un bloqueo. Volviendo a `READY` el job se vuelve a reclamar por las reglas normales, y el incremento de generación invalida cualquier token viejo que ande suelto — sin él, un worker resucitado podría enviar resultado sobre un job que ya reclamó otro.
+
+**Falsador F-J2** — bloquear un job, desbloquearlo, y que el worker original intente `submit` con su token de antes ⇒ rechazo por generación. Si lo acepta, el fencing no cubre el desbloqueo.
+
 **Sólo el servidor persiste transiciones.** El agente solicita; el servidor comprueba lease válido · actor autorizado · artefacto presente y del tipo esperado · presupuesto · estado origen legal. Un Job sin criterios de aceptación no pasa a `READY` salvo tipos explícitamente exploratorios.
 
 ---
@@ -416,21 +478,44 @@ SELECT id FROM jobs
    AND project_id = :project
    AND owner_role = :role
    AND id NOT IN (SELECT job_id FROM job_dependencies WHERE satisfied = 0)
+    AND EXISTS (SELECT 1 FROM principal_scopes ps          -- §6: aislamiento EJECUTABLE
+                WHERE ps.principal_id = :principal
+                  AND ps.project_id   = jobs.project_id)
  ORDER BY priority DESC, created_at ASC
  LIMIT 1;
 
 UPDATE jobs
    SET status = 'CLAIMED',
        lease_generation = lease_generation + 1
- WHERE id = :job AND status = 'READY';     -- guardia: 0 filas ⇒ otro ganó
+ WHERE id = :job AND status = 'READY'
+RETURNING lease_generation AS gen;          -- ← la generación REAL, no una inventada
+
+-- EL GUARDA ES CÓDIGO, NO UN COMENTARIO. Si el UPDATE afectó 0 filas, otro worker
+-- ganó la carrera entre el SELECT y el UPDATE: no hay nada que arrendar.
+IF changes() = 0 THEN
+    ROLLBACK;
+    RETURN 409;                             -- «otro se lo llevó», no un 500
+END IF;
 
 INSERT INTO job_leases (job_id, principal_id, lease_generation, claimed_at, expires_at)
-VALUES (:job, :principal, :gen, :now, :now + :ttl);
+VALUES (:job, :principal, :gen, :now, unixepoch(:now) + :ttl_segundos);
 
 COMMIT;
 ```
 
+**Dos correcciones que la versión anterior de este bloque no tenía, y las dos producían corrupción silenciosa:**
+
+**① El guarda estaba escrito como comentario.** Decía `-- guardia: 0 filas ⇒ otro ganó` y luego seguía al `INSERT` y al `COMMIT` pase lo que pase. Con dos workers en la carrera, el perdedor insertaba un lease sobre un job que **ya tenía dueño** y se llevaba un token que el fencing daría por bueno: exactamente el doble claim que §10 existe para impedir. Una comprobación que vive en un comentario no comprueba nada — el mismo defecto que el resto de esta spec persigue, cometido en su propio pseudocódigo.
+
+**② `:gen` no venía de ninguna parte.** No lo devolvía el `SELECT` ni el `UPDATE`: era un parámetro libre, y el `INSERT` podía grabar una generación distinta de la que el `UPDATE` acababa de escribir. El fencing compara generaciones; si la del lease no es la del job, compara contra basura. Ahora sale del `RETURNING` del propio `UPDATE`, que es el único sitio donde ese número existe de verdad.
+
+**③ `:now + :ttl` no es aritmética de fechas.** Si `:now` llega como ISO 8601, SQLite lo **coacciona a número** para poder sumar: `'2026-08-19T14:00:00Z' + 3600` da `3600`, no una fecha. El lease nacería caducado en 1970 y el barrido de expirados se lo llevaría de inmediato — un lease que se evapora sin que nadie vea un error. Se fija la unidad: `ttl_segundos` es un entero de segundos, y la suma se hace en epoch (`unixepoch()`). La alternativa equivalente es `datetime(:now, '+' || :ttl_segundos || ' seconds')`; lo que no vale es `+` a secas sobre un texto.
+
 El token que se entrega al worker contiene `job_id · principal_id · lease_generation`.
+
+**Falsador F-L1** — dos workers reclamando el MISMO job a la vez: exactamente uno recibe token, el otro recibe `409`. Si los dos reciben token, el guarda no está.
+
+**Falsador F-L2** — reclamar un job y leer `expires_at`: tiene que caer en el futuro, a `ttl_segundos` de `:now`. Un `expires_at` en 1970 es la suma sobre texto, y pasa desapercibida porque el lease simplemente «desaparece».
 
 ### Fencing — el caso feo del failover
 
@@ -546,6 +631,19 @@ median(READY → ACCEPTED)
 tokens_or_cost / accepted_job
 ```
 
+**`ACCEPTED` hay que definirlo antes de medirlo, porque la máquina de estados de §9 no lo tiene.** Tiene `APPROVED` y `DONE`, que no son lo mismo: `APPROVED` es «un gate lo aprobó» —puede haber varios, y aprobar no es entregar—, y `DONE` es «el flujo terminó», que incluye terminar mal. Un North Star construido sobre un estado inexistente se implementa tres veces distintas y nadie nota que los números no comparan.
+
+| | |
+|---|---|
+| `ACCEPTED` **es** | `DONE` habiendo satisfecho `acceptance_criteria`, con **todos** los `required_gates` en `APPROVED`. No es un estado nuevo: es un predicado sobre `DONE`. |
+| `ACCEPTED` **no es** | `DONE` tras `FAILED`, `CANCELLED`, ni `DONE` con gates pendientes o dispensados. |
+| se sella en | `jobs.accepted_at` (NULL mientras no se cumpla). El KPI cuenta filas con ese sello, no estados. |
+| el otro extremo | `jobs.ready_at` — cuándo entró en `READY` la PRIMERA vez. Re-entrar en `READY` tras un `unblock` **no lo reescribe**: si lo hiciera, bloquear un job mejoraría su latencia, y la métrica premiaría bloquear. |
+
+**Denominador de `agent-hour`:** suma de leases ACTIVOS, es decir `Σ (released_at − claimed_at)` sobre `job_leases`, no tiempo de reloj ni sesiones abiertas. Un agente con el proceso arrancado y sin lease no consume agent-hour — si contara, apagar agentes ociosos «mejoraría» la productividad sin entregar nada más.
+
+**Falsador F-N1** — un job que termina en `FAILED` y otro `DONE` con un gate pendiente: ninguno de los dos puede aparecer en `accepted_jobs`. Si aparecen, el North Star está midiendo actividad, no entrega.
+
 *Se quiere una empresa que entregue más, no una empresa que hable menos.* Si el Agent OS gasta los mismos tokens y termina el doble de trabajo en la mitad de tiempo, ha ganado aunque el ratio no baje.
 
 ### Secundarias
@@ -587,6 +685,20 @@ CREATE TABLE org_attestations (
 );
 
 -- AUTORIDAD (cuatro conceptos, cuatro tablas — §6)
+-- ALCANCE POR PROYECTO. `project_scope` vivía sólo en el YAML del modelo, y la
+-- invariante de seguridad exige aislamiento entre proyectos: una autoridad que
+-- no está en el DDL no la puede aplicar ninguna consulta, así que el aislamiento
+-- quedaba dependiendo de que cada `WHERE` se acordara. Aquí se vuelve ejecutable.
+--
+-- ⚠️ Y NO se infiere del nombre. Que un alias sea `em-bikeus` NO otorga alcance
+-- sobre `bikeus`: eso sería que el software se invente la autoridad leyendo una
+-- cadena. El alcance se declara, fila a fila, o no existe.
+CREATE TABLE principal_scopes (
+  principal_id TEXT NOT NULL, project_id TEXT NOT NULL,
+  granted_by TEXT NOT NULL,               -- quién lo otorgó: sin esto no es auditable
+  granted_at TEXT NOT NULL,
+  PRIMARY KEY (principal_id, project_id));
+
 CREATE TABLE decision_authority (
   principal_id TEXT, decision_class TEXT, level TEXT
     CHECK (level IN ('decide','recommend','consult','request','none')),
@@ -615,7 +727,10 @@ CREATE TABLE jobs (
   acceptance_criteria TEXT NOT NULL,                    -- JSON, no vacío salvo exploratorio
   artifact_contract TEXT NOT NULL, risk_tags TEXT,
   matched_policy TEXT, required_gates TEXT,             -- los fija el Gate Engine, §7
-  budget TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+  budget TEXT,
+  context_pack_id TEXT,                                 -- §11: QUÉ contexto recibió
+  ready_at TEXT, accepted_at TEXT,                      -- §14: los dos extremos del KPI
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 
 CREATE TABLE job_dependencies (
   job_id TEXT, depends_on TEXT, satisfied INTEGER NOT NULL DEFAULT 0,
@@ -632,7 +747,28 @@ CREATE TABLE reviews (
   id TEXT PRIMARY KEY, job_id TEXT NOT NULL, gate TEXT NOT NULL,
   reviewer_principal TEXT, verdict TEXT
     CHECK (verdict IN ('APPROVED','CHANGES_REQUESTED','BLOCKED')),
+  -- LA INVARIANTE 10 EXIGE ESTO Y LA TABLA NO LO TENÍA: un veredicto atado a un
+  -- `job_id` aprueba el JOB, no unos BYTES. Entre la aprobación y el merge el
+  -- artefacto puede cambiar, y el APPROVED de ayer se lee como si cubriera lo de
+  -- hoy. Es la firma en blanco que la invariante prohíbe.
+  artifact_sha256 TEXT NOT NULL,          -- los bytes exactos que se aprobaron
+  artifact_ref    TEXT NOT NULL,          -- ref inmutable (commit sha, no rama)
   decided_at TEXT);
+
+-- CONTEXTO. §11 exige `stale`, refresco, procedencia y poder RECONSTRUIR lo que
+-- un agente recibió. Nada de eso es posible sin persistirlo: sin esta tabla, «el
+-- pack estaba rancio» es una afirmación que nadie puede comprobar después, y la
+-- invalidación no tiene sobre qué actuar. Un pack que sólo existió en memoria
+-- convierte cualquier post-mortem en una reconstrucción de memoria.
+CREATE TABLE context_packs (
+  id TEXT PRIMARY KEY, job_id TEXT NOT NULL,
+  pack_version INTEGER NOT NULL,
+  content_sha256 TEXT NOT NULL,          -- los bytes que el agente recibió
+  sources TEXT NOT NULL,                 -- JSON: [{ref, sha256}] — procedencia
+  token_count INTEGER NOT NULL,          -- contra el presupuesto de ≤12k
+  generated_at TEXT NOT NULL,
+  stale INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (job_id, pack_version));        -- inmutable: refrescar CREA versión, no edita
 
 CREATE TABLE consults (
   id TEXT PRIMARY KEY, job_id TEXT NOT NULL,
@@ -644,8 +780,19 @@ CREATE TABLE consults (
 CREATE TABLE events (
   event_id TEXT PRIMARY KEY, event_type TEXT NOT NULL, occurred_at TEXT NOT NULL,
   actor_principal TEXT, project_id TEXT, job_id TEXT,
-  correlation_id TEXT, causation_id TEXT, idempotency_key TEXT,
+  correlation_id TEXT, causation_id TEXT,
+  -- NOT NULL + UNIQUE, y las dos hacen falta. Antes era nullable y sin índice:
+  -- la API EXIGÍA la clave y la base no la imponía, así que un reintento —que es
+  -- la situación normal, no la rara— insertaba un evento duplicado y su fila de
+  -- outbox, y la notificación externa salía dos veces. Guardar la clave no es
+  -- implementar idempotencia; es documentarla y no cumplirla.
+  idempotency_key TEXT NOT NULL,
   payload TEXT);
+
+-- Ámbito de la clave: única POR TIPO DE EVENTO. La misma clave puede aparecer en
+-- un `job.claimed` y en un `job.submitted` del mismo flujo sin colisionar, y a la
+-- vez dos `job.submitted` con la misma clave son EL MISMO envío.
+CREATE UNIQUE INDEX ux_events_idem ON events (event_type, idempotency_key);
 
 CREATE TABLE outbox (
   id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL,
@@ -664,8 +811,9 @@ CREATE TABLE outbox (
 
 ```
 GET  /whoami                     → principal resuelto del token (nunca del payload)
-GET  /org                        → { org_revision, content_sha256, loaded_at, stale }
-GET  /org/principals/{id}
+GET  /organigrama                → { org_revision, content_sha256, loaded_at, stale }
+GET  /organigrama/principals/{id}
+GET  /org  →  308 a /organigrama    (alias de compatibilidad, ver abajo)
 
 GET  /work/next                  POST /jobs/{id}/claim      POST /jobs/{id}/start
 POST /jobs/{id}/heartbeat        POST /jobs/{id}/block      POST /jobs/{id}/unblock
@@ -707,6 +855,14 @@ Y los antipatrones operativos: job sin owner · job sin criterios de aceptación
 
 ---
 
+> **Nota de reconciliación — `/org` vs `/organigrama`.** Una versión anterior de esta spec definía `GET /org` en §16 y a la vez decía en §17 que se ampliaba `GET /organigrama`. Son rutas distintas: se habrían implementado las dos, sirviendo el mismo dato desde dos sitios, que es la deriva de proyecciones que §4 prohíbe — cometida en la propia superficie de API.
+>
+> **Canónica: `/organigrama`.** No por gusto: ya está en producción, ya la consumen los vigías de la flota, y sus falsadores de frescura (F-O1, F-O1b) están escritos contra ella. Mover la ruta canónica obligaría a reescribir consumidores vivos y falsadores a cambio de un nombre más corto.
+>
+> `/org` queda como **alias con `308 Permanent Redirect`**, no como segunda implementación: un alias que reimplementa es otra proyección. Se retira cuando ningún consumidor lo use, medido en el log de acceso — no en una fecha elegida a ojo.
+
+---
+
 # §17 · Qué se reutiliza y qué se deprecia
 
 Verificado contra el código vivo. **Nada de esto se reconstruye.**
@@ -716,7 +872,7 @@ Verificado contra el código vivo. **Nada de esto se reconstruye.**
 | Identidad fail-closed (`422` a nombre fuera de censo) | **Se conserva.** Es el precedente del modelo de §3. |
 | Carriles (`carriles.tsv`) como SoT de proyecto | **Se conserva.** `project_id` se deriva de ahí. |
 | Ledger append-only + `llmi verify` (integridad del canon) | **Se conserva** como audit plane. |
-| `GET /organigrama` | **Se amplía** con `org_revision`, `sha256`, `stale` (§4.3). |
+| `GET /organigrama` | **Se amplía** con `org_revision`, `sha256`, `stale` (§4.3). **Es la ruta canónica**, ver nota. |
 | `llmi stat` detector de deriva de montaje | **Se reutiliza el patrón** para el gate de deriva (§4.2). |
 | `llmi doctor` ①②③⑤ | **Se amplía** con §16.3. |
 | Cursores e inbox dirigido | **Se conserva** para el plano de comunicación; deja de ser el plano de trabajo. |
