@@ -268,6 +268,10 @@ def test_el_generador_no_introduce_mounts_de_fichero_de_CONFIG(tmp_path):
     r = subprocess.run([str(repo / "llmi"), "init", "--demo"], cwd=repo,
                        env={"HOME": str(casa), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
                        capture_output=True, text=True, timeout=180, check=False)
+    # EL CÓDIGO DE SALIDA, no sólo que el fichero exista. `check=False` calla a
+    # Ruff y no demuestra nada: un generador que escribe el override y luego falla
+    # dejaría este test en verde con el proceso roto.
+    assert r.returncode == 0, f"`llmi init` salió {r.returncode}:\n{r.stdout}\n{r.stderr}"
     override = repo / "docker-compose.override.yml"
     assert override.exists(), f"el generador no produjo override:\n{r.stdout}{r.stderr}"
 
@@ -301,9 +305,10 @@ def test_el_riesgo_aceptado_sigue_cubriendo_algo_real(tmp_path):
     for f in ("llmi", "docker-compose.yml", "roster.example.json"):
         shutil.copy(RAIZ / f, repo / f)
     (casa / "LEDGER.md").write_text("### [cto-A → backend · FYI] uno\ncuerpo\n")
-    subprocess.run([str(repo / "llmi"), "init", "--demo"], cwd=repo,
-                   env={"HOME": str(casa), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
-                   capture_output=True, text=True, timeout=180, check=False)
+    r = subprocess.run([str(repo / "llmi"), "init", "--demo"], cwd=repo,
+                       env={"HOME": str(casa), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+                       capture_output=True, text=True, timeout=180, check=False)
+    assert r.returncode == 0, f"`llmi init` salió {r.returncode}:\n{r.stdout}\n{r.stderr}"
     usados = {_aceptado(o, d) for o, d in _montajes(
         (repo / "docker-compose.override.yml").read_text()) if _es_fichero(o, d)}
     huerfanos = {m for _, _, m in RIESGO_ACEPTADO} - usados
@@ -415,3 +420,47 @@ def test_el_estado_que_produce_llmi_up_no_queda_a_merced_del_override():
             f"{clave}={v!r} — `llmi up` produce ese fichero dentro del repo, así que "
             "la composición PUBLICADA tiene que decir dónde está. Con una "
             "interpolación vacía el servicio degrada sin un solo error.")
+
+
+def test_si_el_estado_no_se_puede_preparar_NO_se_levanta_el_contenedor(tmp_path):
+    """FAIL-CLOSED de `llmi up`, con Docker falso para poder demostrarlo.
+
+    El script lleva `set -uo pipefail`, **no** `set -e`: sin `|| exit` explícito,
+    un `mkdir`/`cp` que falle sigue adelante y levanta el contenedor con el estado
+    a medias — censo ausente, mapa de carriles vacío, todo degradando en silencio.
+    Arrancar con el estado roto es peor que no arrancar.
+
+    Se fuerza el fallo de la forma más simple y menos mágica: `.llminbox-state`
+    existe como FICHERO, así que `mkdir -p` no puede crear el directorio.
+
+    Y se pone un `docker` FALSO delante en el PATH que deja una marca al ser
+    invocado. Comprobar sólo el código de salida no bastaría: lo que importa es
+    que NO se llegue a Docker.
+
+    FALSADOR: quitar los `|| exit 1` deja rc=0 (o el de docker) y, sobre todo,
+    hace aparecer la marca — el contenedor se habría levantado."""
+    import shutil
+    import subprocess
+    repo, casa, binfalso = tmp_path / "repo", tmp_path / "home", tmp_path / "bin"
+    for d in (repo, casa, binfalso):
+        d.mkdir()
+    for f in ("llmi", "docker-compose.yml", "roster.example.json"):
+        shutil.copy(RAIZ / f, repo / f)
+    (repo / "roster.json").write_text('{"agentes": [], "humanos": [], "difusion": []}')
+    (repo / ".llmi-mounts.json").write_text("{}")
+    (casa / ".llminbox.token").write_text("token-de-prueba")
+    marca = tmp_path / "docker-fue-invocado"
+    (binfalso / "docker").write_text(f'#!/bin/sh\ntouch "{marca}"\nexit 0\n')
+    (binfalso / "docker").chmod(0o755)
+    # El estado NO se puede preparar: ya hay un fichero con ese nombre.
+    (repo / ".llminbox-state").write_text("soy un fichero, no un directorio")
+
+    r = subprocess.run([str(repo / "llmi"), "up"], cwd=repo,
+                       env={"HOME": str(casa),
+                            "PATH": f"{binfalso}:/usr/bin:/bin:/usr/sbin:/sbin"},
+                       capture_output=True, text=True, timeout=120, check=False)
+    assert r.returncode != 0, f"siguió adelante con el estado roto:\n{r.stdout}\n{r.stderr}"
+    assert not marca.exists(), (
+        "se invocó a Docker con el estado sin preparar: el contenedor habría "
+        "arrancado con censo ausente y mapa de carriles vacío, degradando en "
+        "silencio")
