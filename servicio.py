@@ -475,7 +475,12 @@ def huella_censo() -> str:
 # columna `raw_tipo` NO EXISTE y no hay sello — ninguna versión del derivador ha
 # llegado nunca a producción, así que "1" puede representar la implementación final
 # de esta rama. Si alguna hubiera corrido, esto tendría que ser "2".
-RAW_TIPO_V = "1"
+# v2 (2026-08-19): `raw_tipo_de` aprendió la forma SPOKE sin corchetes. Sin subir
+# esto el arreglo es INERTE sobre lo ya indexado —el sello de v1 hace `return` y
+# los ledgers dormidos no vuelven a pasar por `reindex()`—, que es literalmente el
+# defecto que esta migración nació para cerrar. Medido sobre una copia de la base
+# viva: la re-pasada rescata 66 entradas y no pierde ninguna.
+RAW_TIPO_V = "2"
 
 
 def migrar_raw_tipo(con) -> None:
@@ -3275,11 +3280,24 @@ def organigrama():
             "stale": not fresco}
     j = est["jerarquia"]
     if not j:
-        return {**base, "jerarquia": {}, "roles": 0,
-                "aviso": "jerarquía NO montada (LLMINBOX_ROLES_ALIAS vacío o "
-                         "ilegible) — esto NO significa que no reportes a nadie, "
-                         "significa que este servicio no lo sabe. Fuente en prosa: "
-                         "_shared_refs/ORGANIGRAMA.md"}
+        # Dos causas DISTINTAS caían en el mismo aviso, y sólo una de ellas es un
+        # problema de montaje. `source_sha256` las separa: es `None` sólo cuando no
+        # hubo lectura válida en ESTA petición. Con hash de fuente, el fichero está
+        # ahí y se leyó — lo que falta es el CAMPO. Culpar al montaje entonces manda
+        # al operador a buscar una avería que no existe: un aviso que imputa una
+        # causa que su comprobación no midió estorba más que callarse.
+        if est["source_sha256"] is None:
+            aviso = ("jerarquía NO montada (LLMINBOX_ROLES_ALIAS vacío o "
+                     "ilegible) — esto NO significa que no reportes a nadie, "
+                     "significa que este servicio no lo sabe. Fuente en prosa: "
+                     "_shared_refs/ORGANIGRAMA.md")
+        else:
+            aviso = ("la fuente firmada SÍ se leyó en esta petición, pero no trae "
+                     "el campo `jerarquia` (o viene vacío) — el montaje está bien, "
+                     "revisa el CONTENIDO de LLMINBOX_ROLES_ALIAS. Esto NO significa "
+                     "que no reportes a nadie, significa que este servicio no lo "
+                     "sabe. Fuente en prosa: _shared_refs/ORGANIGRAMA.md")
+        return {**base, "jerarquia": {}, "roles": 0, "aviso": aviso}
     if not fresco:
         # Se sirve lo último bueno: una jerarquía vacía haría leer «no reporto a
         # nadie», que es lo contrario de la verdad. Pero marcada, que es lo que
@@ -3905,6 +3923,138 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
         else:
             out.append("   ✓ ningún rol consume sólo sin carril — se puede plantear "
                        "encender LLMINBOX_CARRIL_OBLIGATORIO=1")
+    # ── ⑥ COHERENCIA DE PROYECCIONES ─────────────────────────────────────────
+    # Hay TRES proyecciones de la organización y una pregunta derivada, y cada
+    # combinación es una patología distinta:
+    #
+    #   roster.json      censo de identidad de este servicio
+    #   rol_por_alias    alias → rol del organigrama firmado
+    #   jerarquía        rol → a quién reporta, del mismo fichero
+    #   ¿resuelve?       `canon_identidad()` va por la UNIÓN de roster ∪ alias
+    #
+    #   resuelve=sí + jerarquia=no  → identidad operativa SIN GOBIERNO
+    #   jerarquia=sí + resuelve=no  → rol organizativo IMPOSIBLE DE EJECUTAR
+    #   roster ≠ org_alias          → DERIVA entre proyecciones legacy
+    #
+    # Colapsarlas en «censo | organigrama» hacía ilegible el caso vivo de
+    # `engineering-manager`: no está en el roster, sí en el organigrama con alias,
+    # y su bandeja responde 200. Con dos columnas se leía «no está en el censo» —
+    # falso, y habría llevado a darlo de alta pagando un reindex completo por nada.
+    #
+    # ENCUENTRA; NO ADJUDICA. El tipo sale `UNCLASSIFIED`. Inferirlo por el nombre
+    # —«`em-bikeus` suena a scope bikeus»— sería devolver semántica organizativa a
+    # cadenas de texto, que es lo que este trabajo está quitando. Un alias sólo
+    # dice «este nombre resuelve a este rol»; el scope y la autoridad salen de
+    # política, no del sufijo.
+    out.append("")
+    foto = lp.refrescar_organigrama()
+    fresco = (foto["source_sha256"] is not None
+              and foto["source_sha256"] == foto["loaded_sha256"])
+    if not foto["montada"] or not foto["jerarquia"]:
+        # Sin jerarquía USABLE no hay contra qué comparar, y comparar contra el
+        # conjunto vacío diría que NADIE está gobernado: el censo entero acusado
+        # de golpe. Un informe catastrofista se deja de leer, y con razón. El
+        # fichero puede estar montado y aun así no servir —`rol_por_alias` sin
+        # `jerarquia` es un caso real del arnés—, así que se miran las dos cosas.
+        out.append("⑥ COHERENCIA DE PROYECCIONES — organigrama NO montado (o sin "
+                   "jerarquía usable): no se puede decidir quién está gobernado")
+    elif not fresco:
+        # El último-bueno vale como información sobre FRESCURA, no como base de
+        # una afirmación de gobierno. «Hay N principales divergentes» es una
+        # afirmación sobre AHORA: con la fuente ilegible no se sostiene, y
+        # emitirla igual convertiría el diagnóstico en una invención — el defecto
+        # que esta sección existe para denunciar.
+        out.append("⑥ COHERENCIA DE PROYECCIONES — NO VERIFICABLE: la fuente "
+                   "organizativa está rancia o ilegible en esta petición")
+        out.append("   Lo último cargado sigue sirviéndose en `/organigrama` y ahí "
+                   "se puede ver, pero NO se calcula divergencia con él: sería "
+                   "afirmar sobre el presente con datos del pasado.")
+    else:
+        # NORMALIZADO EN LA FRONTERA. `roles_alias` y `jerarquia` ya vienen en
+        # minúsculas de sus cargadores, pero `ROL_DE` conserva lo que declara
+        # `roster.json`: basta un `"rol": "CTO"` escrito a mano para fabricar una
+        # divergencia `CTO ≠ cto` que no existe. Un informe de gobierno que
+        # inventa una discrepancia por la caja de una letra es peor que no tenerlo.
+        norm = lambda x: str(x).strip().lower()          # noqa: E731
+        roster = {norm(x) for x in lp.ROL_DE.values()}
+        alias = {norm(x) for x in (foto["roles_alias"] or {}).values()}
+        jer = {norm(x) for x in foto["jerarquia"]}
+        acuerdo = roster & alias & jer
+        filas = sorted((roster | alias | jer) - acuerdo)
+        out.append(f"⑥ COHERENCIA DE PROYECCIONES — {len(filas)} principal(es) que "
+                   f"las tres proyecciones no declaran igual")
+        out.append(f"   {'principal':<24}{'roster':<8}{'org_alias':<11}"
+                   f"{'jerarquia':<11}{'resuelve':<10}{'cursor':<8}{'correo':<8}tipo")
+        # `correo` cuenta lo que la BANDEJA de ese principal entregaría, y la
+        # bandeja expande firmas con `escuchados()`, que deriva del ROSTER. Unir
+        # aquí los nombres del organigrama fabricaba un falso verde: medido, un rol
+        # que sólo existe en `rol_por_alias` daba `correo=sí` y `GET /inbox/<rol>`
+        # NO traía esa entrada — `escuchados()` sólo se escuchaba a sí mismo.
+        # Contar correo que la bandeja no va a entregar es peor que no contarlo.
+        nombres_de: dict[str, set[str]] = {}
+        for nombre, rol in lp.ROL_DE.items():
+            nombres_de.setdefault(norm(rol), set()).add(norm(nombre))
+        si = lambda b: "sí" if b else "no"              # noqa: E731
+        for rol in filas[:25]:
+            ns = sorted(nombres_de.get(rol, set()))
+            # `lower(agent)`, y es el REVERSO de la normalización de arriba:
+            # `clave_cursor()` guarda el rol TAL COMO lo declara `roster.json`, así
+            # que un `"rol": "CTO"` deja la fila con clave `CTO`. Consultar con el
+            # valor ya normalizado devolvía cero y la columna decía `cursor=no`
+            # sobre un cursor que existe. Normalizar para comparar conjuntos y no
+            # normalizar al consultar es el mismo defecto con el signo cambiado.
+            cur = con.execute("SELECT COUNT(*) n FROM cursors WHERE lower(agent)=?",
+                              (rol,)).fetchone()["n"]
+            correo = 0
+            if ns:
+                marcas = ",".join("?" * len(ns))
+                correo = con.execute(
+                    f"SELECT COUNT(*) n FROM recipients WHERE lower(who) IN ({marcas})",
+                    tuple(ns)).fetchone()["n"]
+            out.append(f"   {rol:<24}{si(rol in roster):<8}{si(rol in alias):<11}"
+                       f"{si(rol in jer):<11}{si(rol in roster or rol in alias):<10}"
+                       f"{si(cur):<8}{si(correo):<8}UNCLASSIFIED")
+        if len(filas) > 25:
+            out.append(f"   … y {len(filas) - 25} fila(s) más sin listar "
+                       f"(cola del orden alfabético)")
+        sin_gobierno = len((roster | alias) - jer)
+        inejecutable = len(jer - (roster | alias))
+        deriva = len(roster ^ alias)
+        # A NIVEL DE ALIAS, no de rol. Escribí primero una columna `enrutable` por
+        # principal y era un FALSO VERDE DE GOBIERNO: decía «sí» para un rol cuyo
+        # nombre el parser reconoce, sin poder sostener que la bandeja de ESE rol
+        # entregue esa entrada — medido, no entrega, porque `escuchados()` deriva
+        # del roster. «El parser produce un destinatario para un nombre» tampoco
+        # equivale a «la bandeja de este principal recibe ese destinatario»: son
+        # dos capas distintas y las junté.
+        #
+        # Esto es lo único exactamente demostrable con lo que hay: nombres que
+        # `canon_identidad()` acepta y que `→ nombre` NO puede producir como
+        # destinatario, porque el vocabulario del parser son los nombres del censo.
+        mudos = sorted(n for n in (foto["roles_alias"] or {}) if n not in lp.CANON)
+        out.append(f"   patologías: {sin_gobierno} identidad(es) sin gobierno · "
+                   f"{inejecutable} rol(es) sin identidad (no pueden recibir "
+                   f"trabajo) · {deriva} en deriva roster↔org_alias")
+        if mudos:
+            out.append(f"   🔴 {len(mudos)} ALIAS RESOLUBLE(S) PERO NO PARSEABLE(S) COMO "
+                       f"DESTINO: {', '.join(mudos[:6])}")
+            out.append("      `canon_identidad()` los acepta —su bandeja contesta— y "
+                       "`→ <nombre>` en un ledger NO produce destinatario: esa entrada "
+                       "queda huérfana. Delegar con esos nombres pierde el correo.")
+        out.append("   El tipo lo adjudica el operador — esto encuentra, no "
+                   "clasifica, y un alias no implica scope.")
+        # El aviso que impide que un cero se lea como una garantía que el sistema
+        # todavía no da. Sin él, dentro de seis meses alguien concluye de un 0 que
+        # el SoT ya es único — el mismo error que ⑥ denuncia, cometido al leerlo.
+        out.append("   ⚠️ Un 0 aquí dice que las proyecciones COINCIDEN hoy. NO "
+                   "sustituye el gate de integridad del Org SoT (fuente única + "
+                   "compilador + detector de deriva): eso no existe todavía.")
+        # NOTA de asimetría, dicha porque afecta a lo que se acaba de afirmar: el
+        # lado del organigrama se relee en esta misma petición; `roster.json` se
+        # carga al importar el módulo. Una edición en vivo del roster no se ve
+        # hasta el próximo arranque. Anotado para v0.3.1.
+        out.append("   (el lado del organigrama se relee ahora; `roster.json` se "
+                   "carga al arrancar el proceso — v0.3.1 lo unifica)")
     con.close()
     return "\n".join(out) + "\n"
 
