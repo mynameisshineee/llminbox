@@ -3835,31 +3835,57 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
                    "se puede ver, pero NO se calcula divergencia con él: sería "
                    "afirmar sobre el presente con datos del pasado.")
     else:
-        roster = set(lp.ROL_DE.values())
-        alias = set((foto["roles_alias"] or {}).values())
-        jer = set(foto["jerarquia"])
+        # NORMALIZADO EN LA FRONTERA. `roles_alias` y `jerarquia` ya vienen en
+        # minúsculas de sus cargadores, pero `ROL_DE` conserva lo que declara
+        # `roster.json`: basta un `"rol": "CTO"` escrito a mano para fabricar una
+        # divergencia `CTO ≠ cto` que no existe. Un informe de gobierno que
+        # inventa una discrepancia por la caja de una letra es peor que no tenerlo.
+        norm = lambda x: str(x).strip().lower()          # noqa: E731
+        roster = {norm(x) for x in lp.ROL_DE.values()}
+        alias = {norm(x) for x in (foto["roles_alias"] or {}).values()}
+        jer = {norm(x) for x in foto["jerarquia"]}
         acuerdo = roster & alias & jer
         filas = sorted((roster | alias | jer) - acuerdo)
         out.append(f"⑥ COHERENCIA DE PROYECCIONES — {len(filas)} principal(es) que "
                    f"las tres proyecciones no declaran igual")
         out.append(f"   {'principal':<24}{'roster':<8}{'org_alias':<11}"
-                   f"{'jerarquia':<11}{'resuelve':<10}{'cursor':<8}{'correo':<8}tipo")
-        alias_de: dict[str, list[str]] = {}
-        for a, rol in lp.ROL_DE.items():
-            alias_de.setdefault(rol, []).append(a)
+                   f"{'jerarquia':<11}{'resuelve':<10}{'enrutable':<11}"
+                   f"{'cursor':<8}{'correo':<8}tipo")
+        # Los nombres de CADA proyección, no sólo los del roster: un principal que
+        # existe únicamente en el organigrama tiene nombres, y contarlos como cero
+        # haría que su fila mintiera en dos columnas.
+        nombres_de: dict[str, set[str]] = {}
+        for nombre, rol in lp.ROL_DE.items():
+            nombres_de.setdefault(norm(rol), set()).add(norm(nombre))
+        for nombre, rol in (foto["roles_alias"] or {}).items():
+            nombres_de.setdefault(norm(rol), set()).add(norm(nombre))
+        si = lambda b: "sí" if b else "no"              # noqa: E731
+        # ENRUTABLE ≠ RESUELVE, y el caso vivo lo demuestra: `em-bikeus` resuelve
+        # como identidad (`/inbox` da 200) y NO es una dirección de correo — el
+        # vocabulario del parser (`AGENTES`) son los NOMBRES del roster, así que
+        # `→ em-bikeus` parsea a lista vacía y esa entrada no llega a nadie.
+        # Medido: los 5 nombres que sólo existen en el organigrama no aparecen ni
+        # una vez en `recipients`, sobre 54 destinatarios distintos.
+        #
+        # Se calcula APARTE de `roster` aunque hoy coincidan, y no es ceremonia: la
+        # coincidencia es una propiedad del vocabulario actual, no una identidad.
+        # El día que el parser tome sus destinatarios de otra fuente, esta columna
+        # sigue siendo cierta y la otra no.
+        enrutable_de = {r: any(n in lp.CANON for n in ns)
+                        for r, ns in nombres_de.items()}
         for rol in filas[:25]:
-            al = alias_de.get(rol, [])
+            ns = sorted(nombres_de.get(rol, set()))
             cur = con.execute("SELECT COUNT(*) n FROM cursors WHERE agent=?",
                               (rol,)).fetchone()["n"]
             correo = 0
-            if al:
-                marcas = ",".join("?" * len(al))
+            if ns:
+                marcas = ",".join("?" * len(ns))
                 correo = con.execute(
                     f"SELECT COUNT(*) n FROM recipients WHERE lower(who) IN ({marcas})",
-                    tuple(x.lower() for x in al)).fetchone()["n"]
-            si = lambda b: "sí" if b else "no"          # noqa: E731
+                    tuple(ns)).fetchone()["n"]
             out.append(f"   {rol:<24}{si(rol in roster):<8}{si(rol in alias):<11}"
                        f"{si(rol in jer):<11}{si(rol in roster or rol in alias):<10}"
+                       f"{si(enrutable_de.get(rol)):<11}"
                        f"{si(cur):<8}{si(correo):<8}UNCLASSIFIED")
         if len(filas) > 25:
             out.append(f"   … y {len(filas) - 25} fila(s) más sin listar "
@@ -3867,9 +3893,16 @@ def doctor(dias: int = Query(7, ge=1, le=90)):
         sin_gobierno = len((roster | alias) - jer)
         inejecutable = len(jer - (roster | alias))
         deriva = len(roster ^ alias)
+        mudos = sorted(r for r in (roster | alias)
+                       if not enrutable_de.get(r))
         out.append(f"   patologías: {sin_gobierno} identidad(es) sin gobierno · "
                    f"{inejecutable} rol(es) sin identidad (no pueden recibir "
-                   f"trabajo) · {deriva} en deriva roster↔org_alias")
+                   f"trabajo) · {deriva} en deriva roster↔org_alias · "
+                   f"{len(mudos)} RESUELVEN PERO NO SON ENRUTABLES")
+        if mudos:
+            out.append(f"   🔴 resuelve=sí + enrutable=no → {', '.join(mudos[:6])}: su "
+                       f"bandeja contesta, pero `→ <nombre>` en un ledger NO les "
+                       f"entrega nada. El correo dirigido a ellos se PIERDE.")
         out.append("   El tipo lo adjudica el operador — esto encuentra, no "
                    "clasifica, y un alias no implica scope.")
         # El aviso que impide que un cero se lea como una garantía que el sistema
