@@ -42,7 +42,11 @@ services:
       # Vacío por defecto a propósito, mismo patrón que LLMINBOX_LEDGERS — quien
       # clone esto no se encuentra un feature encendido sin haberlo montado.
       LLMINBOX_CARRILES: "${LLMINBOX_CARRILES:-}"
-      LLMINBOX_MOUNTS_JSON: "${LLMINBOX_MOUNTS_JSON:-}"
+      # Deja de ser opcional-externo: `llmi up` SIEMPRE lo deja en `/state`, así
+      # que la composición publicada puede —y debe— apuntar ahí. Con el default
+      # vacío, `_cargar_carriles()` devolvía {} aunque el fichero estuviera
+      # montado: la variable no señalaba a ninguna parte y nadie lo veía.
+      LLMINBOX_MOUNTS_JSON: /state/mounts.json
       # Fuente FIRMADA del censo (①/② — review×3 2026-08-10, MAJOR code): la
       # unión de `canon_identidad()` prefiere `roles-por-alias.json` a
       # `roster.json` cuando está montado, porque los dos pueden divergir sin

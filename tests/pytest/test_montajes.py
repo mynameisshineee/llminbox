@@ -330,3 +330,88 @@ def test_la_composicion_publicada_no_monta_el_checkout():
     assert not culpables, (
         "la composición publicada monta el CHECKOUT ENTERO en el contenedor: "
         + ", ".join(culpables))
+
+
+# Estado que produce `llmi up` DENTRO del repo. Estas variables no pueden quedar
+# a merced del override: si el propio `up` deja el fichero, la composición
+# publicada tiene que saber dónde está. Las demás (p. ej. `LLMINBOX_CARRILES`,
+# que apunta a una ruta del host fuera del repo) sí son externas y se interpolan.
+#
+# La distinción no se puede inferir del texto — se declara aquí, que es donde se
+# puede discutir.
+ESTADO_INTERNO = ("LLMINBOX_ROSTER", "LLMINBOX_MOUNTS_JSON")
+
+
+def _env_publicado(texto: str):
+    """`CLAVE: valor` del bloque `environment:` de la composición publicada."""
+    dentro = False
+    for ln in texto.splitlines():
+        if re.match(r"\s*environment\s*:\s*$", ln):
+            dentro = True
+            continue
+        if dentro:
+            if ln.strip() and not ln.startswith(" " * 6):
+                dentro = False
+                continue
+            m = re.match(r'\s+([A-Z_][A-Z0-9_]*)\s*:\s*"?([^"\n#]*)"?\s*$', ln)
+            if m:
+                yield m.group(1), m.group(2).strip()
+
+
+def test_ninguna_ruta_de_entorno_apunta_donde_no_hay_nada_montado():
+    """El guarda de la clase, no del caso.
+
+    `llmi up` empezó a dejar el mapa de montajes en `/state/mounts.json` y la
+    composición publicada seguía con `LLMINBOX_MOUNTS_JSON` vacío por defecto:
+    `_cargar_carriles()` devolvía {} aunque el fichero estuviera ahí. La variable
+    no señalaba a ninguna parte y **nadie lo veía**, porque un mapa de carriles
+    vacío degrada en silencio.
+
+    La propiedad general: toda ruta ABSOLUTA fijada en la composición publicada
+    tiene que caer dentro de algún destino montado. Las interpolaciones
+    (`${VAR:-}`) se saltan: su valor lo pone el override, que no está versionado.
+
+    FALSADOR: dejar `LLMINBOX_MOUNTS_JSON` vacío, o apuntarlo a `/mounts.json`
+    sin montar nada ahí, pone esto rojo con el nombre de la variable."""
+    texto = (RAIZ / "docker-compose.yml").read_text()
+    destinos = [d for _, d in _montajes(texto)] + ["/data"]
+    huerfanas = []
+    for clave, valor in _env_publicado(texto):
+        if not valor.startswith("/") or "${" in valor:
+            continue
+        if not any(valor == d or valor.startswith(d.rstrip("/") + "/") for d in destinos):
+            huerfanas.append(f"{clave}={valor}")
+    assert not huerfanas, (
+        "variables de entorno que apuntan donde no hay nada montado — el servicio "
+        f"degrada en silencio: {huerfanas}  (destinos montados: {sorted(set(destinos))})")
+
+
+def test_el_lector_de_entorno_ve_de_verdad():
+    """CONTROL: si `_env_publicado` no leyera nada, el test de arriba pasaría
+    siempre. Verde por no mirar, otra vez."""
+    claves = dict(_env_publicado((RAIZ / "docker-compose.yml").read_text()))
+    assert "LLMINBOX_ROSTER" in claves, claves
+    assert claves["LLMINBOX_ROSTER"].startswith("/"), claves
+
+
+def test_el_estado_que_produce_llmi_up_no_queda_a_merced_del_override():
+    """El agujero que dejó vivo el guarda anterior, y que CodeRabbit encontró:
+    `llmi up` empezó a dejar el mapa de montajes en `/state/mounts.json` y la
+    composición publicada seguía con `LLMINBOX_MOUNTS_JSON: "${...:-}"`. Una
+    interpolación VACÍA apunta a ninguna parte, así que `_cargar_carriles()`
+    devolvía {} con el fichero montado delante — y un mapa de carriles vacío
+    degrada en SILENCIO.
+
+    El guarda de rutas huérfanas no lo veía porque salta las interpolaciones, y
+    saltarlas es correcto para las variables genuinamente externas. La diferencia
+    hay que DECLARARLA: lo que `llmi up` produce dentro del repo no puede depender
+    de un fichero que no está versionado.
+
+    FALSADOR: devolver cualquiera de las dos a `"${VAR:-}"` pone esto rojo."""
+    valores = dict(_env_publicado((RAIZ / "docker-compose.yml").read_text()))
+    for clave in ESTADO_INTERNO:
+        v = valores.get(clave, "")
+        assert v and not v.startswith("${") and v.startswith("/"), (
+            f"{clave}={v!r} — `llmi up` produce ese fichero dentro del repo, así que "
+            "la composición PUBLICADA tiene que decir dónde está. Con una "
+            "interpolación vacía el servicio degrada sin un solo error.")
