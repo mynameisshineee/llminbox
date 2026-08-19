@@ -3241,14 +3241,46 @@ def organigrama():
     jerarquía vacía en silencio sería peor que no tener endpoint: el agente
     leería «no reporto a nadie», que es lo contrario de la verdad.
     """
-    j = lp.JERARQUIA
+    # Se relee la fuente EN CADA PETICIÓN (§4.3 de la spec del Agent OS). No es
+    # celo: el 2026-08-18 este endpoint sirvió 15 roles de hacía dos días porque
+    # la jerarquía se cargaba al importar y el mount de fichero único apuntaba a
+    # un inodo borrado. `stale=False` sólo se puede afirmar habiendo LEÍDO la
+    # fuente en esta misma petición y coincidiendo el hash — cualquier otra cosa
+    # (ilegible, distinta, no montada) es rancio y se dice.
+    # TODO sale de la MISMA instantánea. Volver a mirar los globales aquí reabre la
+    # carrera que el cerrojo cierra: otra petición puede recargar entre medias y se
+    # serviría el hash de una revisión con la jerarquía de otra.
+    est = lp.refrescar_organigrama()
+    fresco = (est["source_sha256"] is not None
+              and est["source_sha256"] == est["loaded_sha256"])
+    base = {"revision": est["revision"],
+            "source_sha256": est["source_sha256"],
+            "loaded_sha256": est["loaded_sha256"],
+            # Sin carga válida, `null`. Caer a `ARRANCADO_EN` publicaba la hora de
+            # arranque del proceso como si fuera la del organigrama: un sello que
+            # afirma una carga que no ocurrió — la mentira exacta que esta rama
+            # vino a quitar, cometida en el campo que la mide.
+            "cargado_en": est["cargado_en"],
+            "stale": not fresco}
+    j = est["jerarquia"]
     if not j:
-        return {"jerarquia": {}, "roles": 0, "cargado_en": ARRANCADO_EN,
+        return {**base, "jerarquia": {}, "roles": 0,
                 "aviso": "jerarquía NO montada (LLMINBOX_ROLES_ALIAS vacío o "
                          "ilegible) — esto NO significa que no reportes a nadie, "
                          "significa que este servicio no lo sabe. Fuente en prosa: "
                          "_shared_refs/ORGANIGRAMA.md"}
-    return {"jerarquia": j, "roles": len(j), "cargado_en": ARRANCADO_EN, "aviso": None}
+    if not fresco:
+        # Se sirve lo último bueno: una jerarquía vacía haría leer «no reporto a
+        # nadie», que es lo contrario de la verdad. Pero marcada, que es lo que
+        # faltaba — el fallo no fue servir viejo, fue servirlo como bueno.
+        return {**base, "jerarquia": j, "roles": len(j),
+                "aviso": "organigrama RANCIO: no pude leer la fuente firmada en "
+                         "esta petición, así que esto es lo último que cargué y no "
+                         "puedo afirmar que siga vigente. Revisa el montaje "
+                         "(LLMINBOX_ROLES_ALIAS) — un bind-mount de FICHERO se "
+                         "rompe si el host lo reemplaza por rename; monta el "
+                         "DIRECTORIO."}
+    return {**base, "jerarquia": j, "roles": len(j), "aviso": None}
 
 
 @app.get("/claims", dependencies=GATE)
