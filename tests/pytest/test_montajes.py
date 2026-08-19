@@ -23,8 +23,8 @@ acuerde; un test falla solo cuando alguien no se acuerda.
 """
 from __future__ import annotations
 
-import json
 import re
+import shutil
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parents[2]
@@ -257,7 +257,6 @@ def test_el_generador_no_introduce_mounts_de_fichero_de_CONFIG(tmp_path):
 
     FALSADOR: que el generador emita `- ./roster.json:/censo.json:ro` pone esto
     rojo — y ése es exactamente el montaje que rompió el organigrama."""
-    import shutil
     import subprocess
     repo, casa = tmp_path / "repo", tmp_path / "home"
     repo.mkdir()
@@ -298,7 +297,6 @@ def test_el_riesgo_aceptado_sigue_cubriendo_algo_real(tmp_path):
 
     FALSADOR: cuando los ledgers dejen de montarse como fichero —que es el
     objetivo— esto se pone rojo y obliga a RETIRAR la entrada."""
-    import shutil
     import subprocess
     repo, casa = tmp_path / "repo", tmp_path / "home"
     repo.mkdir()
@@ -440,7 +438,6 @@ def test_si_el_estado_no_se_puede_preparar_NO_se_levanta_el_contenedor(tmp_path)
 
     FALSADOR: quitar los `|| exit 1` deja rc=0 (o el de docker) y, sobre todo,
     hace aparecer la marca — el contenedor se habría levantado."""
-    import shutil
     import subprocess
     repo, casa, binfalso = tmp_path / "repo", tmp_path / "home", tmp_path / "bin"
     for d in (repo, casa, binfalso):
@@ -470,7 +467,6 @@ def test_si_el_estado_no_se_puede_preparar_NO_se_levanta_el_contenedor(tmp_path)
 def _up_hermetico(tmp_path, roster_json, estado_previo=None):
     """`llmi up` con un `docker` FALSO que registra sus argumentos. Devuelve
     (returncode, argumentos_de_docker)."""
-    import shutil
     import subprocess
     repo, casa, binfalso = tmp_path / "repo", tmp_path / "home", tmp_path / "bin"
     for d in (repo, casa, binfalso):
@@ -604,7 +600,6 @@ def test_una_escritura_entre_medir_y_publicar_no_puede_pasar_desapercibida(tmp_p
 
     FALSADOR: volver a `cmp -s "$ROSTER" ...` deja instalado B con «sin cambios»
     anunciado, y las dos aserciones caen."""
-    import shutil
     import subprocess
     repo, casa, binfalso = tmp_path / "repo", tmp_path / "home", tmp_path / "bin"
     for d in (repo, casa, binfalso):
@@ -620,16 +615,34 @@ def test_una_escritura_entre_medir_y_publicar_no_puede_pasar_desapercibida(tmp_p
     (binfalso / "docker").write_text("#!/bin/sh\nexit 0\n")
     (binfalso / "docker").chmod(0o755)
     # `cmp` real primero, y DESPUÉS la escritura ajena: la ventana exacta.
+    #
+    # El contenido va por FICHERO auxiliar, no incrustado en el script: mi primera
+    # versión metía `json.dumps(B)!r` con un `.replace("'", "")` encima y lo que
+    # acababa escrito era `{\"agentes\": ...}` con barras literales — basura, no B.
+    # El test seguía en verde, así que afirmaba reproducir una ventana con un
+    # contenido que nunca escribía. Cazado por CodeRabbit.
+    aux = tmp_path / "roster-B.json"
+    aux.write_text(B)
+    marca = tmp_path / "escritura-ajena-ocurrio"
+    cmp_real = shutil.which("cmp", path="/usr/bin:/bin:/usr/local/bin")
+    assert cmp_real, "no encuentro `cmp` real: el arnés no puede montar la ventana"
     (binfalso / "cmp").write_text(
-        f'#!/bin/sh\n/usr/bin/cmp "$@"\n_rc=$?\n'
-        f'printf %s {json.dumps(B)!r} > "{repo}/roster.json"\nexit $_rc\n'
-        .replace("'", ""))
+        f'#!/bin/sh\n"{cmp_real}" "$@"\n_rc=$?\n'
+        f'cp -f "{aux}" "{repo}/roster.json" && : > "{marca}"\nexit $_rc\n')
     (binfalso / "cmp").chmod(0o755)
 
     r = subprocess.run([str(repo / "llmi"), "up"], cwd=repo,
                        env={"HOME": str(casa),
                             "PATH": f"{binfalso}:/usr/bin:/bin:/usr/sbin:/sbin"},
                        capture_output=True, text=True, timeout=120, check=False)
+    # LA VENTANA TIENE QUE HABER OCURRIDO. Sin esto, un `cmp` falso que fallara en
+    # silencio dejaría el test en verde habiendo probado NADA — que es exactamente
+    # lo que pasaba antes de arreglar el citado.
+    assert marca.exists(), (
+        "la escritura ajena no llegó a ocurrir: el test no reprodujo la ventana y "
+        "no demuestra nada")
+    assert (repo / "roster.json").read_text() == B, (
+        "la fuente no quedó en B: la escritura ajena escribió otra cosa")
     instalado = (repo / ".llminbox-state" / "roster.json").read_text()
     anuncio = "cambió estado" in r.stdout
     assert (instalado != A) == anuncio, (
