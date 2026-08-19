@@ -951,7 +951,7 @@ def test_dos_up_a_la_vez_no_se_pisan_el_sello(tmp_path):
     (repo / "roster.json").write_text(A)
     (repo / ".llmi-mounts.json").write_text("{}")
     (casa / ".llminbox.token").write_text("t")
-    (repo / ".llmi-up.lock").mkdir()          # otro `up` ya está dentro
+    (repo / ".llmi-lifecycle.lock").mkdir()          # otro `up` ya está dentro
     reg = tmp_path / "docker-args.txt"
     (binfalso / "docker").write_text(f'#!/bin/sh\necho "$@" >> "{reg}"\nexit 0\n')
     (binfalso / "docker").chmod(0o755)
@@ -962,4 +962,66 @@ def test_dos_up_a_la_vez_no_se_pisan_el_sello(tmp_path):
     assert r.returncode != 0, "entró con el cerrojo tomado"
     assert "otro `llmi up`" in r.stderr, r.stderr
     assert not reg.exists(), f"invocó a Docker con el cerrojo tomado: {reg.read_text()!r}"
-    assert (repo / ".llmi-up.lock").exists(), "se llevó por delante el cerrojo ajeno"
+    assert (repo / ".llmi-lifecycle.lock").exists(), "se llevó por delante el cerrojo ajeno"
+
+
+def test_sin_cerrojo_no_se_toca_NADA_ni_siquiera_el_bootstrap(tmp_path):
+    """El cerrojo tiene que proteger desde el PRIMER write, no desde la parte que
+    parecía peligrosa.
+
+    Con el token/roster/mounts creados fuera del cerrojo, dos `up` en un checkout
+    limpio todavía se pisaban: los dos ven que no hay token, los dos lo generan,
+    uno arranca Docker con el suyo y el disco acaba con el del otro — servicio
+    vivo con credenciales que ya no coinciden con las del cliente. El cerrojo
+    existía y no cubría eso.
+
+    «No conseguí exclusión» tiene que significar «no toqué nada».
+
+    FALSADOR: devolver la toma del cerrojo detrás del bootstrap hace que el token
+    y los ficheros aparezcan aunque el cerrojo esté ocupado."""
+    import subprocess
+    repo, casa, binfalso = tmp_path / "repo", tmp_path / "home", tmp_path / "bin"
+    for d in (repo, casa, binfalso):
+        d.mkdir()
+    for f in ("llmi", "docker-compose.yml", "roster.example.json"):
+        shutil.copy(RAIZ / f, repo / f)
+    (repo / ".llmi-lifecycle.lock").mkdir()        # otro proceso ya está dentro
+    reg = tmp_path / "docker-args.txt"
+    (binfalso / "docker").write_text(f'#!/bin/sh\necho "$@" >> "{reg}"\nexit 0\n')
+    (binfalso / "docker").chmod(0o755)
+    r = subprocess.run([str(repo / "llmi"), "up"], cwd=repo,
+                       env={"HOME": str(casa),
+                            "PATH": f"{binfalso}:/usr/bin:/bin:/usr/sbin:/sbin"},
+                       capture_output=True, text=True, timeout=120, check=False)
+    assert r.returncode != 0, "entró con el cerrojo ocupado"
+    assert not (casa / ".llminbox.token").exists(), "generó token sin exclusión"
+    assert not (repo / "roster.json").exists(), "creó el censo sin exclusión"
+    assert not (repo / ".llmi-mounts.json").exists(), "creó el mapa sin exclusión"
+    assert not (repo / ".llminbox-state").exists(), "creó el estado sin exclusión"
+    assert not reg.exists(), "invocó a Docker sin exclusión"
+    assert (repo / ".llmi-lifecycle.lock").exists(), "se llevó el cerrojo ajeno"
+
+
+def test_build_comparte_el_cerrojo_con_up(tmp_path):
+    """`build` y `up` son operaciones distintas del MISMO ciclo de vida mutable.
+    Un `build` que cambia la imagen mientras un `up` decide qué hacer con ella es
+    la misma carrera con otro disfraz — y `build` ignoraba el cerrojo.
+
+    FALSADOR: quitarle la toma de cerrojo a `build` deja que invoque a Docker con
+    un `up` en marcha."""
+    import subprocess
+    repo, casa, binfalso = tmp_path / "repo", tmp_path / "home", tmp_path / "bin"
+    for d in (repo, casa, binfalso):
+        d.mkdir()
+    for f in ("llmi", "docker-compose.yml", "roster.example.json"):
+        shutil.copy(RAIZ / f, repo / f)
+    (repo / ".llmi-lifecycle.lock").mkdir()
+    reg = tmp_path / "docker-args.txt"
+    (binfalso / "docker").write_text(f'#!/bin/sh\necho "$@" >> "{reg}"\nexit 0\n')
+    (binfalso / "docker").chmod(0o755)
+    r = subprocess.run([str(repo / "llmi"), "build"], cwd=repo,
+                       env={"HOME": str(casa),
+                            "PATH": f"{binfalso}:/usr/bin:/bin:/usr/sbin:/sbin"},
+                       capture_output=True, text=True, timeout=120, check=False)
+    assert r.returncode != 0, "construyó con el ciclo de vida ocupado"
+    assert not reg.exists(), f"invocó a Docker: {reg.read_text()!r}"
