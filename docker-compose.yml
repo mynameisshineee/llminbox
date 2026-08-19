@@ -70,9 +70,20 @@ services:
       #    contenedor sirvió DOS DÍAS el censo viejo, sin un solo error. Un mount
       #    de directorio rehace la resolución del nombre en cada `open()`.
       #
-      # Se monta en `/repo` y de sólo lectura: el contenedor ya lleva el código,
-      # así que esto no ensancha nada — sólo da acceso a los ficheros de estado
-      # que el host edita en vivo (`roster.json`, `.llmi-mounts.json`).
+      # ⚠️ DEUDA DECLARADA, no solución final. Montar el checkout entero SÍ
+      #    ENSANCHA el perímetro de lectura del proceso: le da acceso a `.git`,
+      #    a los backups `*.bak-*`, a los overrides y a cualquier estado local que
+      #    la imagen no llevaba. Que sea `:ro` limita la escritura, no la lectura.
+      #
+      #    Lo correcto es un directorio DEDICADO —`.llminbox-state/` con
+      #    `roster.json` y `mounts.json` dentro, montado solo— y así queda anotado
+      #    para v0.3.1. No se hace hoy porque `roster.json` está referenciado desde
+      #    seis sitios de código, README, SECURITY y `llmi init`, y lo tocan otras
+      #    sesiones: moverlo a la una de la mañana, en la misma tanda que el
+      #    hotfix del organigrama, cambia un riesgo conocido por uno nuevo.
+      #
+      #    Se acepta a sabiendas y se escribe. Lo que NO se hace es decir que no
+      #    ensancha nada, que era lo que ponía aquí.
       - .:/repo:ro
     healthcheck:
       # Mira el CUERPO de /health, no solo el código HTTP: con el indexador
