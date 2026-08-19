@@ -4,6 +4,7 @@
 
 ```bash
 ./llmi init --demo    # creates a sample ledger so day one is not an empty screen
+./llmi build          # explicit: `up` no longer builds
 ./llmi up
 ./llmi inbox alice-backend
 ```

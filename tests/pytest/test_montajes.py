@@ -708,3 +708,48 @@ def test_up_con_build_lo_anuncia_como_operacion_que_corta(tmp_path):
     assert "compose build" in txt, f"`--build` no construyó: {txt!r}"
     assert "--no-build" in txt, f"el `up` posterior no lleva --no-build: {txt!r}"
     assert "PUEDE recrear" in r.stdout, "construyó sin avisar de que puede cortar la bandeja"
+
+
+DOCS_CON_QUICKSTART = ("README.md", "CONTRIBUTING.md")
+
+
+def test_la_documentacion_no_promete_que_up_construya():
+    """La interfaz no puede prometer una propiedad que los bytes ya no cumplen.
+
+    El Quick Start decía `./llmi up  # builds and starts the container`. Desde que
+    `up` lleva `--no-build`, eso es FALSO: en un checkout limpio el usuario sigue
+    la documentación al pie de la letra y su primer `up` no tiene imagen que
+    arrancar. Es el mismo antipatrón que este repo lleva la sesión entera
+    quitando, sólo que en la puerta de entrada.
+
+    Se comprueba lo que el código HACE contra lo que la documentación DICE, no la
+    documentación contra sí misma.
+
+    FALSADOR: devolver `--build` al `up` sin tocar el README —o al revés— pone
+    esto rojo."""
+    up_construye = "--no-build" not in (RAIZ / "llmi").read_text()
+    for nombre in DOCS_CON_QUICKSTART:
+        ruta = RAIZ / nombre
+        if not ruta.exists():
+            continue
+        texto = ruta.read_text()
+        # SÓLO líneas de COMANDO, no prosa. La primera versión de este guarda
+        # marcaba mi propia frase explicativa (`./llmi build && ./llmi up`) como
+        # si prometiera que `up` construye: un guarda con falso positivo se
+        # desactiva a la semana, y entonces no guarda nada.
+        promete = [ln for ln in texto.splitlines()
+                   if ln.strip().startswith(("./llmi up", "llmi up"))
+                   and "build" in ln.lower() and "--build" not in ln
+                   and "WITHOUT rebuilding" not in ln]
+        assert bool(promete) == up_construye, (
+            f"{nombre} y `llmi` no dicen lo mismo sobre si `up` construye "
+            f"(código construye={up_construye}): {promete}")
+        if not up_construye:
+            # También como LÍNEA DE COMANDO: la prosa que explica la separación
+            # contiene «llmi build» y hacía pasar la aserción aunque el Quick
+            # Start lo hubiera perdido. Lo que tiene que poder copiar quien llega
+            # es el comando, no la explicación.
+            assert any(ln.strip().startswith(("./llmi build", "llmi build"))
+                       for ln in texto.splitlines()), (
+                f"{nombre} no enseña `llmi build` como comando, así que quien "
+                "siga el Quick Start no tendrá imagen que arrancar")
