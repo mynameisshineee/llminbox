@@ -198,9 +198,9 @@ Por qué importa, y no es purismo: si un `role` puede tomar el lease, el fencing
 
 **Falsador F-P2 (control negativo)** — un principal `type=agent` con contrato válido, `lifecycle=active` y `can_claim_jobs=1` **sí** reclama. Sin este control, F-P1 pasaría con un sistema que deniega a todo el mundo.
 
-**Falsador F-A3** — un `alias` de `backend#03` reclama un job de `backend` ⇒ **se concede**, y la fila de `job_leases` sale a nombre de `backend#03`, **no** del alias. Sin la canonicalización, el alias recibe un 409 y la spec dice una cosa mientras el sistema hace otra.
+**Falsador F-AL1** — un `alias` de `backend#03` reclama un job de `backend` ⇒ **se concede**, y la fila de `job_leases` sale a nombre de `backend#03`, **no** del alias. Sin la canonicalización, el alias recibe un 409 y la spec dice una cosa mientras el sistema hace otra.
 
-**Falsador F-A4** — un `alias` que apunta a un `role` (no a un `agent`) intenta reclamar ⇒ `409`. Es el que impide que la canonicalización se convierta en un rodeo para que un rol reclame.
+**Falsador F-AL2** — un `alias` que apunta a un `role` (no a un `agent`) intenta reclamar ⇒ `409`. Es el que impide que la canonicalización se convierta en un rodeo para que un rol reclame.
 
 **Falsador F-P4** — `backend#03` (agente de `backend`, con alcance en el proyecto) intenta reclamar un job cuyo `owner_role` es `db-migrations` ⇒ `409`. Sin él, «un agente ejecuta en nombre de UN rol» es una frase: el alcance por proyecto no acota el rol, y cualquier agente del proyecto podría tomar cualquier job de él.
 
@@ -297,6 +297,46 @@ scope: organization              # organization | policy | project
 ```
 contenido cambia → hash cambia → la aprobación deja de aplicar
 ```
+
+### `source_revision` ≠ `active_org_revision`
+
+La propiedad que faltaba no es «rehashear el filesystem en cada claim» — eso pondría la lectura de `roles-por-alias.json` y de todo `generated/` en el camino caliente de cada reclamo, y además ataría la autoridad de la empresa a lo que haya en disco **ahora**: bastaría con que alguien empezara a editar una fuente todavía sin aprobar para que **nadie** pudiera reclamar trabajo. Un editor de texto abierto no puede ser un incidente.
+
+La separación correcta es entre **lo que hay** y **lo que gobierna**:
+
+```
+source nueva
+   ↓ compile
+generated
+   ↓ attest          (fuente + artefactos + compilador, juntos)
+revisión aprobada
+   ↓ activate        (atómico)
+active_org_revision  ←──── el work plane consume SÓLO esto
+```
+
+Con una revisión 43 en disco mientras la 42 sigue siendo la última atestada:
+
+```
+source_revision      = 43
+active_org_revision  = 42
+
+→ /organigrama informa pending · unattested · drift
+→ los claims siguen gobernados por la 42
+→ NADIE obtiene autoridad de la 43
+```
+
+Y al revés, el caso en que **sí** hay que parar: si la proyección **activa** no se puede demostrar contra su atestación —artefacto editado, hash que no cuadra— entonces **fail closed y no hay claim**. La diferencia importa: una fuente nueva sin atestar es trabajo en curso; una activa que no se sostiene es corrupción.
+
+```sql
+CREATE TABLE org_activation (             -- una sola fila, la verdad del work plane
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  active_org_revision INTEGER NOT NULL REFERENCES org_attestations(org_revision),
+  activated_at_epoch INTEGER NOT NULL);
+```
+
+**Falsador F-A3** — dejar una revisión 43 sin atestar en disco: los claims siguen concediéndose bajo la 42, y `/organigrama` la reporta `pending`. Si los claims paran, la autoridad está atada al disco y no a lo activado.
+
+**Falsador F-A4** — editar un byte de un artefacto de la revisión **activa**: el claim siguiente falla cerrado.
 
 Un compilado cuya fuente no tiene atestación vigente **no se despliega**: el control plane arranca con la última revisión atestada y avisa; nunca con contenido sin aprobar. Esto sustituye a `gate_delegado_por: ALBERT` como mecanismo — la delegación de gate pasa a ser **una concesión permanente registrada una vez** (§6.4), no una dependencia del operador en cada aprobación.
 
@@ -521,7 +561,13 @@ BEGIN IMMEDIATE;
 -- Se resuelve UN SALTO, no una cadena: `aliases_of` apuntando a otro alias es un
 -- ciclo esperando a existir, y el compilador del Org SoT (§4) ya rechaza esa
 -- forma. Si tras el salto no hay un `agent`, se rechaza explícitamente.
-canonico = SELECT COALESCE(p.aliases_of, p.id) FROM principals p WHERE p.id = :principal;
+-- LA REVISIÓN QUE GOBIERNA, leída UNA vez y usada en todo el bloque. No se
+-- rehashea nada del filesystem aquí: `active_org_revision` ya es el resultado de
+-- haber verificado fuente + artefactos + compilador en la ACTIVACIÓN (§5).
+activa = SELECT active_org_revision FROM org_activation WHERE singleton = 1;
+
+canonico = SELECT COALESCE(p.aliases_of, p.id) FROM principals p
+            WHERE p.id = :principal AND p.org_revision = activa;
 if canonico is None:
     ROLLBACK; return 409 unknown_principal
 
@@ -545,9 +591,15 @@ SELECT id FROM jobs
    AND project_id = :project
    AND owner_role = :role
    AND id NOT IN (SELECT job_id FROM job_dependencies WHERE satisfied = 0)
-    AND EXISTS (SELECT 1 FROM principal_scopes ps          -- §6: aislamiento EJECUTABLE
+    -- TODO dato organizativo que participe en autorización va atado a la revisión
+   -- ACTIVA, no a la última que exista. Sin esto se puede activar la 43 y seguir
+   -- concediendo por una fila de alcance de la 42 que nadie retiró: la
+   -- reorganización se aplicaría a medias, y la mitad que no se aplica es
+   -- justamente la que otorga permisos.
+   AND EXISTS (SELECT 1 FROM principal_scopes ps          -- §6: aislamiento EJECUTABLE
                 WHERE ps.principal_id = canonico
-                  AND ps.project_id   = jobs.project_id)
+                  AND ps.project_id   = jobs.project_id
+                  AND ps.org_revision = activa)
    -- Y LA ADMISIÓN AL WORK PLANE, EN LA MISMA TRANSACCIÓN. El alcance dice a QUÉ
    -- proyectos, no SI puede reclamar: un principal deshabilitado o un `role` que
    -- conserve su fila de alcance reclamaría igual. La invariante de §3 vive aquí
@@ -558,7 +610,8 @@ SELECT id FROM jobs
                   AND p.type           = 'agent'        -- §3: un rol NO ejecuta
                   AND p.lifecycle      = 'active'
                   AND p.can_claim_jobs = 1
-                  AND p.role_id        = jobs.owner_role)  -- EN NOMBRE DE QUIÉN
+                  AND p.role_id        = jobs.owner_role   -- EN NOMBRE DE QUIÉN
+                  AND p.org_revision   = activa)
  ORDER BY priority DESC, created_at ASC
  LIMIT 1;
 
@@ -586,9 +639,13 @@ if row is None:
 
 gen = row.lease_generation                  -- la generación REAL, capturada
 
+-- El lease REGISTRA bajo qué revisión se autorizó. No se congela el JOB a una
+-- revisión vieja —una reorganización debe afectar a quién está autorizado AHORA—,
+-- pero después se puede demostrar «backend#03 reclamó esto bajo la org rev 42».
+-- Congelar el job perdería lo primero; no registrar nada perdería lo segundo.
 INSERT INTO job_leases (job_id, principal_id, lease_generation,
-                        claimed_at_epoch, expires_at_epoch, ttl_seconds)
-VALUES (elegido.id, canonico, gen, :now_epoch, :now_epoch + :ttl_seconds, :ttl_seconds);
+                        claimed_at_epoch, expires_at_epoch, ttl_seconds, org_revision)
+VALUES (elegido.id, canonico, gen, :now_epoch, :now_epoch + :ttl_seconds, :ttl_seconds, activa);
 
 COMMIT;
 ```
@@ -795,12 +852,21 @@ en cualquier otro caso ⇒ 409, y el job NO transiciona
 Y hay que decir **cómo se calcula un lease que sigue vivo**, porque `released_at − claimed_at` sobre un lease activo da NULL y lo excluye del sumatorio en silencio:
 
 ```
-Σ ( COALESCE(released_at_epoch, min(now_epoch, expires_at_epoch)) − claimed_at_epoch ) / 3600.0
-                                                                     ^^^^^^^^^^
-                          la resta da SEGUNDOS, y la métrica se llama agent-HORA
+Σ ( min( COALESCE(released_at_epoch, now_epoch), expires_at_epoch ) − claimed_at_epoch ) / 3600.0
+      ^^^                                              ^^^^^^^^^^^^^^^^      ^^^^^^^^
+      el tope se aplica SIEMPRE, no sólo a los vivos                 la resta da SEGUNDOS
 ```
 
-La división por 3.600 no es cosmética: sin ella el denominador va inflado ×3.600 y `accepted_jobs / agent-hour` sale mil veces menor de lo que es. Un North Star con un factor constante mal puesto no se detecta comparándolo consigo mismo — sólo cuando alguien intenta contrastarlo con la realidad, meses después.
+El tope va **fuera** del `COALESCE`, y eso es lo que arregla el caso que la versión anterior regalaba: si una transición terminal ocurre **después** de que el lease expirara pero antes de que el watchdog pase, `released_at_epoch` queda posterior a `expires_at_epoch` y se contabiliza tiempo que el lease ya no sostenía. Con el tope sólo sobre la rama viva, ese hueco quedaba abierto justo cuando el sistema va con retraso, que es cuando más importa.
+
+La propiedad correspondiente en la escritura, que es la otra mitad:
+
+```
+released_at_epoch <= expires_at_epoch        -- invariante
+toda liberación escribe  min(now_epoch, expires_at_epoch)
+```
+
+La división por 3.600 no es cosmética: sin ella el denominador va inflado ×3.600 y `accepted_jobs / agent-hour` sale **3.600 veces** menor de lo que es. Un North Star con un factor constante mal puesto no se detecta comparándolo consigo mismo — sólo cuando alguien intenta contrastarlo con la realidad, meses después.
 
 Y los dos extremos del otro KPI van también en **epoch INTEGER** (`ready_at_epoch`, `done_at_epoch`): `median(READY → ACCEPTED)` necesita restar, y restar exige una unidad. Con `TEXT` la resta o falla o —peor— coacciona y da un número.
 
@@ -866,7 +932,13 @@ CREATE TABLE org_relations (
 
 CREATE TABLE org_attestations (
   org_revision INTEGER PRIMARY KEY,
-  content_sha256 TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,                -- la FUENTE canónica
+  -- §5 dice que la atestación cubre fuente Y salida Y compilador, y la tabla sólo
+  -- guardaba la fuente: la mitad del contrato no tenía dónde escribirse, así que
+  -- «verificamos los artefactos» era una frase sin respaldo en el esquema.
+  artifacts_json TEXT NOT NULL,                -- {ruta: sha256} canónico
+  artifacts_manifest_sha256 TEXT NOT NULL,     -- hash del propio manifiesto
+  compiler_version TEXT NOT NULL,              -- otro compilador ⇒ otra salida
   approved_by TEXT NOT NULL, approved_at TEXT NOT NULL,
   scope TEXT NOT NULL
 );
@@ -884,7 +956,11 @@ CREATE TABLE principal_scopes (
   principal_id TEXT NOT NULL, project_id TEXT NOT NULL,
   granted_by TEXT NOT NULL,               -- quién lo otorgó: sin esto no es auditable
   granted_at TEXT NOT NULL,
-  PRIMARY KEY (principal_id, project_id));
+  -- REVISIONADO como el resto de lo organizativo. Sin `org_revision` se podía
+  -- activar la 43 y conservar una concesión de proyecto de la 42: la parte de la
+  -- reorganización que NO se aplica sería justamente la que da permisos.
+  org_revision INTEGER NOT NULL,
+  PRIMARY KEY (principal_id, project_id, org_revision));
 
 CREATE TABLE decision_authority (
   principal_id TEXT, decision_class TEXT, level TEXT
@@ -913,7 +989,13 @@ CREATE TABLE jobs (
   lease_generation INTEGER NOT NULL DEFAULT 0,          -- fencing, §10
   acceptance_criteria TEXT NOT NULL,                    -- JSON, no vacío salvo exploratorio
   artifact_contract TEXT NOT NULL, risk_tags TEXT,
-  matched_policy TEXT, required_gates TEXT,             -- los fija el Gate Engine, §7
+  -- §7 EXIGE persistir revisión y bytes de la policy para poder reconstruir por
+  -- qué avanzó un job, y el DDL sólo guardaba el identificador: la afirmación de
+  -- §7 no se podía representar en esta tabla.
+  matched_policy  TEXT    NOT NULL,                    -- los fija el Gate Engine, §7
+  policy_revision INTEGER NOT NULL,
+  policy_sha256   TEXT    NOT NULL,
+  required_gates  TEXT    NOT NULL,
   budget TEXT,
   -- La FK sola prueba que el pack EXISTE, no que sea de ESTE job: `job-A` podía
   -- apuntar al pack de `job-B` y la base lo aceptaba. Se impone la pertenencia
@@ -940,6 +1022,8 @@ CREATE TABLE job_leases (
   expires_at_epoch  INTEGER NOT NULL,
   released_at_epoch INTEGER,                -- NULL = sostenido
   ttl_seconds       INTEGER NOT NULL CHECK (ttl_seconds > 0),
+  org_revision      INTEGER NOT NULL,       -- bajo QUÉ organización se autorizó
+  CHECK (released_at_epoch IS NULL OR released_at_epoch <= expires_at_epoch),
   -- `NOT NULL` no impide 0 ni negativos, y con cualquiera de los dos el lease
   -- nace ya expirado: el watchdog lo desaloja en su primera pasada y el job entra
   -- en un ciclo de claim-y-desalojo que parece contención y es aritmética.
