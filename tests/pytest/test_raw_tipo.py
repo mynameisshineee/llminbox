@@ -517,10 +517,17 @@ def test_el_fallo_de_la_migracion_no_se_lleva_por_delante_la_columna(tmp_path, m
     hallazgo era que el DDL va dentro de la transacción; en esta conexión no va.
 
     Pero la protección es una PROPIEDAD DE LA CONFIGURACIÓN, no del código, y no
-    estaba escrita en ninguna parte. Con `autocommit=False` (el modo PEP 249, que
-    es hacia donde empuja Python) o `isolation_level=None` mal puesto, el hallazgo
-    pasa a ser cierto y el daño es el que describe. Este test ata las dos mitades
-    para que ese cambio se vea aquí y no en `/lint` en producción.
+    estaba escrita en ninguna parte. Con `autocommit=False` (modo PEP 249) el
+    hallazgo pasa a ser cierto. `isolation_level=None` NO reproduce este caso: en
+    LEGACY_TRANSACTION_CONTROL desactiva las transacciones implícitas y deja
+    SQLite en autocommit. Medido, los tres modos:
+
+        isolation_level=''    in_transaction=False · la columna sobrevive
+        isolation_level=None  in_transaction=False · la columna sobrevive
+        autocommit=False      in_transaction=True  · la columna NO sobrevive
+
+    Este test ata las dos mitades para que ese cambio se vea aquí y no en `/lint`
+    en producción.
 
     FALSADOR: cambiar la conexión a `autocommit=False` pone en rojo la aserción
     del modo Y la de la columna.
