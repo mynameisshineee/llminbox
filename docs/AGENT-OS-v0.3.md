@@ -160,10 +160,14 @@ principal:
 | `role` | sí | **no** | **sí, obligatorio** | sí |
 | `agent` | sí | **sí** | vía su `role` | vía su `role` |
 | `service` | sí | no | **no** | **sí, obligatorio** |
-| `alias` | hereda | hereda | hereda | hereda |
+| `alias` | hereda | **no** (ver abajo) | hereda | hereda |
 | `group` | sí | no | no | sí |
 | `project` | sí | no | no | sí |
 | `legacy` | sí | no | no | opcional |
+
+**Un alias no toma un lease COMO alias.** «Hereda» valía para recibir mensajes y para la autoridad, y contradecía «sólo `agent` reclama» en cuanto se leía literalmente: un alias de un agente parecía poder reclamar. Lo que ocurre es otra cosa — el alias **se canonicaliza primero** al principal al que apunta, y el lease queda firmado por ese principal canónico. Nunca hay una fila de `job_leases` a nombre de un alias.
+
+No es formalismo: el fencing, el watchdog y `agent-hour` (§14) cuentan por `principal_id`. Dos alias del mismo agente firmando leases serían dos ejecutores donde hay uno, y la métrica contaría doble el trabajo de un solo proceso.
 
 Con esto desaparece la anomalía semántica: un `group` recibe mensajes sin tener jefe; un `project` es destino lógico sin reclamar trabajo; un `service` opera herramientas sin formar parte del organigrama; un `alias` no tiene autoridad propia, hereda identidad; un `agent` ejecuta un `role`.
 
@@ -193,6 +197,8 @@ Por qué importa, y no es purismo: si un `role` puede tomar el lease, el fencing
 **Falsador F-P1** — un principal `type=service` intenta `POST /jobs/{id}/claim` ⇒ `409`, evento `principal.claim_denied`, y el job permanece `READY`. Si el claim prospera, el modelo de principal no está enforzado y todo lo que se apoya en él (§6, §7, §9) es decorativo.
 
 **Falsador F-P2 (control negativo)** — un principal `type=agent` con contrato válido, `lifecycle=active` y `can_claim_jobs=1` **sí** reclama. Sin este control, F-P1 pasaría con un sistema que deniega a todo el mundo.
+
+**Falsador F-P4** — `backend#03` (agente de `backend`, con alcance en el proyecto) intenta reclamar un job cuyo `owner_role` es `db-migrations` ⇒ `409`. Sin él, «un agente ejecuta en nombre de UN rol» es una frase: el alcance por proyecto no acota el rol, y cualquier agente del proyecto podría tomar cualquier job de él.
 
 **Falsador F-P3** — un principal `type=role`, con contrato válido y activo, intenta `claim` ⇒ `409`. Es el que impide que la separación de §3 se deshaga por la puerta de atrás: sin él, «sólo agent reclama» es una frase del documento y no una propiedad del sistema. Sin este control, F-P1 pasaría con un sistema que deniega a todo el mundo.
 
@@ -519,25 +525,30 @@ SELECT id FROM jobs
                 WHERE p.id = :principal
                   AND p.type           = 'agent'        -- §3: un rol NO ejecuta
                   AND p.lifecycle      = 'active'
-                  AND p.can_claim_jobs = 1)
+                  AND p.can_claim_jobs = 1
+                  AND p.role_id        = jobs.owner_role)  -- EN NOMBRE DE QUIÉN
  ORDER BY priority DESC, created_at ASC
  LIMIT 1;
 
-UPDATE jobs
-   SET status = 'CLAIMED',
-       lease_generation = lease_generation + 1
- WHERE id = :job AND status = 'READY'
-RETURNING lease_generation AS gen;          -- ← la generación REAL, no una inventada
+row = UPDATE jobs
+         SET status = 'CLAIMED',
+             lease_generation = lease_generation + 1
+       WHERE id = :job AND status = 'READY'
+   RETURNING lease_generation;
 
--- EL GUARDA ES CÓDIGO, NO UN COMENTARIO. Si el UPDATE afectó 0 filas, otro worker
--- ganó la carrera entre el SELECT y el UPDATE: no hay nada que arrendar.
-IF changes() = 0 THEN
-    ROLLBACK;
-    RETURN 409;                             -- «otro se lo llevó», no un 500
-END IF;
+-- UN SOLO MECANISMO demuestra que se ganó el claim: la fila devuelta. Si no hay
+-- fila, otro worker ganó la carrera entre el SELECT y el UPDATE y no hay nada que
+-- arrendar. (Nada de `changes()` en paralelo: dos mecanismos para la misma
+-- pregunta es una oportunidad de que discrepen.)
+if row is None:
+    ROLLBACK
+    return 409                              -- «otro se lo llevó», no un 500
 
-INSERT INTO job_leases (job_id, principal_id, lease_generation, claimed_at, expires_at)
-VALUES (:job, :principal, :gen, :now, unixepoch(:now) + :ttl_segundos);
+gen = row.lease_generation                  -- la generación REAL, capturada
+
+INSERT INTO job_leases (job_id, principal_id, lease_generation,
+                        claimed_at_epoch, expires_at_epoch, ttl_seconds)
+VALUES (:job, :principal, gen, :now_epoch, :now_epoch + :ttl_seconds, :ttl_seconds);
 
 COMMIT;
 ```
@@ -561,13 +572,33 @@ El token que se entrega al worker contiene `job_id · principal_id · lease_gene
 `unblock` (§9) sólo cubre `BLOCKED → READY`, que es el bloqueo **deliberado**. Falta el caso que de verdad ocurre solo: un agente muere con el lease tomado, en `CLAIMED` o `RUNNING`. Sin nadie que lo recoja, ese job **no se puede reclamar nunca más** — y no hay error, ni evento, ni nada que lo delate: simplemente deja de avanzar.
 
 ```
-watchdog, en una transacción por lease:
-  leases con expires_at < now  ∧  released_at IS NULL
+watchdog, en una transacción por lease. Las CUATRO condiciones, simultáneas:
+
+  lease.expires_at_epoch  <= now_epoch
+  ∧ lease.released_at_epoch IS NULL
+  ∧ job.status IN ('CLAIMED','RUNNING')                  -- NUNCA un terminal
+  ∧ lease.lease_generation = job.lease_generation        -- sólo el VIGENTE
+
     → job.status = READY
     → job.lease_generation += 1        -- invalida el token del muerto
-    → lease.released_at = min(now, expires_at)
+    → lease.released_at_epoch = min(now_epoch, lease.expires_at_epoch)
     → evento lease.expired
 ```
+
+**Y la invariante general, que es la que hace del watchdog una red y no el mecanismo:**
+
+```
+toda transición que ABANDONE {CLAIMED, RUNNING}
+    → libera el lease vigente EN LA MISMA TRANSACCIÓN
+```
+
+Incluye `RESULT_SUBMITTED`, `BLOCKED`, `FAILED`, `CANCELLED` y `DONE` — todas. El watchdog recupera **workers muertos**; no arregla estados terminales mal persistidos. Si es lo único que sella leases, el estado normal del sistema pasa a ser «leases colgando», y una red que se usa siempre deja de ser una red.
+
+**Las dos condiciones de más no son celo, son la diferencia entre recoger y destruir.** Un job que llegó a `DONE`, `FAILED` o `CANCELLED` puede conservar su lease abierto —porque la transición terminal se olvidó de sellarlo, que es justo el descuido que este watchdog existe para tolerar— y sin el filtro de estado el watchdog lo **resucita a `READY`**: un trabajo ya entregado vuelve a la cola y se hace dos veces. Y sin el filtro de generación, un lease viejo de una ronda anterior desaloja al dueño ACTUAL, que está vivo y trabajando.
+
+Corolario, y va en el servidor: **toda transición terminal libera su lease en la misma transacción**. El watchdog es la red, no el mecanismo — si es lo único que sella leases, entonces el estado normal del sistema es «leases colgando», y una red que se usa siempre deja de ser una red.
+
+**Falsador F-L5** — un job en `DONE` con un lease sin `released_at` y ya expirado: tras pasar el watchdog sigue en `DONE`. Si vuelve a `READY`, el filtro no está.
 
 Tres detalles que no son de forma:
 
@@ -620,7 +651,13 @@ Inmutable, versionado, generado al reclamar.
 
 **Frontera de carril:** el pack de un job del proyecto `P` no incluye material de otro proyecto. `project_id` se deriva de `carriles.tsv`, que ya es el SoT de carriles y no se reinventa.
 
-**Invalidación:** si una dependencia crítica cambia tras generar el pack, `stale = true`; refresco obligatorio antes de acción irreversible.
+**Invalidación:** si una dependencia crítica cambia tras generar el pack, se **INSERTA** su invalidación (§15) y el refresco es obligatorio antes de cualquier acción irreversible. `stale` **no es un campo que se escriba**, es una propiedad **derivada**:
+
+```
+stale(pack) ≡ EXISTS (SELECT 1 FROM context_pack_invalidations WHERE pack_id = pack.id)
+```
+
+Y refrescar **crea otro `context_pack`**, no edita el anterior. Una versión previa de esta línea decía literalmente `stale = true`, que contradice la inmutabilidad de §15: un pack que se marca a sí mismo rancio es un pack que se edita, y entonces «esto es lo que el agente recibió» deja de ser reconstruible — que es la única razón por la que se persiste.
 
 **Falsador F-11.1** — un proyecto con millones de tokens de historia; un job nuevo recibe pack acotado y no la historia. Medido en tokens reales del pack, no en su descripción.
 
@@ -718,7 +755,7 @@ en cualquier otro caso ⇒ 409, y el job NO transiciona
 Y hay que decir **cómo se calcula un lease que sigue vivo**, porque `released_at − claimed_at` sobre un lease activo da NULL y lo excluye del sumatorio en silencio:
 
 ```
-Σ ( COALESCE(released_at, min(now, expires_at)) − claimed_at )
+Σ ( COALESCE(released_at_epoch, min(now_epoch, expires_at_epoch)) − claimed_at_epoch )
 ```
 
 Con dos exigencias que lo hacen calculable: el **instante de corte** de un lease vivo es `min(now, expires_at)` —nunca más allá de su expiración, o un proceso muerto acumularía horas para siempre—, y el **watchdog escribe `released_at`** al expirar (ver §10), de modo que un lease sólo permanece sin sellar mientras de verdad está sostenido.
@@ -749,8 +786,29 @@ CREATE TABLE principals (
   lifecycle TEXT NOT NULL DEFAULT 'active'
     CHECK (lifecycle IN ('proposed','active','disabled','retired')),
   aliases_of TEXT,                           -- si type='alias'
-  org_revision INTEGER NOT NULL
+  -- §3 dice que un `agent` está en el organigrama «vía su role», y esa relación
+  -- no estaba en ninguna columna: sin ella, `backend#03` reclama un job de
+  -- `db-migrations` sin más que pasar `:role=db-migrations`, porque el alcance
+  -- dice a QUÉ proyectos, no EN NOMBRE DE QUIÉN.
+  role_id TEXT REFERENCES principals(id),    -- obligatorio si type='agent', NULL en el resto
+  org_revision INTEGER NOT NULL,
+
+  -- COMBINACIONES IMPOSIBLES, impuestas por la base y no por la prosa. El modelo
+  -- de §3 las prohibía en texto y el DDL las dejaba pasar todas: un `service` con
+  -- can_claim_jobs=1, un `alias` sin `aliases_of`, un `role` con `role_id`, un no
+  -- humano sin responsable. Una tabla que admite estados que el modelo declara
+  -- imposibles convierte cada consulta en una comprobación defensiva.
+  CHECK ((type = 'agent') = (role_id IS NOT NULL)),
+  CHECK ((type = 'alias') = (aliases_of IS NOT NULL)),
+  CHECK ((type = 'human') = (accountable_by IS NULL)),
+  CHECK (can_claim_jobs = 0 OR type = 'agent'),          -- §3: sólo agent reclama
+  CHECK (type <> 'service' OR accountable_by IS NOT NULL)
 );
+-- `role_id` REFERENCES principals(id) sólo garantiza que existe, no que sea un
+-- ROL: SQLite no expresa «FK a las filas con type='role'». Lo valida el compilador
+-- del Org SoT (§4) en la misma pasada de admisión que estos CHECK, y es un fallo
+-- de compilación, no un aviso — un agente que dice actuar en nombre de algo que
+-- no es un rol no se despliega.
 
 CREATE TABLE org_relations (
   principal_id TEXT NOT NULL,
@@ -811,7 +869,11 @@ CREATE TABLE jobs (
   artifact_contract TEXT NOT NULL, risk_tags TEXT,
   matched_policy TEXT, required_gates TEXT,             -- los fija el Gate Engine, §7
   budget TEXT,
-  context_pack_id TEXT REFERENCES context_packs(id),     -- §11: QUÉ contexto recibió
+  -- La FK sola prueba que el pack EXISTE, no que sea de ESTE job: `job-A` podía
+  -- apuntar al pack de `job-B` y la base lo aceptaba. Se impone la pertenencia
+  -- con una FK COMPUESTA contra una clave que incluye el job.
+  context_pack_id TEXT,                                 -- §11: QUÉ contexto recibió
+  FOREIGN KEY (id, context_pack_id) REFERENCES context_packs(job_id, id),
   ready_at TEXT, done_at TEXT,                          -- §14: los dos extremos del KPI
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 
@@ -819,10 +881,19 @@ CREATE TABLE job_dependencies (
   job_id TEXT, depends_on TEXT, satisfied INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (job_id, depends_on));
 
+-- TIEMPOS EN EPOCH INTEGER, TODOS. La versión anterior mezclaba `claimed_at` en
+-- ISO con un `expires_at` calculado en epoch, y luego el watchdog y las métricas
+-- comparaban los dos mundos. Mezclar representaciones temporales DENTRO de una
+-- misma entidad es cómo se cuela una comparación lexicográfica entre un texto y
+-- un número: no falla, da un resultado — y el lease se evapora o no caduca nunca.
 CREATE TABLE job_leases (
-  job_id TEXT NOT NULL, principal_id TEXT NOT NULL,
+  job_id TEXT NOT NULL REFERENCES jobs(id),
+  principal_id TEXT NOT NULL REFERENCES principals(id),
   lease_generation INTEGER NOT NULL,
-  claimed_at TEXT NOT NULL, expires_at TEXT NOT NULL, released_at TEXT,
+  claimed_at_epoch  INTEGER NOT NULL,
+  expires_at_epoch  INTEGER NOT NULL,
+  released_at_epoch INTEGER,                -- NULL = sostenido
+  ttl_seconds       INTEGER NOT NULL,
   PRIMARY KEY (job_id, lease_generation));
 
 -- GOBERNANZA
@@ -830,6 +901,13 @@ CREATE TABLE reviews (
   id TEXT PRIMARY KEY, job_id TEXT NOT NULL, gate TEXT NOT NULL,
   reviewer_principal TEXT, verdict TEXT
     CHECK (verdict IN ('APPROVED','CHANGES_REQUESTED','BLOCKED')),
+  -- UN VEREDICTO SIN ACTOR NI SELLO NO ES UNA DECISIÓN. La tabla admitía
+  -- `verdict='APPROVED'` con `reviewer_principal` y `decided_at` en NULL: una
+  -- aprobación que nadie firmó y que no ocurrió en ningún momento. Es justo lo
+  -- que el audit plane tiene que poder responder —quién y cuándo— y era
+  -- exactamente lo que se podía dejar vacío.
+  CHECK ((verdict IS NULL) = (reviewer_principal IS NULL)),
+  CHECK ((verdict IS NULL) = (decided_at IS NULL)),
   -- LA INVARIANTE 10 EXIGE ESTO Y LA TABLA NO LO TENÍA: un veredicto atado a un
   -- `job_id` aprueba el JOB, no unos BYTES. Entre la aprobación y la entrega el
   -- artefacto puede cambiar, y el APPROVED de ayer se lee como si cubriera lo de
@@ -859,22 +937,30 @@ CREATE TABLE context_packs (
   sources TEXT NOT NULL,                 -- JSON: [{ref, sha256}] — procedencia
   token_count INTEGER NOT NULL,          -- contra el presupuesto de ≤12k
   generated_at TEXT NOT NULL,
-  -- INVALIDACIÓN SIN MUTAR. La versión anterior llevaba `stale INTEGER` y se
-  -- llamaba inmutable: una fila que se edita para marcarse rancia NO es inmutable,
-  -- y además pierde CUÁNDO y POR QUÉ dejó de valer. Aquí la invalidación es un
-  -- HECHO FECHADO, y refrescar CREA otra versión en vez de tocar ésta.
-  invalidated_at TEXT,                   -- NULL = vigente. Se escribe UNA vez.
-  invalidated_by_event TEXT,             -- events.event_id: qué cambió, y cuándo
-  UNIQUE (job_id, pack_version));
+  UNIQUE (job_id, pack_version),
+  UNIQUE (job_id, id));                  -- soporta la FK compuesta desde `jobs`
 
--- La UNIQUE no impide UPDATE ni DELETE, así que el append-only se IMPONE, no se
--- confía: permisos de la conexión de aplicación (sin UPDATE/DELETE sobre esta
--- tabla) más triggers que lo hagan explícito en la propia base.
-CREATE TRIGGER context_packs_no_update BEFORE UPDATE ON context_packs
-  WHEN OLD.invalidated_at IS NOT NULL OR NEW.content_sha256 <> OLD.content_sha256
-  BEGIN SELECT RAISE(ABORT, 'context_packs es append-only'); END;
+-- APPEND-ONLY DE VERDAD: la fila NO SE TOCA NUNCA. Mi versión anterior dejaba
+-- `invalidated_at` en esta tabla y un trigger que sólo abortaba si la fila ya
+-- estaba invalidada o si cambiaba `content_sha256` — o sea que permitía editar
+-- `sources`, `token_count` y `generated_at`, y permitía la PRIMERA invalidación
+-- por UPDATE. Un append-only con una excepción no es un append-only: es una
+-- tabla mutable con una convención, y la convención se rompe sola.
+CREATE TRIGGER context_packs_inmutable BEFORE UPDATE ON context_packs
+  BEGIN SELECT RAISE(ABORT, 'context_packs es append-only: crea otra versión'); END;
 CREATE TRIGGER context_packs_no_delete BEFORE DELETE ON context_packs
   BEGIN SELECT RAISE(ABORT, 'context_packs es append-only'); END;
+
+-- La invalidación pasa a ser un HECHO INSERTADO, no un campo mutado. Vigente =
+-- «no tiene fila aquí». Y así la invalidación conserva su propia procedencia:
+-- cuándo y por qué evento dejó de valer, sin sobrescribir nada.
+CREATE TABLE context_pack_invalidations (
+  pack_id TEXT PRIMARY KEY REFERENCES context_packs(id),
+  invalidated_at TEXT NOT NULL,
+  invalidated_by_event TEXT NOT NULL REFERENCES events(event_id),
+  reason TEXT NOT NULL);                 -- QUÉ dependencia cambió, en claro
+CREATE TRIGGER cpi_no_update BEFORE UPDATE ON context_pack_invalidations
+  BEGIN SELECT RAISE(ABORT, 'la invalidación es un hecho, no se edita'); END;
 
 CREATE TABLE consults (
   id TEXT PRIMARY KEY, job_id TEXT NOT NULL,
@@ -909,7 +995,8 @@ CREATE TABLE idempotency (
   PRIMARY KEY (principal_id, operation, idempotency_key));
 
 CREATE TABLE outbox (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL UNIQUE REFERENCES events(event_id),
   delivered_at TEXT);
 ```
 
@@ -928,13 +1015,40 @@ primera vez                           → estado + event + outbox + fila de idem
                                          en UNA transacción
 ```
 
-Que las cuatro escrituras vayan en la misma transacción es lo que hace que el contrato se sostenga en el caso feo: si el proceso muere entre ejecutar y registrar la respuesta, el reintento no encuentra fila y **vuelve a ejecutar** — que es precisamente lo que la idempotencia promete evitar.
+**Y la concurrencia se serializa con `BEGIN IMMEDIATE`, no con una fila «en curso».** El contrato de arriba, leído como «mira si existe; si no, ejecuta», tiene una carrera que se abre justo en el caso que la idempotencia existe para cubrir —dos reintentos simultáneos, que es lo que pasa cuando un cliente reintenta por timeout mientras la primera petición sigue viva—: **los dos** ven que no hay fila, **los dos** ejecutan, y sólo al final uno choca contra la PK. La mutación ya se hizo dos veces y el error llega tarde.
+
+```
+BEGIN IMMEDIATE                       -- el write lock, desde el principio
+
+buscar (principal_id, operation, idempotency_key)
+
+  existe + mismo request_sha256   → devolver la respuesta persistida
+                                    → NO ejecutar
+
+  existe + hash distinto          → 409 IDEMPOTENCY_KEY_REUSED
+
+  no existe                       → ejecutar la mutación
+                                    → event
+                                    → outbox
+                                    → fila de idempotencia con la respuesta
+COMMIT
+```
+
+El segundo request queda **esperando el write lock**; cuando entra, la primera ya ha commiteado y encuentra la respuesta hecha. No hace falta inventar una fila `PENDING` en v1: el cerrojo ya da la exclusión, y un estado «en curso» añadiría un modo de fallo propio —quién lo limpia si el proceso muere— a cambio de nada que el cerrojo no dé ya.
+
+**Falsador F-I3 (concurrente, obligatorio)** — **20** peticiones simultáneas con la misma clave y el mismo cuerpo ⇒ **una** mutación, **un** event, **una** fila de outbox y **20 respuestas idénticas**. Es el único de los tres que se pone rojo con la versión «comprobar y luego ejecutar»: F-I1 y F-I2 pasan secuencialmente con la carrera abierta, y por eso dos falsadores en verde no bastaban.
 
 **Falsador F-I1** — enviar dos veces la misma mutación con la misma clave y el mismo cuerpo: la segunda devuelve **el mismo status y el mismo payload** que la primera, y `events` no crece. Si la segunda devuelve `409` o un error de restricción, hay UNIQUE pero no idempotencia.
 
 **Falsador F-I2** — misma clave, cuerpo distinto ⇒ `409 IDEMPOTENCY_KEY_REUSED`, y **no** se ejecuta la segunda.
 
+**`PRAGMA foreign_keys = ON` en CADA conexión, y es parte del contrato de inicialización.** SQLite las trae **desactivadas por defecto**: sin este pragma, todos los `REFERENCES` de arriba son documentación. Un `jobs.context_pack_id` apuntando a un pack inexistente se inserta sin protestar, y la referencia que hace verificable «qué contexto recibió este job» deja de verificar nada. No es una opción de despliegue — una conexión sin el pragma sirve un modelo de datos distinto del que esta sección describe.
+
+**Falsador F-DB1** — insertar un `jobs.context_pack_id` que no existe en `context_packs` ⇒ la base lo rechaza. Con el pragma apagado, esa inserción pasa: el falsador mide el pragma tanto como la FK.
+
 **Sin event-sourcing completo en v1:** `jobs` es el estado actual, `events` es cómo se llegó. El log sirve para auditoría, depuración, analítica y provenance, no para reconstruir el sistema.
+
+**`outbox.event_id` es UNIQUE, y eso garantiza MENOS de lo que parece.** Garantiza **una sola fila de outbox por evento** — sin ello, un reintento del productor encolaba el mismo evento dos veces y la notificación salía duplicada aunque la mutación fuera idempotente. Lo que **NO** garantiza es entrega *exactly-once* al exterior: entre marcar `delivered_at` y que el destinatario acuse hay una ventana que ninguna base cierra. La entrega externa es **at-least-once** por diseño, y **el consumidor deduplica por `event_id`**. Decirlo aquí es parte del contrato: un consumidor que asuma exactly-once construirá sobre una garantía que este sistema no da.
 
 **Outbox transaccional:** toda mutación que requiera notificación externa escribe estado + evento + outbox **en la misma transacción**. Nunca «actualizo y luego envío».
 
