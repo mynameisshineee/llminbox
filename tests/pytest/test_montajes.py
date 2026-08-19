@@ -651,3 +651,60 @@ def test_una_escritura_entre_medir_y_publicar_no_puede_pasar_desapercibida(tmp_p
     assert instalado == A, (
         "publicó bytes que nunca midió: la escritura ajena entró entre la medida y "
         "la publicación")
+
+
+def test_up_no_construye_y_build_es_una_decision_aparte(tmp_path):
+    """BUILD ≠ UP ≠ STATE, y el shadow del PR #11 demostró por qué hace falta.
+
+    `llmi up` hacía `docker compose up -d --build`, y dos `up` idénticos sin tocar
+    nada producían IMÁGENES DISTINTAS. Una imagen nueva hace que Compose recree el
+    contenedor, así que `llmi up` cortaba la bandeja de la flota SIEMPRE — y el
+    gate de estado, aun siendo correcto, era impotente: no anunciaba recreate y el
+    recreate ocurría igual.
+
+    No basta con quitar `--build`: `docker compose up` construye por su cuenta los
+    servicios con `build:` si no encuentra imagen. `--no-build` es lo único que lo
+    GARANTIZA.
+
+    Consecuencia buscada, no evitada: cambiar `servicio.py` y hacer sólo `llmi up`
+    ya no despliega el código nuevo. Hay que pedir `llmi build`. El despliegue pasa
+    a ser una acción explícita en vez de un efecto secundario de «asegúrate de que
+    está levantado».
+
+    FALSADOR: devolver `--build` al `up` hace que aparezca en los argumentos y que
+    `--no-build` desaparezca."""
+    r, args = _up_hermetico(tmp_path, A, estado_previo=A)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "--no-build" in args, f"`up` puede construir: {args!r}"
+    assert "compose build" not in args, f"`up` construyó sin que se lo pidieran: {args!r}"
+    assert "--force-recreate" not in args, args
+
+
+def test_up_con_build_lo_anuncia_como_operacion_que_corta(tmp_path):
+    """`--build` explícito sigue disponible, pero DICE lo que hace. Esconder otra
+    vez la construcción dentro del `up` normal sería reintroducir el defecto con
+    otro nombre.
+
+    FALSADOR: construir en silencio deja el aviso fuera y esto se pone rojo."""
+    import shutil
+    import subprocess
+    repo, casa, binfalso = tmp_path / "repo", tmp_path / "home", tmp_path / "bin"
+    for d in (repo, casa, binfalso):
+        d.mkdir()
+    for f in ("llmi", "docker-compose.yml", "roster.example.json"):
+        shutil.copy(RAIZ / f, repo / f)
+    (repo / "roster.json").write_text(A)
+    (repo / ".llmi-mounts.json").write_text("{}")
+    (casa / ".llminbox.token").write_text("t")
+    args = tmp_path / "docker-args.txt"
+    (binfalso / "docker").write_text(f'#!/bin/sh\necho "$@" >> "{args}"\nexit 0\n')
+    (binfalso / "docker").chmod(0o755)
+    r = subprocess.run([str(repo / "llmi"), "up", "--build"], cwd=repo,
+                       env={"HOME": str(casa),
+                            "PATH": f"{binfalso}:/usr/bin:/bin:/usr/sbin:/sbin"},
+                       capture_output=True, text=True, timeout=120, check=False)
+    txt = args.read_text() if args.exists() else ""
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert "compose build" in txt, f"`--build` no construyó: {txt!r}"
+    assert "--no-build" in txt, f"el `up` posterior no lleva --no-build: {txt!r}"
+    assert "PUEDE recrear" in r.stdout, "construyó sin avisar de que puede cortar la bandeja"
