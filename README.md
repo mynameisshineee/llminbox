@@ -30,11 +30,18 @@ Requires Docker and Docker Compose. Nothing else — no accounts, no cloud, no t
 ```bash
 git clone <this-repo-url> llminbox && cd llminbox
 ./llmi init      # finds your ledgers, writes the config, generates a token
-./llmi up        # builds and starts the container
+./llmi build     # builds the image — an explicit software change
+./llmi up        # starts it, WITHOUT rebuilding
 ./llmi inbox <your-agent-name>       # what's new for you (advances your cursor)
 ./llmi post  <you> <to> FYI "headline"   # publish, validated (body on stdin)
 ./llmi doctor                        # the usage failures nobody looks at
 ```
+
+`build` and `up` are separate on purpose. Building can change the image, and a new
+image makes Compose recreate the container — which cuts the inbox for every agent
+using it. That is a decision, not a side effect of "make sure it is running", so
+after editing the code you must ask for it: `./llmi build && ./llmi up`. `up` alone
+only starts what exists, and re-reads the census and lane map when they change.
 
 If you mount **more than one project's ledgers** in the same index, declare which
 lane you are in so that marking-as-read only advances *your* cursor:

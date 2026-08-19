@@ -79,6 +79,17 @@ def test_los_claims_sobreviven_a_una_reconstruccion(cliente, servicio):
 # rescatarla o justificarla aquí, y eso es justo lo que se quiere que cueste.
 NO_SE_RESCATAN = {
     ("incidencias", "id"),   # AUTOINCREMENT: lo pone la base nueva, copiarlo no aporta
+    # `entries` es DERIVADA (ver `servicio.DERIVADAS`): se re-deriva entera del
+    # markdown, así que `raw_tipo` se vuelve a calcular y rescatarlo no aporta.
+    ("entries", "raw_tipo"),
+    # ⚠️ ESTAS DOS SON DISTINTAS Y HAY QUE MOVERLAS EL DÍA QUE DEJEN DE SER NULL.
+    # `canonical_kind` NO es re-derivable del markdown: es INTERPRETACIÓN, y
+    # recalcularla en una reconstrucción la haría con el registro de HOY, cambiando
+    # en silencio el pasado — que es justo lo que `kind_registry_rev` existe para
+    # impedir. Mientras las dos sean NULL no hay nada que perder; en cuanto se
+    # rellenen, pasan a `TABLAS_RESCATADAS` o la cura se lleva la taxonomía.
+    ("entries", "canonical_kind"),
+    ("entries", "kind_registry_rev"),
 }
 
 
@@ -132,6 +143,14 @@ def test_las_columnas_del_alter_tambien_se_rescatan(servicio):
     `CREATE TABLE` sino en un `ALTER` posterior son las más fáciles de olvidar —no se
     ven leyendo el esquema— y son, por definición, las más nuevas."""
     for tabla, col, _ in servicio.COLUMNAS_ANADIDAS:
+        if tabla in servicio.DERIVADAS:
+            # Se re-deriva del markdown; no hay estado que rescatar. La excepción
+            # se ancla a `DERIVADAS`, que ya declara qué se reconstruye, en vez de
+            # a una lista nueva que se quedaría vieja por su cuenta.
+            assert (tabla, col) in NO_SE_RESCATAN, (
+                f"{tabla}.{col} es de una tabla derivada pero nadie lo ha declarado: "
+                "decláralo en NO_SE_RESCATAN con el motivo, o rescátalo")
+            continue
         declaradas = dict((t, c) for t, c in servicio.TABLAS_RESCATADAS).get(tabla)
         assert declaradas is not None, f"{tabla} no se rescata en absoluto"
         assert col in declaradas.split(","), f"{tabla}.{col} se añade por ALTER y no se rescata"
