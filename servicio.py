@@ -481,8 +481,8 @@ RAW_TIPO_V = "1"
 def migrar_raw_tipo(con) -> None:
     """Rellena `raw_tipo` del corpus que YA estaba indexado.
 
-    Sin esto el cambio es inerte justo donde importa: las 641 entradas del
-    hallazgo llevan meses en la base, y la tupla del volcado sólo corre para eids
+    Sin esto el cambio es inerte justo donde importa: las entradas del hallazgo
+    llevan meses en la base, y la tupla del volcado sólo corre para eids
     NUEVOS. Lo señaló CodeRabbit — y su arreglo (meter `raw_tipo` en la
     comparación de la rama «ya conocida») es necesario pero NO suficiente:
     `barrido()` salta un ledger entero cuando su tamaño y su mtime no han
@@ -490,8 +490,19 @@ def migrar_raw_tipo(con) -> None:
     migración a una re-indexación los dejaría en NULL para siempre.
 
     Por eso se deriva del `head` YA GUARDADO: no toca ficheros, no depende de que
-    un ledger reciba tráfico, y corre una sola vez (sellada en `meta`). Medido
-    sobre la base viva: 16.099 de 65.186 entradas quedan con lexema.
+    un ledger reciba tráfico, y corre una sola vez (sellada en `meta`).
+
+    Medido el 2026-08-19 sobre una copia de la base viva (66.492 entradas):
+    32.704 quedan con lexema, de las cuales 2.021 NO tenían tipo canónico — ese
+    subconjunto es el rescate. Coste: 3,0 s y 41 MB de pico, e idempotente (una
+    segunda pasada calcula 0 cambios). Las cifras son una FOTO de esa fecha y
+    envejecen con el corpus; no las creas, re-derívalas:
+        SELECT COUNT(*) FROM entries WHERE raw_tipo IS NOT NULL
+                                       AND (tipo IS NULL OR tipo='');
+    Un número sin fecha ni consulta que lo reproduzca es una afirmación que nadie
+    puede falsar: este docstring decía «16.099 de 65.186» y hoy no reproduce, no
+    porque el corpus creciera, sino porque `raw_tipo_de` ganó el respaldo a
+    `ETIQUETAS` después de medirlo.
 
     `canonical_kind`/`kind_registry_rev` NO se tocan: son interpretación, y su
     revisión, no re-derivables del markdown.
