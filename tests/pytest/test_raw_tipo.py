@@ -565,10 +565,18 @@ def test_el_fallo_de_la_migracion_no_se_lleva_por_delante_la_columna(tmp_path, m
     # LA OTRA MITAD, y sin ella lo de arriba pasa sin explicar por qué: el DDL
     # sobrevive porque la conexión está en modo legacy. Atarlo aquí convierte un
     # cambio de configuración silencioso en un test rojo.
-    assert con.isolation_level == "", (
-        "la conexión dejó el modo legacy: ahora el ALTER TABLE SÍ entra en la "
-        "transacción y el rollback de la migración se lo lleva — hay que sellar "
-        "las columnas con un commit antes de llamar a migrar_raw_tipo()")
-    sonda = db_directa(s)
-    sonda.execute("ALTER TABLE entries ADD COLUMN _sonda_ddl TEXT")
-    assert sonda.in_transaction is False, "el DDL abrió transacción: ver arriba"
+    #
+    # SOBRE `s.db()`, LA FACTORÍA DE PRODUCCIÓN, no sobre `db_directa()`. Mi
+    # primera versión midió el helper de conftest, que hace su PROPIO
+    # `sqlite3.connect` — o sea que un cambio en `db()` lo habría dejado pasar
+    # tan campante, justo lo único que este guarda promete cazar. Lo señaló
+    # CodeRabbit. (Y el mutante que di por muerto no lo mató este guarda: lo
+    # mataron otros 120 tests por daño colateral. Un acierto mal atribuido es
+    # un acierto que no existe.)
+    prod = s.db()
+    assert prod.isolation_level == "", (
+        "la conexión de PRODUCCIÓN dejó el modo legacy: ahora el ALTER TABLE SÍ "
+        "entra en la transacción y el rollback de la migración se lo lleva — hay "
+        "que sellar las columnas con un commit antes de llamar a migrar_raw_tipo()")
+    prod.execute("ALTER TABLE entries ADD COLUMN _sonda_ddl TEXT")
+    assert prod.in_transaction is False, "el DDL abrió transacción: ver arriba"
