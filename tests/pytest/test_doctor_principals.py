@@ -106,15 +106,16 @@ def test_no_inventa_el_tipo_de_nadie(tmp_path, monkeypatch):
 
 
 def test_enseña_hechos_comprobables_no_opiniones(tmp_path, monkeypatch):
-    """Las columnas son hechos que el servicio puede sostener: censo, organigrama,
-    alias, cursor y correo. `destilador` RECIBE correo en el arnés y no tiene
+    """Las columnas son hechos que el servicio puede sostener, uno por proyección
+    más la pregunta derivada. `destilador` RECIBE correo en el arnés y no tiene
     cursor — las dos cosas tienen que verse, porque juntas son el caso que
     importa: le llega trabajo y nadie lo drena."""
     sec = _seis(_doctor(_monta(tmp_path, monkeypatch)))
     # La línea de COLUMNAS, no la cabecera de la sección: ésta también
     # contiene «principal(es)» y el `in` suelto la cazaba a ella.
     cab = next(ln for ln in sec.splitlines() if ln.strip().startswith("principal "))
-    for col in ("censo", "organigrama", "alias", "cursor", "correo", "tipo"):
+    for col in ("roster", "org_alias", "jerarquia", "resuelve", "cursor",
+                "correo", "tipo"):
         assert col in cab, f"falta la columna {col}: {cab}"
     fila = next(ln for ln in sec.splitlines() if ln.strip().startswith("destilador"))
     assert "sí" in fila, fila
@@ -132,3 +133,123 @@ def test_sin_organigrama_montado_no_acusa_a_todo_el_mundo(tmp_path, monkeypatch)
     sec = _seis(txt)
     assert "destilador" not in sec, sec
     assert "organigrama NO montado" in sec, sec
+
+
+# ── ⑥ refresca su PROPIA fuente, y distingue cuatro realidades ────────────────
+# Corrección del operador: `censo | organigrama` mezclaba tres cosas distintas.
+# Hay tres proyecciones (roster.json · rol_por_alias · jerarquía) y una pregunta
+# derivada (¿resuelve la identidad?), y cada combinación es una patología
+# diferente:
+#
+#   resolvable=sí + hierarchy=no  → identidad operativa SIN GOBIERNO
+#   hierarchy=sí + resolvable=no  → rol organizativo IMPOSIBLE DE EJECUTAR
+#   roster ≠ org_alias            → DERIVA entre proyecciones legacy
+#
+# La tercera no bloquea nada mientras la unión sea el mecanismo transitorio, pero
+# no puede desaparecer del diagnóstico: es el caso vivo de `engineering-manager`.
+
+def _monta_em(tmp_path, monkeypatch):
+    """El estado REAL de producción: el EM está en el organigrama (con alias) y
+    NO está en el roster; su bandeja resuelve por la unión."""
+    org = json.loads(json.dumps(ORG))
+    org["rol_por_alias"]["engineering-manager"] = "engineering-manager"
+    org["rol_por_alias"]["em-bikeus"] = "engineering-manager"
+    # Y la SEGUNDA patología, que hoy tiene cero casos en producción y por eso hay
+    # que fabricarla aquí: un rol declarado en la jerarquía SIN ningún alias que
+    # lo resuelva. Está en el organigrama y no puede recibir trabajo.
+    org["jerarquia"]["rol-inejecutable"] = {"reporta_a": "cto", "capa": "ejecucion"}
+    (tmp_path / "org.json").write_text(json.dumps(org))
+    s = construir(tmp_path, monkeypatch, roster=ROSTER,
+                  extra_env={"LLMINBOX_ROLES_ALIAS": str(tmp_path / "org.json")})
+    (tmp_path / "DEMO-LEDGER.md").write_text(
+        "### [cto-A → backend · FYI] gobernado\ncuerpo\n")
+    return s, tmp_path / "org.json"
+
+
+def test_distingue_las_tres_patologias(tmp_path, monkeypatch):
+    """`engineering-manager` no está en el roster, sí en el organigrama con dos
+    alias, y su bandeja responde. Con dos columnas eso se leía como «no está en
+    el censo» — que es falso y llevaría a darlo de alta sin necesidad, pagando un
+    reindex completo por nada.
+
+    FALSADOR: colapsar `org_alias` y `hierarchy` en una sola columna hace
+    indistinguible esta fila de un rol que NO puede recibir trabajo."""
+    s, _ = _monta_em(tmp_path, monkeypatch)
+    sec = _seis(_doctor(s))
+    cab = next(ln for ln in sec.splitlines() if ln.strip().startswith("principal "))
+    for col in ("roster", "org_alias", "jerarquia", "resuelve", "cursor", "correo", "tipo"):
+        assert col in cab, f"falta la columna {col}: {cab}"
+    fila = next(ln for ln in sec.splitlines() if ln.strip().startswith("engineering-manager"))
+    campos = fila.split()
+    assert campos[1] == "no", f"roster debería ser no: {fila}"
+    assert campos[2] == "sí" and campos[3] == "sí", f"org_alias/jerarquia: {fila}"
+    assert campos[4] == "sí", f"tiene que constar que RESUELVE: {fila}"
+
+
+def test_F_DOC_1_ve_el_cambio_sin_que_nadie_llame_a_organigrama(tmp_path, monkeypatch):
+    """⑥ no puede depender de que otro endpoint haya refrescado antes. Si la
+    fuente cambia y sólo se llama a `/doctor`, el diagnóstico tiene que ser sobre
+    la fuente ACTUAL — o no ser un diagnóstico.
+
+    FALSADOR: leer `lp.JERARQUIA` sin refrescar deja fuera al rol nuevo y ⑥
+    informa de una organización que ya no existe."""
+    s, ruta = _monta_em(tmp_path, monkeypatch)
+    assert "sdet" not in _seis(_doctor(s))
+    org = json.loads(ruta.read_text())
+    org["jerarquia"]["sdet"] = {"reporta_a": "cto", "capa": "gate"}
+    ruta.write_text(json.dumps(org))
+    assert "sdet" in _seis(_doctor(s)), "⑥ no vio el cambio: diagnostica el pasado"
+
+
+def test_F_DOC_2_con_la_fuente_rota_no_afirma_huerfanos_actuales(tmp_path, monkeypatch):
+    """La precisión semántica del operador: el último-bueno vale como información
+    sobre FRESCURA, no como base de una afirmación de gobierno.
+
+    «Hay 17 principales divergentes» es una afirmación sobre AHORA. Con la fuente
+    ilegible no se puede sostener, y emitirla igual convertiría un diagnóstico en
+    una invención — el defecto que ⑥ existe para denunciar.
+
+    FALSADOR: seguir calculando con el last-good imprime la lista como si fuera
+    contemporánea y esto se pone rojo."""
+    s, ruta = _monta_em(tmp_path, monkeypatch)
+    assert "engineering-manager" in _seis(_doctor(s))
+    ruta.unlink()
+    sec = _seis(_doctor(s))
+    assert "engineering-manager" not in sec, sec
+    assert "NO VERIFICABLE" in sec, sec
+    assert "ranci" in sec.lower(), sec        # «rancia o ilegible»
+
+
+def test_no_se_lee_un_cero_como_SoT_resuelto(tmp_path, monkeypatch):
+    """⑥ en cero demuestra que las proyecciones COINCIDEN en ese instante. No
+    demuestra que haya una fuente única, ni compilador, ni gate de deriva.
+
+    Sin esta línea, dentro de seis meses alguien lee un cero como una garantía
+    que el sistema todavía no da — y es la misma clase de error que todo lo que
+    ⑥ denuncia, cometido por quien lo lee."""
+    s, _ = _monta_em(tmp_path, monkeypatch)
+    sec = _seis(_doctor(s))
+    assert "no sustituye" in sec.lower(), sec
+
+
+def test_un_rol_de_la_jerarquia_sin_alias_no_puede_ejecutar(tmp_path, monkeypatch):
+    """La segunda patología, y el falsador que faltaba: `org_alias` y `jerarquia`
+    son proyecciones DISTINTAS del mismo fichero, y colapsarlas en una columna se
+    lleva por delante este caso.
+
+    `rol-inejecutable` está en la jerarquía y no lo resuelve ningún alias: se le
+    puede asignar trabajo sobre el papel y su bandeja contesta 422. Es el defecto
+    que medí en producción con `engineering-manager` antes de que el harness le
+    diera alias.
+
+    FALSADOR (el que sobrevivía): imprimir `jerarquia` en la columna de
+    `org_alias` hace que esta fila salga `org_alias=sí` y esto se pone rojo."""
+    s, _ = _monta_em(tmp_path, monkeypatch)
+    sec = _seis(_doctor(s))
+    fila = next(ln for ln in sec.splitlines() if ln.strip().startswith("rol-inejecutable"))
+    campos = fila.split()
+    assert campos[1] == "no", f"roster: {fila}"
+    assert campos[2] == "no", f"org_alias debería ser NO: {fila}"
+    assert campos[3] == "sí", f"jerarquia debería ser SÍ: {fila}"
+    assert campos[4] == "no", f"NO resuelve — no puede recibir trabajo: {fila}"
+    assert "1 rol(es) sin identidad" in sec, sec

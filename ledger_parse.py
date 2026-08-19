@@ -296,6 +296,10 @@ def _foto_org(montada: bool, source: str | None) -> dict:
     """
     return {"montada": montada, "source_sha256": source,
             "loaded_sha256": ORG_SHA, "jerarquia": dict(JERARQUIA),
+            # `rol_por_alias` va en la MISMA foto: son proyecciones distintas del
+            # mismo fichero y compararlas leyendo una de la foto y otra del global
+            # reabriría la carrera por la puerta de al lado.
+            "roles_alias": dict(ROLES_ALIAS) if ROLES_ALIAS is not None else None,
             "revision": ORG_REVISION, "cargado_en": ORG_CARGADO_EN}
 
 
