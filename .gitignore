@@ -41,3 +41,4 @@ web/tsconfig.tsbuildinfo
 
 # Sello del último estado APLICADO con éxito (ver `llmi up`). Derivado.
 .llmi-applied
+.llmi-up.lock/

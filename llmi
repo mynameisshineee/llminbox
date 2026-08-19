@@ -967,7 +967,11 @@ if resto > 0:
           _con_build=0
           for _a in "$@"; do
             case "$_a" in
-              --build) _con_build=1 ;;
+              --build) [ "$_con_build" = "1" ] && {
+                         echo "· \`--build\` repetido" >&2
+                         echo "  las únicas formas válidas son \`llmi up\` y \`llmi up --build\`" >&2
+                         mal_uso; }
+                       _con_build=1 ;;
               *) echo "· argumento desconocido para \`up\`: $_a" >&2
                  echo "  las únicas formas válidas son \`llmi up\` y \`llmi up --build\`" >&2
                  mal_uso ;;
@@ -1026,14 +1030,38 @@ if resto > 0:
           # coincide con lo último APLICADO con éxito?». El sello de aplicado sólo
           # avanza DESPUÉS de que Docker termine bien.
           _APPLIED="$DIR/.llmi-applied"
+          # CERROJO. Dos `llmi up` simultáneos —y en esta casa hay varias sesiones
+          # a la vez— compiten por el sello: uno puede mover el temporal del otro y
+          # dejar `.llmi-applied` describiendo un despliegue que no es el que corre.
+          # `mkdir` es atómico en POSIX y no necesita `flock`, que no está en macOS.
+          # Se RECHAZA en vez de esperar: dos despliegues a la vez no es una cola,
+          # es un accidente, y adivinar cuál gana sería peor que negarse.
+          _LOCK="$DIR/.llmi-up.lock"
+          mkdir "$_LOCK" 2>/dev/null || {
+            echo "· hay otro \`llmi up\` en marcha (o quedó un cerrojo de uno que murió)" >&2
+            echo "  si estás seguro de que no corre ninguno: rmdir $_LOCK" >&2
+            exit 1; }
+          trap 'rmdir "$_LOCK" 2>/dev/null' EXIT
           _NEXT="$_ST/.next.$$"
           mkdir -p "$_NEXT" || { echo "· no pude crear $_NEXT" >&2; exit 1; }
           cp -f "$ROSTER" "$_NEXT/roster.json" \
             || { echo "· no pude preparar el censo" >&2; rm -rf "$_NEXT"; exit 1; }
           cp -f "$DIR/.llmi-mounts.json" "$_NEXT/mounts.json" \
             || { echo "· no pude preparar el mapa de montajes" >&2; rm -rf "$_NEXT"; exit 1; }
+          # SI EL HASH NO SE PUEDE CALCULAR, SE CORTA. El script lleva
+          # `set -uo pipefail` pero NO `set -e`: sin este `||`, un fallo de `cat` o
+          # de `python3` seguía adelante, publicaba el staging y escribía un sello
+          # VACÍO — que ya no describe nada y hace que el gate mienta en la
+          # dirección que más duele.
           _deseado="$(cat "$_NEXT/roster.json" "$_NEXT/mounts.json" \
-                      | python3 -c 'import hashlib,sys;print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+                      | python3 -c 'import hashlib,sys;print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')" \
+            || { echo "· no pude calcular el estado deseado: no publico ni sello" >&2
+                 rm -rf "$_NEXT"; exit 1; }
+          case "$_deseado" in
+            ????????????????????????????????????????????????????????????????) ;;
+            *) echo "· el estado deseado no parece un sha256: no publico ni sello" >&2
+               rm -rf "$_NEXT"; exit 1 ;;
+          esac
 
           # EL BUILD VA ANTES DE PUBLICAR. Si falla, no se ha tocado nada: ni
           # `/state` ni el sello. El siguiente `up` vuelve a ver la diferencia.
@@ -1062,7 +1090,10 @@ if resto > 0:
             || { echo "· \`compose up\` falló: el sello de aplicado NO avanza, así que" >&2
                  echo "  el próximo \`llmi up\` volverá a forzar la recreación" >&2; exit 1; }
           # EL ACUSE, y sólo aquí: después de que Docker haya terminado bien.
-          printf %s "$_deseado" > "$_APPLIED.tmp" && mv -f "$_APPLIED.tmp" "$_APPLIED" ;;
+          # el nombre único del temporal es defensa en profundidad: quien de verdad
+          # impide la carrera es el CERROJO de arriba. Se deja porque no cuesta
+          # nada, y se dice para que nadie lo tome por la protección.
+          printf %s "$_deseado" > "$_APPLIED.tmp.$$" && mv -f "$_APPLIED.tmp.$$" "$_APPLIED" ;;
   build)  # Construir es una DECISIÓN, no un efecto secundario de «asegúrate de que
           # está levantado». Consecuencia buscada: cambiar `servicio.py` y hacer
           # sólo `llmi up` NO despliega el código nuevo. Hay que pedirlo.
