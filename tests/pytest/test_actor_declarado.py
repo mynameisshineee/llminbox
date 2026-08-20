@@ -82,8 +82,11 @@ def test_el_raw_intacto_Y_la_derivacion_correcta_a_la_vez(tmp_path, monkeypatch)
     assert f["derived_role_source"] == "org_alias_map", f
     assert f["actor_provenance"] == "self_declared", f
     assert f["actor_identity_verified"] is False, f
-    # y la procedencia identifica LOS BYTES, no una revisión que la fuente no trae
-    assert f["role_mapping_sha256"], f
+    # LA PROCEDENCIA, EXACTA: no «que haya algo», sino que sea el sha de ESTOS
+    # bytes. `assert x` sólo comprueba que no está vacío, y con eso un hash de
+    # cualquier otra cosa —o una constante— pasaría igual.
+    import hashlib
+    assert f["role_mapping_sha256"] == hashlib.sha256(org.read_bytes()).hexdigest(), f
 
 
 def test_sin_fuente_fresca_NO_se_afirma_la_derivacion(tmp_path, monkeypatch):
@@ -114,7 +117,12 @@ def test_sin_fuente_fresca_NO_se_afirma_la_derivacion(tmp_path, monkeypatch):
         f = [x for x in c.get("/entries?limit=50").json() if x["actor"] == "cto-A"][0]
 
     assert f["actor"] == "cto-A", f                    # el crudo sigue
-    assert f["derived_role"] is None, f                # la derivación se calla
+    # LOS TRES CAMPOS DERIVADOS SE CALLAN, no dos. `derived_role_source` es
+    # metadata de la derivación: dejarlo poblado mientras los otros dos van a
+    # null afirma que hubo una derivación por mapa de alias y luego no dice cuál.
+    # Mi versión anterior no lo comprobaba, así que ese fallo pasaba.
+    assert f["derived_role"] is None, f
+    assert f["derived_role_source"] is None, f
     assert f["role_mapping_sha256"] is None, f
 
 
