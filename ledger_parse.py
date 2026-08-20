@@ -55,7 +55,13 @@ from dataclasses import dataclass, field
 # corpus real cambian de actor); difusión (FLOTA/equipo/todos) sale de `to` a
 # su propio campo (1.915 entradas cambian de forma, ninguna de cobertura real
 # perdida — ver PROTOCOL.md, sección "Qué NO garantiza el formato hoy").
-PARSER_V = 9   # 9: la difusión sobrevive a una re-derivación — sin esto, cada
+PARSER_V = 10  # 10: la ranura de tipo sólo existe si la cabecera DIRIGE. Sin este
+               #    gate, las 58 entradas que declaraban el CARRIL como raw_tipo
+               #    (`### [wiki-vault·64bis]`) y los ~35 sellos de fecha seguirían
+               #    ahí: `barrido()` salta el ledger cuyo tamaño y mtime no
+               #    cambian, así que el arreglo del parser sin subir esto sólo
+               #    valdría para lo que se escriba a partir de hoy.
+               # 9: la difusión sobrevive a una re-derivación — sin esto, cada
                #    arranque con censo o parser nuevo borraba las filas de
                #    entrega de FLOTA/equipo/todos de TODO el histórico (6.220
                #    entradas del corpus, 32 filas vivas al medirlo). Se sube
@@ -700,7 +706,32 @@ def raw_tipo_de(head: str) -> str | None:
     inner = _sin_emoji(inner)
     cierre = inner.find("]")
     inner = inner[:cierre + 1] if cierre != -1 else inner
-    m = RAW_TIPO.search(inner)
+    # LA RANURA DE TIPO EXISTE CUANDO LA GRAMÁTICA LA TIENE, no cuando hay un `·`.
+    # `### [wiki-vault·64bis]` es `agente·carril` —dos campos, sin ruta— y esta
+    # rama tomaba el último igualmente: devolvía el CARRIL como tipo, 58 veces en
+    # el corpus vivo, y `64bis` iba camino de colarse en el canon como si fuera
+    # vocabulario. Lo mismo con `## [qa-biklabs · 2026-07-18T21:45:15Z]`, que
+    # capturaba la FECHA (~35 más).
+    #
+    # El discriminante es el OPERADOR DE RUTA, y tenía que ser estructural: mirar
+    # si el candidato «parece un carril» o «parece un agente» no decide semántica,
+    # y está demostrado aquí mismo — `HARNESS` es un nombre de agente Y está
+    # legítimamente en posición de tipo. Un `if candidato in CARRILES: return None`
+    # arreglaría el corpus de hoy, no la sintaxis.
+    #
+    #     [actor · carril]           → NO hay ranura      ← esto se estaba leyendo mal
+    #     [actor → destino · TIPO]   → sí la hay
+    #     [TIPO actor → destino]     → tipo FRONTAL, otra rama (ETIQUETAS, abajo)
+    #
+    # Sin operador de ruta la cabecera no dirige a nadie, y su último campo es un
+    # calificador —carril, sello, nota—, no un tipo. Medido antes de aplicarlo:
+    # 10.512 capturas de esta rama llevan ruta y 270 no; de esas 270, la inmensa
+    # mayoría es carril, fecha, nombre de agente o prosa. El daño colateral se
+    # declara: algún calificador que sí parecía tipo (`TRIAGE-PARKED`, `MÉTODO`)
+    # deja de extraerse. El lexema NO se pierde — sigue entero en `head`, que es
+    # de donde se deriva todo esto.
+    _dirigida = any(o in inner for o in OPERADORES_RUTA)
+    m = RAW_TIPO.search(inner) if _dirigida else None
     if m and _es_token_de_tipo(m.group(1)):
         return m.group(1)
     # La forma SPOKE no lleva corchetes: `## <ISO> · a → b · TIPO`. `H_ENTRY` la
