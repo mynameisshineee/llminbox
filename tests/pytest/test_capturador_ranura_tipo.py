@@ -47,6 +47,31 @@ def test_agente_carril_sin_ruta_no_produce_el_carril_como_tipo():
     assert _raw("### [wiki-vault·64bis] 2026-07-19T09:15:17Z — DONE") is None
 
 
+def test_una_CONJUNCION_no_acredita_direccion():
+    """`∧` y `&` juntan participantes; no dirigen a nadie.
+
+    Mi primera versión de este arreglo usó `OPERADORES_RUTA`, que incluye las dos
+    —porque `_es_token_de_tipo` las necesita para OTRA cosa: descartar candidatos
+    que sean rutas—. Con eso, `[wiki-vault ∧ qa · 64bis]` volvía a dar `64bis`:
+    maté una forma del defecto y dejé viva su variante, reutilizando una constante
+    cuya semántica es más ancha que «flecha». Lo cazó el operador.
+
+    FALSADOR: volver a `OPERADORES_RUTA` en `_dirigida` resucita las dos.
+    """
+    assert _raw("### [wiki-vault ∧ qa · 64bis] 2026-08-20T10:00Z — algo") is None
+    assert _raw("### [wiki-vault & qa · 64bis] 2026-08-20T10:00Z — algo") is None
+
+
+def test_una_conjuncion_JUNTO_a_una_flecha_si_dirige():
+    """CONTROL: el caso mayoritario del corpus lleva las dos cosas —una flecha y
+    varias conjunciones— y tiene que seguir extrayendo.
+
+    FALSADOR: una regla que RECHACE la presencia de `∧` en vez de exigir flecha
+    tira los miles de envíos multidestinatario.
+    """
+    assert _raw("### [db-mig → security ∧ qa ∧ cto · MEASURED] 2026-08-20T10:00Z — algo") == "MEASURED"
+
+
 def test_con_ruta_el_ultimo_campo_SI_es_el_tipo():
     """CONTROL ①: la gramática dirigida conserva su ranura, y con un valor que
     ADEMÁS es nombre de agente — para que quede claro que la regla no mira el

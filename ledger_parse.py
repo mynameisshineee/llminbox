@@ -571,6 +571,14 @@ RAW_TIPO = re.compile(r"·\s*([^·\]\r\n]{1,64}?)\s*\]")
 # Operadores de RUTA del propio formato. Excluirlos no es vocabulario de palabras:
 # es respetar la sintaxis de la cabecera, donde `→`/`∧` separan actores.
 OPERADORES_RUTA = ("→", "->", "←", "<-", "∧", "&")
+# FLECHAS aparte, y la distinción es la que decide si una cabecera DIRIGE.
+# `OPERADORES_RUTA` existe para `_es_token_de_tipo`, que descarta candidatos con
+# forma de ruta — ahí las conjunciones cuentan, porque `a ∧ b` tampoco es un tipo.
+# Pero `∧` y `&` JUNTAN participantes; no acreditan dirección: `[wiki-vault ∧ qa ·
+# 64bis]` no manda nada a nadie. Reutilizar la constante ancha para decidir
+# «¿hay ranura de tipo?» mataba `[wiki-vault·64bis]` y dejaba VIVA su variante con
+# conjunción — el mismo defecto, con otra ropa.
+FLECHAS_RUTA = ("→", "->", "←", "<-")
 
 
 def _es_token_de_tipo(v: str) -> bool:
@@ -713,7 +721,7 @@ def raw_tipo_de(head: str) -> str | None:
     # vocabulario. Lo mismo con `## [qa-biklabs · 2026-07-18T21:45:15Z]`, que
     # capturaba la FECHA (~35 más).
     #
-    # El discriminante es el OPERADOR DE RUTA, y tenía que ser estructural: mirar
+    # El discriminante es la FLECHA, y tenía que ser estructural: mirar
     # si el candidato «parece un carril» o «parece un agente» no decide semántica,
     # y está demostrado aquí mismo — `HARNESS` es un nombre de agente Y está
     # legítimamente en posición de tipo. Un `if candidato in CARRILES: return None`
@@ -730,7 +738,7 @@ def raw_tipo_de(head: str) -> str | None:
     # declara: algún calificador que sí parecía tipo (`TRIAGE-PARKED`, `MÉTODO`)
     # deja de extraerse. El lexema NO se pierde — sigue entero en `head`, que es
     # de donde se deriva todo esto.
-    _dirigida = any(o in inner for o in OPERADORES_RUTA)
+    _dirigida = any(f in inner for f in FLECHAS_RUTA)   # FLECHAS, no conjunciones
     m = RAW_TIPO.search(inner) if _dirigida else None
     if m and _es_token_de_tipo(m.group(1)):
         return m.group(1)
