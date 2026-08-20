@@ -85,6 +85,66 @@ H_ENTRY = re.compile(
 TS = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z")
 TIPOS = ("PRODUCED", "INGESTED", "FYI", "REQUEST", "ACK", "HELD", "AMEND", "DELTA")
 
+# ── CANON v1 ──────────────────────────────────────────────────────────────────
+# El contrato, adjudicado el 2026-08-20 sobre el corpus rederivado:
+#
+#     raw_tipo = el lexema EXACTO que escribió el autor · nunca se destruye
+#     tipo     = normalización canónica · conjunto pequeño y GOBERNADO
+#
+# Los cuatro nuevos entran por USO MEDIDO, no por parecido con nada:
+#     MEASURED  580 usos · 17 autores · 14% el primero   → vocabulario de flota
+#     RESP      735 usos · 31 autores · 23%
+#     RULING     98 usos ·  4 autores · 59%
+#     FINDING    54 usos · 12 autores · 17%
+#
+# Y LOS QUE SE QUEDAN FUERA, cada uno con su motivo medido — porque la frecuencia
+# sola no basta y aquí está la prueba:
+#     WAKE      97 usos y UN SOLO AUTOR (marketing), todas el mismo texto
+#               automático de heartbeat rancio. Es tooling de un agente, no
+#               contrato de flota. Estaba en la lista y se retiró al medirlo.
+#     HARNESS   23/23 de un solo autor. Mismo patrón.
+#     EXECUTED  CERO usos. Crear un canónico que nadie ha escrito para normalizar
+#               21 EJECUTADO sería diseñar el corpus hacia la taxonomía.
+#     DECIDED   contraejemplo real: sus textos empiezan por «acepto tu corrección»
+#               y «mi requisito era INSUFICIENTE» — eso es ACK/AMEND, no adjudicar.
+#     DONE      colisiona con el estado de Job de Agent OS (ACCEPTED ≡ DONE).
+#     CLAIM     colisiona con la operación de lease del control plane.
+#     MSG       no clasifica el acto: decir «es un mensaje» no dice nada.
+#     ASK · AVISO · STATUS   medidos y MIXTOS: AVISO mezcla alertas con
+#               RETRACTACIONES, ASK mezcla estado con escalación. Quedan raw.
+#
+# Tres ontologías que NO se mezclan, y por eso DONE y CLAIM no entran:
+#     tipo de ledger  = qué acto comunicativo ocurrió
+#     estado de Job   = en qué punto está el trabajo
+#     operación       = CLAIM / LEASE / REVIEW del control plane
+CANON_TIPOS = frozenset(TIPOS) | {"MEASURED", "RESP", "FINDING", "RULING"}
+
+# UN SOLO ALIAS, y es el único con evidencia que resiste: 14 de los 15 autores de
+# `MEDIDO` escriben TAMBIÉN `MEASURED` (93%). Si fueran semánticas distintas, los
+# autores se habrían especializado; no lo hacen. `ADJUDICADO` y `VEREDICTO` quedan
+# PENDIENTES —no rechazados—: no encontré contraejemplo, pero tampoco un test que
+# lo hubiera encontrado, y eso no es equivalencia probada.
+ALIASES = {"MEDIDO": "MEASURED"}
+
+
+def canonical_tipo(raw: str | None) -> str | None:
+    """La ÚNICA derivación de `tipo`, y sale del lexema — nunca de la prosa.
+
+    Lo anterior era `next((t for t in TIPOS if t in head), None)`: subcadena sobre
+    la cabecera entera. Una cabecera que MENCIONA «FYI» recibía tipo FYI, y la
+    columna quedó inflada — medido: 13 valores fuera de `TIPOS` en 22.882
+    entradas. Añadir los canónicos nuevos por esa vía habría sido peor todavía:
+    `RESP` aparece como subcadena en 2.630 cabeceras que no lo son, `RULING` en
+    1.577.
+
+    Por eso esta función NO recibe `head`: no puede caer en esa tentación.
+    """
+    if not raw:
+        return None
+    t = raw.strip().upper()
+    t = ALIASES.get(t, t)
+    return t if t in CANON_TIPOS else None
+
 # Los nombres de agente vivos en la flota. Se listan explícitamente en vez de
 # inferirse: inferir "la primera palabra" da basura sobre cabeceras que empiezan
 # por emoji, verbo o adjetivo, y una atribución equivocada es peor que ninguna
@@ -888,12 +948,20 @@ def _campos(head: str, cola: str) -> tuple[
                 (difusion if n.lower() in DIFSET else to).append(n)
                 por_arroba = True
 
-    tipo = next((t for t in TIPOS if t in head), None)
-    if tipo is None and etiqueta:
-        tipo = etiqueta.group(1).upper()
     # Lo escrito, se entienda o no. Se mira la posición canónica (`· TOKEN]`)
     # antes que la etiqueta al frente, porque es donde la flota lo pone.
     raw = raw_tipo_de(head)
+    # Y EL TIPO SALE DE AHÍ, no de buscar palabras en la cabecera. Lo anterior era
+    # `next((t for t in TIPOS if t in head), None)` seguido de aceptar CUALQUIER
+    # etiqueta frontal, y por eso la columna acabó con 13 valores fuera del canon
+    # en 22.882 entradas: una cabecera que MENCIONA «FYI» recibía tipo FYI.
+    #
+    # Esto sólo gobierna lo que se INDEXA a partir de ahora: `reindex()` no
+    # reescribe `tipo` de las filas que ya existen —su UPDATE toca seq, line_no,
+    # byte_off, ausente, provisional y raw_tipo, y nada más—, así que el histórico
+    # inflado no se mueve aquí. Sanearlo es otra PR: son 31.077 filas y tiene
+    # consumidores vivos.
+    tipo = canonical_tipo(raw)
     return ts, actor, to, difusion, tipo, por_arroba, raw
 
 

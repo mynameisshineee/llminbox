@@ -72,7 +72,13 @@ def test_no_se_interpreta_nada_todavia(tmp_path, monkeypatch):
     canónico lo que nadie ha aprobado."""
     _, con = _monta(tmp_path, monkeypatch)
     f = _filas(con)
-    assert f["MEDIDO"][0] is None, "se coló en `tipo`: eso es interpretar"
+    # SUPERSEDIDO el 2026-08-20: cuando se escribió esto, el contrato era «raw_tipo
+    # captura, tipo NO interpreta». Albert adjudicó después CANON v1 con un único
+    # alias —`MEDIDO → MEASURED`—, soportado por medición: 14 de los 15 autores de
+    # MEDIDO escriben TAMBIÉN MEASURED (93%), o sea idioma del autor y no semántica
+    # distinta. Lo que sigue intacto es lo que este test protege de verdad: el
+    # LEXEMA no se destruye.
+    assert f["MEDIDO"][0] == "MEASURED", "el alias adjudicado debe normalizar"
     assert f["MEDIDO"][2] is None and f["MEDIDO"][3] is None
     assert f["FYI"][2] is None, "canonical_kind se rellena antes de tener registro"
 
@@ -176,7 +182,13 @@ def test_lint_separa_no_declarar_de_declarar_algo_que_no_entiendo(tmp_path, monk
     linea = next(ln for ln in txt.splitlines() if "no entiendo" in ln)
     # Se ancla al NÚMERO, no a un `in` suelto: el porcentaje que va detrás en la
     # misma línea hacía pasar la aserción por la puerta de al lado.
-    assert _re.search(r"no entiendo: 4\b", linea), linea   # MEDIDO ADJUDICADO Medido REVIEW.V2
+    # 4 → 2 por CANON v1 (2026-08-20): `MEDIDO` y `Medido` pasan a entenderse vía el
+    # alias adjudicado `MEDIDO → MEASURED` —el único con evidencia que resiste—, y
+    # quedan los DOS que siguen sin canon: `ADJUDICADO` (pendiente, no rechazado:
+    # no encontré contraejemplo pero tampoco un test que lo hallara) y `REVIEW.V2`.
+    # La separación que este test protege —«no declarar» ≠ «declarar algo que no
+    # entiendo»— es la misma; lo que cambia es cuántos caen en el segundo cubo.
+    assert _re.search(r"no entiendo: 2\b", linea), linea   # ADJUDICADO · REVIEW.V2
     sin = next(ln for ln in txt.splitlines() if "sin tipo declarado" in ln)
     assert _re.search(r"sin tipo declarado: 2\b", sin), sin   # la sin tipo y la del titular trampa
 

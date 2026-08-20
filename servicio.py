@@ -498,6 +498,49 @@ def huella_censo() -> str:
 # los ledgers dormidos no vuelven a pasar por `reindex()`—, que es literalmente el
 # defecto que esta migración nació para cerrar. Medido sobre una copia de la base
 # viva: la re-pasada rescata 66 entradas y no pierde ninguna.
+CANON_V1_V = "1"
+
+
+def migrar_canon_v1(con) -> None:
+    """Rellena `tipo` donde está VACÍO y el lexema es canonizable. Sólo eso.
+
+    Conectar `canonical_tipo()` al troceador gobierna lo que se INDEXA a partir de
+    ahora, pero no toca el histórico: `reindex()` no reescribe `tipo` de las filas
+    que ya existen —su UPDATE toca seq, line_no, byte_off, ausente, provisional y
+    raw_tipo, y nada más—. Así que los cuatro canónicos nuevos no llegarían jamás
+    a las 1.459 entradas que ya llevan su lexema escrito.
+
+    ESTRICTAMENTE ADITIVA, y es una restricción adjudicada, no una precaución:
+    `WHERE tipo IS NULL OR tipo=''`. Ninguna fila con valor se toca. El saneamiento
+    del histórico inflado —los 21.543 HEARTBEAT y los 4.943 FYI que el matcher por
+    subcadena metió desde la PROSA— mueve 31.077 filas y tiene consumidores vivos:
+    va en su propia PR, con su matriz old→new y su medición de consumidores.
+
+    Medido antes de escribirla, sobre el corpus rederivado:
+        ganan tipo ... 1.459   MEASURED 1.178 · RESP 134 · RULING 95 · FINDING 52
+        pierden ......     0
+    """
+    try:
+        fila = con.execute("SELECT v FROM meta WHERE k='canon_v1_v'").fetchone()
+        if fila and fila["v"] == CANON_V1_V:
+            return
+        cambios = [(t, r["ledger"], r["eid"])
+                   for r in con.execute("SELECT ledger, eid, raw_tipo FROM entries "
+                                        "WHERE (tipo IS NULL OR tipo='') AND raw_tipo IS NOT NULL")
+                   if (t := lp.canonical_tipo(r["raw_tipo"])) is not None]
+        if cambios:
+            con.executemany("UPDATE entries SET tipo=? WHERE ledger=? AND eid=?", cambios)
+        # El sello en la MISMA transacción que los datos: un commit entre medias
+        # dejaría una base a medio rellenar sellada como completa.
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('canon_v1_v', ?)", (CANON_V1_V,))
+        con.commit()
+        print(f"[migración] canon v1: {len(cambios)} entradas ganan `tipo` desde su "
+              f"lexema; ninguna con valor previo se toca", flush=True)
+    except sqlite3.OperationalError as e:
+        con.rollback()
+        print(f"[migración] canon v1 NO aplicada: {e}", flush=True)
+
+
 RAW_TIPO_V = "2"
 
 
@@ -1120,6 +1163,23 @@ def indice_ilegible() -> str:
     return ""
 
 
+def _latido_cosechado(e) -> bool:
+    """¿Es un latido cuyo destinatario se COSECHÓ del texto libre?
+
+    UNA sola definición, usada en los DOS caminos de escritura de `reindex()`: el
+    de entradas nuevas y el de RE-DERIVAR. Estaba sólo en el primero, y por eso
+    `rederivar` —que hace `DELETE FROM recipients` y reconstruye— resucitaba el
+    correo cosechado que la otra rama acababa de suprimir. Lo disparaba cualquier
+    despliegue con censo o troceador nuevos.
+
+    Por el LEXEMA porque `HEARTBEAT` quedó fuera de `CANON_TIPOS` y `tipo` es None;
+    `casefold` porque `raw_tipo` conserva la caja literal del autor; y con
+    `por_arroba` porque lo que se descarta es el nombre COSECHADO — un latido con
+    flecha explícita lo escribió alguien a mano y sigue dirigiendo.
+    """
+    return (e.raw_tipo or "").casefold() == "heartbeat" and e.por_arroba
+
+
 def reindex(ledger: str, path: str, con) -> dict:
     """Reindexa un ledger identificando cada entrada por su CONTENIDO.
 
@@ -1218,8 +1278,18 @@ def reindex(ledger: str, path: str, con) -> dict:
                 # puede reconocer a alguien que antes no existía. Se recalcula lo
                 # DERIVADO y se conserva el `arrival`, que es lo que sostiene el
                 # cursor de cada agente.
-                con.execute("UPDATE entries SET actor=?, tipo=? WHERE ledger=? AND eid=?",
-                            (e.actor, e.tipo, ledger, e.sha))
+                # `tipo` NO SE TOCA, y es la regla de esta PR: una entrada ya
+                # conocida con `tipo` poblado sale byte-idéntica de cualquier
+                # RE-DERIVAR. Antes se reescribía aquí, así que el saneamiento
+                # histórico —que mueve 31.077 filas y tiene consumidores vivos—
+                # se colaba por este camino ANTES de la PR que lo adjudica, y
+                # bastaba un despliegue con censo nuevo para dispararlo. Nada de
+                # `viejo or nuevo` ni excepciones: #16/A cambiará esta política a
+                # conciencia, y entonces será una decisión, no un efecto lateral.
+                con.execute("UPDATE entries SET actor=? WHERE ledger=? AND eid=?",
+                            (e.actor, ledger, e.sha))
+                if _latido_cosechado(e):
+                    continue          # ni `to` ni `difusion`: los dos son cosecha
                 for w in e.to:
                     dest.append((ledger, e.sha, w))
                 # LA DIFUSIÓN TAMBIÉN, y su ausencia aquí era DESTRUCTIVA Y RECURRENTE.
@@ -1261,7 +1331,13 @@ def reindex(ledger: str, path: str, con) -> dict:
         # Y va ACOTADO al enrutado por arroba: un latido con FLECHA explícita sí lleva
         # destinatario, porque ahí alguien lo escribió a mano y a propósito. Lo que se
         # descarta es el nombre COSECHADO del texto libre, que es lo que se fabrica.
-        latido_cosechado = e.tipo == "HEARTBEAT" and e.por_arroba
+        # POR EL LEXEMA, no por `tipo`: HEARTBEAT quedó FUERA de CANON_TIPOS —no es
+        # vocabulario de flota, son 97/97 de un solo autor y en Fase 4 pasa a ser
+        # señal de runtime—, así que `tipo` es None y esta comparación dejaba de
+        # casar. Sin migrarla, los latidos empezaban a dirigir correo cosechado:
+        # las 1.040 filas de destinatario fabricadas que esta línea cerró.
+        # `casefold` porque `raw_tipo` conserva la caja literal que tecleó el autor.
+        latido_cosechado = _latido_cosechado(e)
         if latido_cosechado:
             pass
         elif (not e.por_arroba) or previos or (lp.ARROBA_DESDE and e.ts and e.ts >= lp.ARROBA_DESDE):
@@ -1926,6 +2002,7 @@ def _preparar_indice(con: sqlite3.Connection) -> None:
         except sqlite3.OperationalError as e:
             print(f"[arranque] no pude añadir {tabla}.{col}: {e}", flush=True)
     migrar_raw_tipo(con)           # rellena el corpus ya indexado (ver la función)
+    migrar_canon_v1(con)           # ADITIVA: sólo donde `tipo` está vacío (ver la función)
     migrar_alias_a_rol(con)        # ② — después de SCHEMA (tablas garantizadas),
                                     # antes de CENSO cambiado (orden no crítico entre
                                     # ambas, pero así quedan agrupados: migraciones de
