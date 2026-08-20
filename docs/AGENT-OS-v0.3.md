@@ -356,14 +356,38 @@ CREATE TABLE org_activation (             -- una sola fila, la verdad del work p
 **Y la ventana se declara, no se disimula.** Hacer verdadero «el claim SIGUIENTE a la edición falla» exigiría rehashear el conjunto activo en cada claim, que es justo el coste que esta sección evita. Lo que el sistema puede sostener es más débil y hay que decirlo con su cota:
 
 ```
-verificador: al arranque · por cadencia (≤60 s) · ante evento de fichero
+VERIFY_INTERVAL_SECONDS   = 30       -- cada cuánto pasa el verificador
+MAX_INTEGRITY_AGE_SECONDS = 60       -- cuánto vale su sello
+
+verificador: al arranque · cada VERIFY_INTERVAL · ante evento de fichero
 detecta divergencia → integrity_ok = 0, atómico, ANTES de autorizar nada más
-claims con integrity_ok = 0 → fail closed
+
+claim exige:  integrity_ok = 1
+        AND   now_epoch − verified_at_epoch <= MAX_INTEGRITY_AGE_SECONDS
+
+en otro caso → 503 ORG_INTEGRITY_UNVERIFIED
 
 VENTANA DECLARADA: entre la edición y su detección puede concederse un claim.
-Cota: la cadencia del verificador. No es cero, y afirmar que lo es sería
-exactamente el tipo de promesa que §19 prohíbe.
+Cota: MAX_INTEGRITY_AGE. No es cero, y afirmar que lo es sería exactamente el
+tipo de promesa que §19 prohíbe.
 ```
+
+**La frescura no es un extra del flag: sin ella la cota es falsa.** `integrity_ok = 1` a secas es una autorización **eterna**. Si el verificador muere a las 12:01, alguien corrompe el snapshot activo a las 12:05 y nadie mira, tres días después el flag sigue en `1` y los claims siguen entrando. La ventana quedaba acotada a 60 s **sólo mientras el verificador estuviera sano** — o sea, acotada precisamente en el caso en que no hace falta acotarla.
+
+Con el SLA de frescura la propiedad cambia de forma: **si el verificador muere, el work plane acaba fallando cerrado por sí solo.** Un bit no puede convertirse en un permiso permanente.
+
+**Y el sello sólo vale para la revisión que sigue activa:**
+
+```sql
+UPDATE org_activation
+   SET integrity_ok = 1, verified_at_epoch = :now
+ WHERE singleton = 1
+   AND active_org_revision = :revision_que_verifiqué;   -- ← 0 filas ⇒ descartar
+```
+
+Un verificador lento que empezó a hashear la 42 no puede certificar la 43 si hubo una activación entre medias. Sin esta condición, una activación concurrente convierte un resultado válido para una revisión en un sello para otra que nadie miró.
+
+**Falsador F-A6** — matar el verificador dejando `integrity_ok = 1`, esperar más de `MAX_INTEGRITY_AGE` y reclamar ⇒ `503`. Es el que distingue «hay un detector» de «hay un detector vivo»: sin él, apagar el verificador **relaja** el sistema en vez de cerrarlo.
 
 **Falsador F-A4** — editar un byte de un artefacto de la revisión **activa** y esperar a que el verificador pase ⇒ el claim siguiente falla cerrado. Redactado así es comprobable; la versión anterior («el claim siguiente a la edición») no lo era con ninguna implementación que no hasheara por claim.
 
@@ -597,9 +621,12 @@ BEGIN IMMEDIATE;
 -- LA REVISIÓN QUE GOBIERNA, leída UNA vez y usada en todo el bloque. No se
 -- rehashea nada del filesystem aquí: `active_org_revision` ya es el resultado de
 -- haber verificado fuente + artefactos + compilador en la ACTIVACIÓN (§5).
-activa, ok = SELECT active_org_revision, integrity_ok FROM org_activation WHERE singleton = 1;
-if not ok:
-    ROLLBACK; return 503 org_integrity_failed    -- el conjunto activo no se sostiene
+activa, ok, verificado = SELECT active_org_revision, integrity_ok, verified_at_epoch
+                           FROM org_activation WHERE singleton = 1;
+if not ok or (:now_epoch - verificado) > MAX_INTEGRITY_AGE_SECONDS:
+    ROLLBACK; return 503 ORG_INTEGRITY_UNVERIFIED
+    -- las DOS: el conjunto no se sostiene, O nadie lo ha mirado hace demasiado.
+    -- Sin la segunda, un verificador muerto deja el permiso abierto para siempre.
 
 canonico = SELECT COALESCE(p.aliases_of, p.id) FROM principals p
             WHERE p.id = :principal AND p.org_revision = activa;
@@ -923,8 +950,13 @@ Con dos exigencias más que lo hacen calculable: el **instante de corte** de un 
 
 ```sql
 -- ORGANIZACIÓN (proyecciones compiladas; la fuente es roles-por-alias.json)
+-- MULTIVERSIÓN POR `org_revision`, y no es un adorno de esquema: con
+-- `id TEXT PRIMARY KEY`, preparar la 43 SOBRESCRIBE la fila de la 42, y entonces
+-- `active_org_revision = 42` apunta a una revisión que la propia proyección ha
+-- BORRADO. El modelo entero de §5 —preparar sin activar— era irrealizable con
+-- esta clave.
 CREATE TABLE principals (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL,
   type TEXT NOT NULL CHECK (type IN
     ('human','role','agent','service','alias','group','project','legacy')),
   accountable_by TEXT,                       -- principal.id, NULL sólo si type='human'
@@ -937,8 +969,14 @@ CREATE TABLE principals (
   -- no estaba en ninguna columna: sin ella, `backend#03` reclama un job de
   -- `db-migrations` sin más que pasar `:role=db-migrations`, porque el alcance
   -- dice a QUÉ proyectos, no EN NOMBRE DE QUIÉN.
-  role_id TEXT REFERENCES principals(id),    -- obligatorio si type='agent', NULL en el resto
+  role_id TEXT,                              -- obligatorio si type='agent', NULL en el resto
   org_revision INTEGER NOT NULL,
+  PRIMARY KEY (id, org_revision),
+  -- Las referencias organizativas se resuelven DENTRO de la misma revisión: un
+  -- agente de la 43 no puede apuntar al rol de la 42.
+  FOREIGN KEY (role_id,        org_revision) REFERENCES principals(id, org_revision),
+  FOREIGN KEY (aliases_of,     org_revision) REFERENCES principals(id, org_revision),
+  FOREIGN KEY (accountable_by, org_revision) REFERENCES principals(id, org_revision),
 
   -- COMBINACIONES IMPOSIBLES, impuestas por la base y no por la prosa. El modelo
   -- de §3 las prohibía en texto y el DDL las dejaba pasar todas: un `service` con
@@ -951,8 +989,13 @@ CREATE TABLE principals (
   CHECK (can_claim_jobs = 0 OR type = 'agent'),          -- §3: sólo agent reclama
   CHECK (type <> 'service' OR accountable_by IS NOT NULL)
 );
--- `role_id` REFERENCES principals(id) sólo garantiza que existe, no que sea un
--- ROL: SQLite no expresa «FK a las filas con type='role'». Lo valida el compilador
+-- REGLA GLOBAL, y aplica a TODA proyección organizativa que participe en
+-- autoridad: **preparar N+1 jamás muta ni elimina N**. Activar sólo mueve el
+-- puntero de `org_activation`. Una proyección que se sobrescribe al preparar
+-- convierte «preparar sin activar» en una contradicción.
+--
+-- La FK compuesta garantiza que la referencia EXISTE en esa revisión, no que sea
+-- un ROL: SQLite no expresa «FK a las filas con type='role'». Lo valida el compilador
 -- del Org SoT (§4) en la misma pasada de admisión que estos CHECK, y es un fallo
 -- de compilación, no un aviso — un agente que dice actuar en nombre de algo que
 -- no es un rol no se despliega.
@@ -1011,8 +1054,9 @@ CREATE TABLE gate_capability (                          -- qué gate PUEDE ejerc
   org_revision INTEGER, PRIMARY KEY (principal_id, gate, org_revision));
 
 CREATE TABLE risk_acceptance (
-  decision_class TEXT PRIMARY KEY, principal_id TEXT NOT NULL,
-  org_revision INTEGER NOT NULL);
+  decision_class TEXT NOT NULL, principal_id TEXT NOT NULL,
+  org_revision INTEGER NOT NULL,
+  PRIMARY KEY (decision_class, org_revision));   -- mismo fallo que `principals`
 
 -- TRABAJO
 CREATE TABLE jobs (
