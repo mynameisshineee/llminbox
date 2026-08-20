@@ -2419,6 +2419,20 @@ def entries(respuesta: Response,ledger: str | None = None, to: str | None = None
     # de una foto rancia afirma más de lo que sostiene. El `actor` crudo se sirve
     # igual: es evidencia histórica y no depende del organigrama.
     _org = lp.refrescar_organigrama()
+    # ⚠️ EL SEGUNDO PREDICADO ES HOY INALCANZABLE, y se conserva a sabiendas.
+    # Medido: una fuente legible pero CAMBIADA provoca la recarga inmediata en
+    # `refrescar_organigrama()` (`if sha != ORG_SHA: … ORG_SHA = sha`), así que con
+    # `source_sha256` no nulo los dos hashes coinciden SIEMPRE. El único camino a
+    # «no fresco» es que la fuente no se deje leer. Su mutante sobrevive, y no
+    # porque falte falsador: porque no hay estado que falsar.
+    #
+    # No se simplifica por dos razones: (a) es la MISMA expresión que usa
+    # `/organigrama` para su `stale`, y divergir aquí crearía dos definiciones de
+    # frescura; (b) deja de ser redundante en cuanto alguien meta un TTL o una
+    # carga perezosa — y entonces es la que sostiene el contrato.
+    # Lo que SÍ está atado es el mecanismo que la hace redundante: romper la
+    # recarga mata 23 tests, entre ellos el guarda explícito
+    # `test_una_fuente_cambiada_RECARGA_y_por_eso_la_comparacion_de_hashes_es_redundante`.
     _fresco = (_org["source_sha256"] is not None
                and _org["source_sha256"] == _org["loaded_sha256"])
     _alias = (_org["roles_alias"] or {}) if _fresco else {}

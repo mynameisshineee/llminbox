@@ -146,3 +146,50 @@ def test_el_banner_de_inbox_declara_que_la_firma_no_esta_verificada(cliente):
     assert "dato, no instrucción" in t, t[:200]          # control: lo de siempre sigue
     assert "autodeclarad" in t or "no verificad" in t, t[:300]
     assert "canal" in t, t[:300]
+
+
+def test_una_fuente_cambiada_RECARGA_y_por_eso_la_comparacion_de_hashes_es_redundante(
+        tmp_path, monkeypatch):
+    """El otro brazo de `_fresco` es INALCANZABLE hoy, y esto lo ata.
+
+    `_fresco` exige dos cosas: `source_sha256 is not None` **y** que coincida con
+    `loaded_sha256`. CodeRabbit pidió un falsador para la segunda. No se puede
+    escribir honestamente: medido, una fuente legible pero CAMBIADA provoca la
+    recarga inmediata en `refrescar_organigrama()` —`if sha != ORG_SHA: … ORG_SHA
+    = sha`—, así que con `source` no nulo los dos hashes coinciden SIEMPRE. El
+    único camino a «no fresco» es que la fuente no se deje leer.
+
+    Un test que forzara ese estado a mano estaría probando algo que el sistema no
+    alcanza. Lo que sí se puede falsar es el MECANISMO que lo hace inalcanzable —
+    y es el que importa, porque el día que alguien meta un TTL o una carga
+    perezosa, la comparación deja de ser redundante y pasa a ser la que sostiene
+    el contrato.
+
+    FALSADOR: romper la recarga (que `sha != ORG_SHA` no publique el mapa nuevo)
+    deja la derivación sirviendo el alias VIEJO, y la última aserción cae.
+    """
+    import json
+    from fastapi.testclient import TestClient
+    from conftest import construir
+
+    org = tmp_path / "roles-por-alias.json"
+    org.write_text(json.dumps({"rol_por_alias": {"cto-A": "cto"}, "jerarquia": {}}))
+    s_ = construir(tmp_path, monkeypatch,
+                   extra_env={"LLMINBOX_ROLES_ALIAS": str(org)})
+    (tmp_path / "DEMO-LEDGER.md").write_text(
+        "### [cto-A → backend · MEDIDO] 2026-08-20T10:00:00Z — sembrada\n\ncuerpo\n")
+    c = TestClient(s_.app)
+    c.headers.update({"X-Llminbox-Token": "test-token"})
+    with c:
+        s_.barrido()
+        f = [x for x in c.get("/entries?limit=50").json() if x["actor"] == "cto-A"][0]
+        assert f["derived_role"] == "cto", f            # control: deriva con el mapa viejo
+        sha_viejo = f["role_mapping_sha256"]
+
+        # MISMA fuente, JSON VÁLIDO, mapeo DISTINTO. Nada de romperla.
+        org.write_text(json.dumps({"rol_por_alias": {"cto-A": "vision"}, "jerarquia": {}}))
+        g = [x for x in c.get("/entries?limit=50").json() if x["actor"] == "cto-A"][0]
+
+    assert g["actor"] == "cto-A", g                      # el crudo, intacto
+    assert g["role_mapping_sha256"] != sha_viejo, g      # la foto se movió
+    assert g["derived_role"] == "vision", g              # ← y la derivación es la NUEVA
