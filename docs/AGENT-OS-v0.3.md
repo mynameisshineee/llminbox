@@ -349,8 +349,15 @@ CREATE TABLE org_activation (             -- una sola fila, la verdad del work p
   -- INTEGRIDAD DEL CONJUNTO ACTIVO. El arranque no basta: una edición POSTERIOR
   -- no cambia esta tabla, y el claim siguiente se concedía. Ahora el claim lee
   -- este flag —una columna, no el filesystem— y el verificador lo baja.
-  integrity_ok INTEGER NOT NULL DEFAULT 1,
-  verified_at_epoch INTEGER NOT NULL);
+  integrity_ok INTEGER NOT NULL DEFAULT 0,      -- ← 0, no 1: nace sin verificar
+  verified_at_epoch INTEGER NOT NULL,
+  -- QUÉ REVISIÓN se verificó. Sin esto, el sello es de «algo» y el claim lo
+  -- acepta para lo que sea que esté activo AHORA: el verificador certifica la 42
+  -- en t=0, se activa la 43 en t=1, y hasta t=60 los claims se conceden bajo la
+  -- 43 con el sello de la 42 — una revisión que nadie ha mirado todavía. Mi
+  -- guarda anterior impedía que un verificador LENTO certificara la revisión
+  -- equivocada, pero no que una ACTIVACIÓN heredara un sello ajeno.
+  verified_org_revision INTEGER NOT NULL);
 ```
 
 **Y la ventana se declara, no se disimula.** Hacer verdadero «el claim SIGUIENTE a la edición falla» exigiría rehashear el conjunto activo en cada claim, que es justo el coste que esta sección evita. Lo que el sistema puede sostener es más débil y hay que decirlo con su cota:
@@ -379,13 +386,25 @@ Con el SLA de frescura la propiedad cambia de forma: **si el verificador muere, 
 **Y el sello sólo vale para la revisión que sigue activa:**
 
 ```sql
+-- El verificador sella, diciendo QUÉ selló:
 UPDATE org_activation
-   SET integrity_ok = 1, verified_at_epoch = :now
+   SET integrity_ok = 1, verified_at_epoch = :now,
+       verified_org_revision = :revision_que_verifiqué
  WHERE singleton = 1
    AND active_org_revision = :revision_que_verifiqué;   -- ← 0 filas ⇒ descartar
+
+-- Y LA ACTIVACIÓN INVALIDA, en su misma transacción:
+UPDATE org_activation
+   SET active_org_revision = :nueva, activated_at_epoch = :now,
+       integrity_ok = 0                                  -- nadie ha mirado la nueva
+ WHERE singleton = 1;
 ```
 
+Las dos mitades, y ninguna sobra: `verified_org_revision` hace que el claim pueda **exigir** que el sello sea de la revisión que gobierna, y el reset en la activación hace que el sistema falle **cerrado** aunque alguien añada mañana otro camino de activación que olvide la semántica. El verificador es el único componente que vuelve a habilitar claims para una revisión.
+
 Un verificador lento que empezó a hashear la 42 no puede certificar la 43 si hubo una activación entre medias. Sin esta condición, una activación concurrente convierte un resultado válido para una revisión en un sello para otra que nadie miró.
+
+**Falsador F-A7** — verificar la 42, activar la 43 inmediatamente después y reclamar **antes** de que el verificador pase ⇒ `503`. Sin `verified_org_revision`, ese claim se concede con el sello de una revisión distinta durante toda la ventana de frescura.
 
 **Falsador F-A6** — matar el verificador dejando `integrity_ok = 1`, esperar más de `MAX_INTEGRITY_AGE` y reclamar ⇒ `503`. Es el que distingue «hay un detector» de «hay un detector vivo»: sin él, apagar el verificador **relaja** el sistema en vez de cerrarlo.
 
@@ -621,12 +640,16 @@ BEGIN IMMEDIATE;
 -- LA REVISIÓN QUE GOBIERNA, leída UNA vez y usada en todo el bloque. No se
 -- rehashea nada del filesystem aquí: `active_org_revision` ya es el resultado de
 -- haber verificado fuente + artefactos + compilador en la ACTIVACIÓN (§5).
-activa, ok, verificado = SELECT active_org_revision, integrity_ok, verified_at_epoch
-                           FROM org_activation WHERE singleton = 1;
-if not ok or (:now_epoch - verificado) > MAX_INTEGRITY_AGE_SECONDS:
+activa, ok, verificado, rev_verificada =
+    SELECT active_org_revision, integrity_ok, verified_at_epoch, verified_org_revision
+      FROM org_activation WHERE singleton = 1;
+if not ok
+   or rev_verificada != activa                                   -- el sello es de OTRA
+   or (:now_epoch - verificado) > MAX_INTEGRITY_AGE_SECONDS:      -- o está rancio
     ROLLBACK; return 503 ORG_INTEGRITY_UNVERIFIED
-    -- las DOS: el conjunto no se sostiene, O nadie lo ha mirado hace demasiado.
-    -- Sin la segunda, un verificador muerto deja el permiso abierto para siempre.
+    -- LAS TRES. Sin la primera, un snapshot corrupto autoriza. Sin la segunda,
+    -- activar una revisión hereda el sello de la anterior. Sin la tercera, un
+    -- verificador muerto deja el permiso abierto para siempre.
 
 canonico = SELECT COALESCE(p.aliases_of, p.id) FROM principals p
             WHERE p.id = :principal AND p.org_revision = activa;
@@ -1095,13 +1118,20 @@ CREATE TABLE job_dependencies (
 -- un número: no falla, da un resultado — y el lease se evapora o no caduca nunca.
 CREATE TABLE job_leases (
   job_id TEXT NOT NULL REFERENCES jobs(id),
-  principal_id TEXT NOT NULL REFERENCES principals(id),
+  principal_id TEXT NOT NULL,      -- FK COMPUESTA abajo: `principals.id` dejó de
+                                   -- ser único al versionar la tabla, y SQLite no
+                                   -- admite una columna no única como destino de
+                                   -- FK ⇒ «foreign key mismatch» al usarla. Lo
+                                   -- rompí yo en el commit anterior.
   lease_generation INTEGER NOT NULL,
   claimed_at_epoch  INTEGER NOT NULL,
   expires_at_epoch  INTEGER NOT NULL,
   released_at_epoch INTEGER,                -- NULL = sostenido
   ttl_seconds       INTEGER NOT NULL CHECK (ttl_seconds > 0),
   org_revision      INTEGER NOT NULL,       -- bajo QUÉ organización se autorizó
+  -- Y ata el lease al principal EXACTO de esa revisión, que además es la
+  -- evidencia correcta: «backend#03, tal como estaba definido en la 42».
+  FOREIGN KEY (principal_id, org_revision) REFERENCES principals(id, org_revision),
   CHECK (released_at_epoch IS NULL OR released_at_epoch <= expires_at_epoch),
   -- `NOT NULL` no impide 0 ni negativos, y con cualquiera de los dos el lease
   -- nace ya expirado: el watchdog lo desaloja en su primera pasada y el job entra
