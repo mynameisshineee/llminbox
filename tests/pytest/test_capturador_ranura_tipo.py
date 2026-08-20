@@ -19,11 +19,11 @@ Las tres gramáticas, y sólo la del medio tiene ranura al final:
     [actor → destino · TIPO]    → sí la hay
     [TIPO actor → destino]      → tipo FRONTAL (otra rama, `ETIQUETAS`)
 
-El discriminante es el OPERADOR DE RUTA. Sin él la cabecera no está dirigiendo a
+El discriminante es la FLECHA. Sin él la cabecera no está dirigiendo a
 nadie, y el último campo es un calificador —carril, sello, nota—, no un tipo.
 
 Medido sobre producción antes de tocar nada: de las capturas de esta rama, 10.512
-llevan operador de ruta y **270 no**. De esas 270: `64bis` 58, unos 35 timestamps
+llevan flecha y **272 no**. De esas 272: `64bis` 58, unos 35 timestamps
 (`## [qa-biklabs · 2026-07-18T21:45:15Z]` capturaba la FECHA), nombres de agente y
 fragmentos de prosa. El daño colateral aceptado y declarado: algún calificador que
 sí parecía un tipo —`TRIAGE-PARKED`, `MÉTODO`— deja de extraerse, porque
@@ -72,6 +72,41 @@ def test_una_conjuncion_JUNTO_a_una_flecha_si_dirige():
     assert _raw("### [db-mig → security ∧ qa ∧ cto · MEASURED] 2026-08-20T10:00Z — algo") == "MEASURED"
 
 
+def test_FLECHAS_RUTA_es_exactamente_lo_que_consume_el_parser_de_rutas():
+    """Las dos constantes tienen que decir lo mismo, o la cabecera tiene ranura de
+    tipo para una función y no para la otra.
+
+    Medido antes de estrecharla: con `←` dentro, `raw_tipo_de("[a ← b · 64bis]")`
+    devolvía `64bis` mientras `_campos()` —que sólo conoce `→` y `->`— tomaba
+    `64bis` como ACTOR. Dos lecturas de la misma cabecera.
+
+    CodeRabbit propuso arreglarlo por el otro lado: ampliar `_campos` a `←`/`<-`.
+    No, y no es conservadurismo: en `A ← B` la dirección se invierte, así que hay
+    que decidir quién es actor y quién destinatario. Eso es semántica nueva, no
+    dos caracteres más en un regex.
+
+    FALSADOR: cualquier flecha en `FLECHAS_RUTA` que `FLECHA` no reconozca pone
+    esto en rojo, en las dos direcciones.
+    """
+    import ledger_parse as lp
+    reconocidas = {f for f in ("→", "->", "←", "<-") if lp.FLECHA.search(f"a {f} b")}
+    assert set(lp.FLECHAS_RUTA) == reconocidas, (
+        f"FLECHAS_RUTA={lp.FLECHAS_RUTA} no coincide con lo que consume "
+        f"FLECHA={lp.FLECHA.pattern} → {reconocidas}")
+    # y las inversas siguen descalificando un candidato a tipo, que es OTRA pregunta
+    assert "←" in lp.OPERADORES_RUTA and "<-" in lp.OPERADORES_RUTA
+    assert not lp._es_token_de_tipo("a←b")
+
+
+def test_una_flecha_inversa_no_abre_ranura_de_tipo():
+    """Consecuencia directa: sin soporte de `←`, esa cabecera no dirige.
+
+    FALSADOR: meter `←` en FLECHAS_RUTA devuelve `64bis` — el defecto original,
+    por la tercera puerta.
+    """
+    assert _raw("### [a ← b · 64bis] 2026-08-20T10:00Z — algo") is None
+
+
 def test_con_ruta_el_ultimo_campo_SI_es_el_tipo():
     """CONTROL ①: la gramática dirigida conserva su ranura, y con un valor que
     ADEMÁS es nombre de agente — para que quede claro que la regla no mira el
@@ -104,3 +139,65 @@ def test_el_sello_de_fecha_deja_de_leerse_como_tipo():
     FALSADOR: sin la regla devuelve el timestamp como raw_tipo (~35 entradas).
     """
     assert _raw("## [qa-biklabs · 2026-07-18T21:45:15Z] Fechar el puntero") is None
+
+
+def test_el_bump_de_PARSER_V_rederiva_lo_YA_indexado_sin_tocar_los_ficheros(
+        tmp_path, monkeypatch):
+    """Arreglar el parser NO arregla el pasado: hay que probar el bump.
+
+    `barrido()` salta un ledger cuyo tamaño y mtime no han cambiado, así que las
+    58 entradas que ya tienen `raw_tipo='64bis'` en la base no se volverían a
+    mirar NUNCA — se fosilizarían con el valor falso mientras el código nuevo
+    presume de estar arreglado. Es el mismo defecto que ya costó una corrección en
+    la migración de `raw_tipo` (#9): el arreglo inerte sobre lo existente.
+
+    Se prueba la PROPIEDAD OBSERVABLE, no la mecánica interna: una base sellada
+    como `parser_v=9` con el valor falso guardado, el fichero SIN tocar, y tras el
+    arranque con `PARSER_V=10` el valor tiene que estar corregido.
+
+    FALSADOR: quitar el efecto del cambio de `parser_v` deja `'64bis'` vivo en la
+    base y la aserción cae.
+    """
+    from fastapi.testclient import TestClient
+    from conftest import construir, db_directa
+
+    # `construir()` SOBRESCRIBE el ledger de demo, así que la siembra va DESPUÉS.
+    s_ = construir(tmp_path, monkeypatch)
+    led = tmp_path / "DEMO-LEDGER.md"
+    led.write_text("### [wiki-vault·64bis] 2026-07-19T09:15:17Z — DONE de la tanda\n\ncuerpo\n")
+    with TestClient(s_.app):
+        s_.barrido()
+
+    con = db_directa(s_)
+    fila = con.execute(
+        "SELECT eid, ledger, head FROM entries WHERE head LIKE '%64bis%'").fetchone()
+    assert fila, "la entrada sembrada no se indexó: el test no mide nada"
+    # ESTADO HISTÓRICO: el valor falso guardado y el sello de la versión ANTERIOR.
+    con.execute("UPDATE entries SET raw_tipo='64bis' WHERE eid=?", (fila["eid"],))
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('parser_v', '9')")
+    con.commit()
+    antes_mtime = led.stat().st_mtime
+    cursores_antes = [dict(r) for r in con.execute("SELECT * FROM cursors ORDER BY agent, ledger")]
+
+    # SEGUNDO ARRANQUE con el PARSER_V de hoy. `construir()` reescribe el ledger de
+    # demo, así que se restaura BYTE A BYTE y se le devuelve su mtime: si el
+    # fichero pareciera nuevo, `barrido()` lo re-leería por el camino fácil y el
+    # test no probaría el bump, sino la detección de cambios que ya existía.
+    contenido = led.read_bytes()
+    s2 = construir(tmp_path, monkeypatch)
+    led.write_bytes(contenido)
+    import os
+    os.utime(led, (antes_mtime, antes_mtime))
+    with TestClient(s2.app):
+        s2.barrido()
+
+    assert led.stat().st_mtime == antes_mtime, "el fichero se movió: mediría el camino fácil"
+    ver = db_directa(s2)
+    e = ver.execute("SELECT raw_tipo FROM entries WHERE eid=?", (fila["eid"],)).fetchone()
+    assert e is not None, "la entrada desapareció: rederivar no puede perder filas"
+    assert e["raw_tipo"] is None, f"el valor falso sobrevivió al bump: {e['raw_tipo']!r}"
+    assert ver.execute("SELECT v FROM meta WHERE k='parser_v'").fetchone()["v"] == str(
+        __import__("ledger_parse").PARSER_V)
+    assert [dict(r) for r in ver.execute(
+        "SELECT * FROM cursors ORDER BY agent, ledger")] == cursores_antes, \
+        "la rederivación movió cursores"

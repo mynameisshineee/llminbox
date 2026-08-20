@@ -571,14 +571,27 @@ RAW_TIPO = re.compile(r"·\s*([^·\]\r\n]{1,64}?)\s*\]")
 # Operadores de RUTA del propio formato. Excluirlos no es vocabulario de palabras:
 # es respetar la sintaxis de la cabecera, donde `→`/`∧` separan actores.
 OPERADORES_RUTA = ("→", "->", "←", "<-", "∧", "&")
-# FLECHAS aparte, y la distinción es la que decide si una cabecera DIRIGE.
-# `OPERADORES_RUTA` existe para `_es_token_de_tipo`, que descarta candidatos con
-# forma de ruta — ahí las conjunciones cuentan, porque `a ∧ b` tampoco es un tipo.
-# Pero `∧` y `&` JUNTAN participantes; no acreditan dirección: `[wiki-vault ∧ qa ·
-# 64bis]` no manda nada a nadie. Reutilizar la constante ancha para decidir
-# «¿hay ranura de tipo?» mataba `[wiki-vault·64bis]` y dejaba VIVA su variante con
-# conjunción — el mismo defecto, con otra ropa.
-FLECHAS_RUTA = ("→", "->", "←", "<-")
+# DOS CONSTANTES, DOS PREGUNTAS. Reutilizar una para la otra ya produjo dos
+# defectos seguidos en esta misma función, así que la diferencia va escrita:
+#
+#   OPERADORES_RUTA  ¿qué caracteres prueban que un candidato NO es un tipo
+#                    atómico? Ahí entran las conjunciones (`a ∧ b` tampoco lo es)
+#                    y las flechas inversas: cualquiera de los seis descalifica.
+#
+#   FLECHAS_RUTA     ¿qué sintaxis de routing SOPORTA este parser? Sólo `→` y
+#                    `->`, que son las que consume `FLECHA` en `_campos()`.
+#
+# `←` y `<-` quedan FUERA a propósito, y no por omisión: `_campos()` no las
+# reconoce, así que tratarlas como ruta aquí crea la incoherencia de que
+# `[a ← b · 64bis]` tenga ranura de tipo para una función y no para la otra —
+# medido: `raw_tipo_de` devolvía `64bis` mientras `_campos` tomaba `64bis` como
+# ACTOR. Soportarlas de verdad exige decidir quién es actor y quién destinatario
+# cuando la dirección se invierte, y eso es semántica nueva, no dos caracteres
+# más en un regex. Otro trabajo, con su medición del corpus.
+#
+# Y `∧`/`&` tampoco: JUNTAN participantes, no acreditan dirección. Con ellas
+# dentro, `[wiki-vault ∧ qa · 64bis]` volvía a dar `64bis`.
+FLECHAS_RUTA = ("→", "->")
 
 
 def _es_token_de_tipo(v: str) -> bool:
