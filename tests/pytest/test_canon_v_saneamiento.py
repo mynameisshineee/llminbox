@@ -134,3 +134,84 @@ def test_raw_tipo_es_el_filtro_del_protocolo_legacy(tmp_path, monkeypatch):
         assert d[0]["raw_tipo"] == "HEARTBEAT"    # devuelve el literal, sin normalizar
         # búsqueda sin caja, pero el valor guardado NO se toca
         assert len(c.get("/entries?raw_tipo=heartbeat").json()) >= 1
+
+
+# ── las tres revisiones, y sus DOS caminos independientes ────────────────────
+
+def test_CANON_V_rederiva_tipo_SIN_reparsear_el_markdown(tmp_path, monkeypatch):
+    """Camino ①: cambia la semántica, `raw_tipo` intacto, `tipo` se recalcula.
+
+    Es lo que hace barato cambiar el vocabulario: no obliga a re-leer 68.822
+    cabeceras de markdown. `barrido()` ni siquiera tiene que tocar el fichero.
+
+    FALSADOR: un `CANON_V` que no dispare la rederivación deja el tipo viejo.
+    """
+    from fastapi.testclient import TestClient
+    from conftest import construir, db_directa
+    s_ = construir(tmp_path, monkeypatch)
+    (tmp_path / "DEMO-LEDGER.md").write_text(
+        "### [cto-A → backend · RESP] 2026-08-20T10:00:00Z — sembrada\n\ncuerpo\n")
+    with TestClient(s_.app):
+        s_.barrido()
+
+    con = db_directa(s_)
+    # Estado histórico incoherente: el lexema dice RESP, el tipo dice FYI.
+    con.execute("UPDATE entries SET tipo='FYI' WHERE raw_tipo='RESP'")
+    con.execute("DELETE FROM meta WHERE k='canon_v'")     # canon sin aplicar
+    con.commit()
+    raw_antes = con.execute("SELECT raw_tipo, head FROM entries WHERE raw_tipo='RESP'").fetchone()
+
+    s_.migrar_canon(con)
+
+    ver = db_directa(s_)
+    f = ver.execute("SELECT tipo, raw_tipo, head FROM entries WHERE raw_tipo='RESP'").fetchone()
+    assert f["tipo"] == "RESP", f"CANON_V no rederivó: {f['tipo']!r}"
+    assert f["raw_tipo"] == raw_antes["raw_tipo"], "tocó el lexema"
+    assert f["head"] == raw_antes["head"], "re-parseó el markdown: no hacía falta"
+    assert ver.execute("SELECT v FROM meta WHERE k='canon_v'").fetchone()["v"] == s_.CANON_V
+
+
+def test_PARSER_V_deja_tipo_COHERENTE_con_el_raw_nuevo(tmp_path, monkeypatch):
+    """Camino ②: cambia la extracción, `raw_tipo` cambia, y `tipo` NO puede
+    quedarse con el valor del lexema viejo.
+
+    Es el agujero que #15 tapó a mano con «REDERIVAR jamás toca tipo»: correcto
+    entonces —B no podía sanear—, pero fosilizarlo dejaría un `tipo` derivado de un
+    lexema que ya no existe. La política definitiva es que tras un cambio de parser
+    el tipo queda coherente con el raw NUEVO.
+
+    FALSADOR: si el bump de PARSER_V recalcula `raw_tipo` y no arrastra `tipo`,
+    la entrada queda con el tipo del lexema anterior.
+    """
+    from fastapi.testclient import TestClient
+    from conftest import construir, db_directa
+    import os
+
+    s_ = construir(tmp_path, monkeypatch)
+    led = tmp_path / "DEMO-LEDGER.md"
+    led.write_text("### [wiki-vault·64bis] 2026-07-19T09:15:17Z — sin ranura de tipo\n\ncuerpo\n")
+    with TestClient(s_.app):
+        s_.barrido()
+
+    con = db_directa(s_)
+    fila = con.execute("SELECT eid FROM entries WHERE head LIKE '%sin ranura%'").fetchone()
+    assert fila, "no se sembró"
+    # ESTADO DE UN PARSER VIEJO: capturaba el carril como lexema y lo interpretaba.
+    con.execute("UPDATE entries SET raw_tipo='RESP', tipo='RESP' WHERE eid=?", (fila["eid"],))
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('parser_v', '1')")
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('canon_v', ?)", (s_.CANON_V,))
+    con.commit()
+    contenido, mtime = led.read_bytes(), led.stat().st_mtime
+
+    s2 = construir(tmp_path, monkeypatch)
+    led.write_bytes(contenido)
+    os.utime(led, (mtime, mtime))
+    with TestClient(s2.app):
+        s2.barrido()
+
+    ver = db_directa(s2)
+    f = ver.execute("SELECT tipo, raw_tipo FROM entries WHERE eid=?", (fila["eid"],)).fetchone()
+    assert f["raw_tipo"] is None, f"el parser nuevo debía retirar el lexema: {f['raw_tipo']!r}"
+    assert f["tipo"] is None, \
+        (f"`tipo`={f['tipo']!r} sobrevive a un `raw_tipo` que ya no existe: quedó "
+         f"derivado de un lexema retirado")

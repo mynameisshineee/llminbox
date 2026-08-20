@@ -510,7 +510,18 @@ def huella_censo() -> str:
 # `meta`. Lo que importa es que un cambio de vocabulario no obligue a re-leer el
 # markdown, y que un cambio de parser no deje `tipo` incoherente con el `raw_tipo`
 # nuevo — que es exactamente el agujero que #15 tapó a mano.
-CANON_V = "2"   # 2: saneamiento global · 1: relleno aditivo (#15)
+# CANON_V VERSIONA LA SEMÁNTICA, no las fases de migración. Escribí "2" pensando
+# «#15 fue la uno, #16 es la dos» y eso vuelve a mezclar los dos conceptos que
+# esta separación existe para distinguir: #15 y #16 usan EL MISMO canon —los
+# mismos 12 tipos, el mismo alias MEDIDO→MEASURED, la misma `canonical_tipo()`—.
+# Lo que cambia es la MATERIALIZACIÓN histórica, no las reglas.
+#
+# El día que cambie la función —p.ej. adjudicar ADJUDICADO→RULING— entonces sí:
+# CANON_V 1 → 2, y eso dispara la rederivación porque la semántica es otra.
+#
+# `canon_v1_v` queda SÓLO como sello histórico de la migración aditiva de #15
+# («¿corrí aquel backfill?»), nunca como revisión semántica.
+CANON_V = "1"
 
 
 def migrar_canon(con) -> None:
@@ -543,7 +554,7 @@ def migrar_canon(con) -> None:
         con.execute("INSERT OR REPLACE INTO meta VALUES ('canon_v', ?)", (CANON_V,))
         con.commit()
         perdidas = sum(1 for t, _, _ in cambios if t is None)
-        print(f"[migración] canon v{CANON_V}: {len(cambios)} entradas recalculadas "
+        print(f"[migración] canon semántico v{CANON_V}: {len(cambios)} entradas recalculadas "
               f"({perdidas} pierden `tipo` por no tener lexema canónico; el lexema "
               f"se conserva íntegro en `raw_tipo`)", flush=True)
     except sqlite3.OperationalError as e:
@@ -1317,9 +1328,24 @@ def reindex(ledger: str, path: str, con) -> dict:
                     or prev["byte_off"] != e.byte_off
                     or prev["provisional"] != prov or prev["ausente"] is not None
                     or prev["raw_tipo"] != e.raw_tipo):
+                # `tipo` VIAJA CON `raw_tipo` CUANDO EL LEXEMA CAMBIA, y sólo ahí.
+                # La regla de #15 —«REDERIVAR jamás toca tipo»— era transitoria y
+                # correcta entonces: B no podía sanear histórico. Fosilizarla deja
+                # un `tipo` derivado de un lexema QUE YA NO EXISTE, que es lo que
+                # pasa tras un bump de PARSER_V: el capturador retira el carril
+                # falso de `### [wiki-vault·64bis]`, `raw_tipo` pasa a NULL y el
+                # tipo se quedaba en el valor de la captura anterior.
+                #
+                # No es saneamiento —eso lo hace `migrar_canon()` sobre TODO el
+                # corpus—: la guarda de arriba sólo entra cuando `raw_tipo` ha
+                # cambiado de verdad, así que aquí `tipo` se mantiene COHERENTE
+                # con su lexema, no se reinterpreta. Los dos ejes siguen separados:
+                #     ROSTER_V → actor/recipients (más abajo), NO tipo
+                #     PARSER_V → raw_tipo, y tipo detrás
                 con.execute("UPDATE entries SET seq=?, line_no=?, byte_off=?, ausente=NULL, "
-                            "provisional=?, raw_tipo=? WHERE ledger=? AND eid=?",
-                            (pos, e.line_no, e.byte_off, prov, e.raw_tipo, ledger, e.sha))
+                            "provisional=?, raw_tipo=?, tipo=? WHERE ledger=? AND eid=?",
+                            (pos, e.line_no, e.byte_off, prov, e.raw_tipo,
+                             lp.canonical_tipo(e.raw_tipo), ledger, e.sha))
                 refrescadas += 1
             # RE-DERIVAR SÍ respeta el corte, y aquí está su razón de ser: recalcular
             # el histórico con el router de `@` añadiría 1.679 entradas de golpe a las
