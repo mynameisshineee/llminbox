@@ -245,3 +245,84 @@ def test_el_backfill_es_ESTRICTAMENTE_aditivo(tmp_path, monkeypatch):
     hueco = ver.execute("SELECT tipo FROM entries WHERE raw_tipo='MEASURED'").fetchone()
     if hueco:
         assert hueco["tipo"] == "MEASURED"
+
+
+def test_REDERIVAR_no_sanea_tipo_ni_resucita_el_correo_del_latido(tmp_path, monkeypatch):
+    """El segundo camino de escritura, que las dos garantías de B no cubrían.
+
+    `migrar_canon_v1()` es aditiva, sí — pero `reindex()` tiene OTRA escritura para
+    entradas ya conocidas cuando `rederivar` está activo, y hacía dos cosas que B
+    promete no hacer:
+
+        UPDATE entries SET actor=?, tipo=?     ← saneaba el tipo histórico
+        for w in e.to: dest.append(...)        ← sin el gate del latido
+
+    Y no es un camino teórico: lo dispara el gate de `roster_v`/`parser_v`, o sea
+    cualquier despliegue con censo o troceador nuevos. Con él, una entrada
+    histórica cambiaba de tipo ANTES de la PR que lo adjudica, y los latidos
+    recuperaban el correo cosechado que acabábamos de quitarles — porque
+    REDERIVAR hace `DELETE FROM recipients` antes y reconstruye.
+
+    La regla de B, y es más simple que cualquier `viejo or nuevo`:
+
+        eid existente + tipo poblado  ⇒  tipo BYTE-IDÉNTICO tras cualquier REDERIVAR
+
+    #16/A cambiará esa política a conciencia. Aquí no.
+
+    FALSADOR: reintroducir `tipo=e.tipo` en el UPDATE cae en la 2ª aserción;
+    quitar el gate del latido cae en la 1ª.
+    """
+    from fastapi.testclient import TestClient
+    from conftest import construir, db_directa
+
+    env = {"LLMINBOX_ARROBA_DESDE": "2026-01-01"}
+    s_ = construir(tmp_path, monkeypatch, extra_env=env)
+    led = tmp_path / "DEMO-LEDGER.md"
+    led.write_text(
+        "### [HEARTBEAT cto-A] 2026-08-20T10:00:00Z — vig_a viva, el cierre es de @backend\n\nuno\n"
+        "### [cto-A → backend · MEDIDO] 2026-08-20T10:01:00Z — basura historica\n\ndos\n"
+        "### [HEARTBEAT cto-A → backend] 2026-08-20T10:02:00Z — vig_a viva dirigida\n\ntres\n")
+    with TestClient(s_.app):
+        s_.barrido()
+
+    con = db_directa(s_)
+    # ESTADO HISTÓRICO: el HEARTBEAT con su tipo puesto, y el MEDIDO con un `FYI`
+    # deliberadamente incorrecto — la basura exacta que #16/A vendrá a corregir.
+    con.execute("UPDATE entries SET tipo='HEARTBEAT' WHERE raw_tipo='HEARTBEAT'")
+    con.execute("UPDATE entries SET tipo='FYI' WHERE raw_tipo='MEDIDO'")
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('parser_v', '1')")   # fuerza REDERIVAR
+    con.commit()
+    cursores_antes = [dict(r) for r in con.execute("SELECT * FROM cursors ORDER BY agent, ledger")]
+    contenido, mtime = led.read_bytes(), led.stat().st_mtime
+
+    # SEGUNDO ARRANQUE: el fichero NO se toca; lo que dispara la re-derivación es
+    # el gate de `parser_v`, que es el camino real en producción.
+    import os
+    s2 = construir(tmp_path, monkeypatch, extra_env=env)
+    led.write_bytes(contenido)
+    os.utime(led, (mtime, mtime))
+    with TestClient(s2.app):
+        s2.barrido()
+
+    ver = db_directa(s2)
+    def fila(raw):
+        return ver.execute("SELECT eid, tipo, raw_tipo FROM entries WHERE raw_tipo=? "
+                           "AND head LIKE ? LIMIT 1", (raw, "%vig_a viva, el%" if raw == "HEARTBEAT"
+                                                       else "%basura%")).fetchone()
+    hb, md = fila("HEARTBEAT"), fila("MEDIDO")
+    assert hb and md, "las entradas sembradas no sobrevivieron a la re-derivación"
+
+    cosechados = [r[0] for r in ver.execute("SELECT who FROM recipients WHERE eid=?", (hb["eid"],))]
+    assert cosechados == [], f"REDERIVAR resucitó el correo cosechado del latido: {cosechados}"
+    assert md["tipo"] == "FYI", f"REDERIVAR saneó un tipo histórico: eso es #16/A ({md['tipo']!r})"
+    assert hb["tipo"] == "HEARTBEAT", f"REDERIVAR saneó el latido: {hb['tipo']!r}"
+    assert md["raw_tipo"] == "MEDIDO", "el lexema se destruyó"
+
+    # CONTROL POSITIVO: el latido con FLECHA explícita SÍ conserva destinatario —
+    # `por_arroba=False` ahí—, o estaríamos suprimiendo todos los latidos.
+    dirigido = ver.execute("SELECT eid FROM entries WHERE head LIKE '%dirigida%'").fetchone()
+    assert "backend" in [r[0] for r in ver.execute(
+        "SELECT who FROM recipients WHERE eid=?", (dirigido["eid"],))], "se suprimió un envío deliberado"
+
+    assert [dict(r) for r in ver.execute(
+        "SELECT * FROM cursors ORDER BY agent, ledger")] == cursores_antes, "movió cursores"

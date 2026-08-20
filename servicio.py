@@ -1163,6 +1163,23 @@ def indice_ilegible() -> str:
     return ""
 
 
+def _latido_cosechado(e) -> bool:
+    """¿Es un latido cuyo destinatario se COSECHÓ del texto libre?
+
+    UNA sola definición, usada en los DOS caminos de escritura de `reindex()`: el
+    de entradas nuevas y el de RE-DERIVAR. Estaba sólo en el primero, y por eso
+    `rederivar` —que hace `DELETE FROM recipients` y reconstruye— resucitaba el
+    correo cosechado que la otra rama acababa de suprimir. Lo disparaba cualquier
+    despliegue con censo o troceador nuevos.
+
+    Por el LEXEMA porque `HEARTBEAT` quedó fuera de `CANON_TIPOS` y `tipo` es None;
+    `casefold` porque `raw_tipo` conserva la caja literal del autor; y con
+    `por_arroba` porque lo que se descarta es el nombre COSECHADO — un latido con
+    flecha explícita lo escribió alguien a mano y sigue dirigiendo.
+    """
+    return (e.raw_tipo or "").casefold() == "heartbeat" and e.por_arroba
+
+
 def reindex(ledger: str, path: str, con) -> dict:
     """Reindexa un ledger identificando cada entrada por su CONTENIDO.
 
@@ -1261,8 +1278,18 @@ def reindex(ledger: str, path: str, con) -> dict:
                 # puede reconocer a alguien que antes no existía. Se recalcula lo
                 # DERIVADO y se conserva el `arrival`, que es lo que sostiene el
                 # cursor de cada agente.
-                con.execute("UPDATE entries SET actor=?, tipo=? WHERE ledger=? AND eid=?",
-                            (e.actor, e.tipo, ledger, e.sha))
+                # `tipo` NO SE TOCA, y es la regla de esta PR: una entrada ya
+                # conocida con `tipo` poblado sale byte-idéntica de cualquier
+                # RE-DERIVAR. Antes se reescribía aquí, así que el saneamiento
+                # histórico —que mueve 31.077 filas y tiene consumidores vivos—
+                # se colaba por este camino ANTES de la PR que lo adjudica, y
+                # bastaba un despliegue con censo nuevo para dispararlo. Nada de
+                # `viejo or nuevo` ni excepciones: #16/A cambiará esta política a
+                # conciencia, y entonces será una decisión, no un efecto lateral.
+                con.execute("UPDATE entries SET actor=? WHERE ledger=? AND eid=?",
+                            (e.actor, ledger, e.sha))
+                if _latido_cosechado(e):
+                    continue          # ni `to` ni `difusion`: los dos son cosecha
                 for w in e.to:
                     dest.append((ledger, e.sha, w))
                 # LA DIFUSIÓN TAMBIÉN, y su ausencia aquí era DESTRUCTIVA Y RECURRENTE.
@@ -1310,7 +1337,7 @@ def reindex(ledger: str, path: str, con) -> dict:
         # casar. Sin migrarla, los latidos empezaban a dirigir correo cosechado:
         # las 1.040 filas de destinatario fabricadas que esta línea cerró.
         # `casefold` porque `raw_tipo` conserva la caja literal que tecleó el autor.
-        latido_cosechado = (e.raw_tipo or "").casefold() == "heartbeat" and e.por_arroba
+        latido_cosechado = _latido_cosechado(e)
         if latido_cosechado:
             pass
         elif (not e.por_arroba) or previos or (lp.ARROBA_DESDE and e.ts and e.ts >= lp.ARROBA_DESDE):
