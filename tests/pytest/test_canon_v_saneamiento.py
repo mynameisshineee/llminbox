@@ -98,15 +98,31 @@ def test_un_tipo_no_canonico_FALLA_en_vez_de_devolver_vacio(cliente):
     assert "HEARTBEAT" in str(d), d         # y qué valor rechazó
 
 
-def test_el_alias_se_normaliza_tambien_en_el_filtro(cliente):
+def test_el_alias_se_normaliza_tambien_en_el_filtro(tmp_path, monkeypatch):
     """`?tipo=MEDIDO` → `MEASURED`: un único normalizador gobierna almacenamiento
     Y filtro, o la API contradice a la base.
 
-    FALSADOR: un filtro que compare crudo devuelve 0 para `MEDIDO`, porque en la
-    base ya está guardado como `MEASURED`.
+    ⚠️ Mi primera versión sólo comprobaba `status_code == 200` — **vacuo**: un
+    filtro que compare crudo devuelve `[]` y sigue dando 200. Lo cazó CodeRabbit.
+    Hay que SEMBRAR la entrada y exigir que la consulta por el alias la ENCUENTRE.
+
+    FALSADOR: comparar el parámetro crudo en vez del canonizado devuelve 0 filas.
     """
-    assert cliente.get("/entries?tipo=MEDIDO").status_code == 200
-    assert cliente.get("/entries?tipo=medido").status_code == 200   # y sin caja
+    from fastapi.testclient import TestClient
+    from conftest import construir
+    s_ = construir(tmp_path, monkeypatch)
+    (tmp_path / "DEMO-LEDGER.md").write_text(
+        "### [cto-A → backend · MEDIDO] 2026-08-20T10:00:00Z — sembrada alias\n\ncuerpo\n")
+    c = TestClient(s_.app)
+    c.headers.update({"X-Llminbox-Token": "test-token"})
+    with c:
+        s_.barrido()
+        for grafia in ("MEDIDO", "medido", "MEASURED"):
+            d = [x for x in c.get(f"/entries?tipo={grafia}").json()
+                 if "sembrada alias" in (x["head"] or "")]
+            assert d, f"?tipo={grafia} no encontró la entrada"
+            assert d[0]["tipo"] == "MEASURED", d[0]      # guardado canonizado
+            assert d[0]["raw_tipo"] == "MEDIDO", d[0]    # lexema intacto
 
 
 def test_raw_tipo_es_el_filtro_del_protocolo_legacy(tmp_path, monkeypatch):
@@ -215,3 +231,49 @@ def test_PARSER_V_deja_tipo_COHERENTE_con_el_raw_nuevo(tmp_path, monkeypatch):
     assert f["tipo"] is None, \
         (f"`tipo`={f['tipo']!r} sobrevive a un `raw_tipo` que ya no existe: quedó "
          f"derivado de un lexema retirado")
+
+
+def test_migrar_raw_tipo_arrastra_el_tipo_en_la_MISMA_transaccion(tmp_path, monkeypatch):
+    """El tercer writer de `raw_tipo`, y el que quedaba sin la regla.
+
+    `reindex()` ya arrastra `tipo` cuando el lexema cambia. `migrar_raw_tipo()` no:
+    recalcula el lexema de TODO el corpus desde el `head` guardado y dejaba el
+    tipo con el valor del lexema anterior. Y el saneamiento no lo rescata, porque
+    `migrar_canon()` corre DESPUÉS y hace `return` si su sello ya está puesto.
+
+    El caso que lo hace visible es un ledger DORMIDO: `barrido()` lo salta cuando
+    su tamaño y mtime no cambian, así que no hay `reindex()` que lo arregle nunca.
+
+    La regla, ahora para los tres writers: **quien cambia `raw_tipo` actualiza
+    `tipo` en la misma transacción**. No hace falta invalidar `canon_v` ni inventar
+    un sello compuesto — eso volvería a mezclar materialización con semántica.
+
+    FALSADOR: si `migrar_raw_tipo` sólo escribe `raw_tipo`, el tipo sobrevive a su
+    lexema y la segunda aserción cae.
+    """
+    from fastapi.testclient import TestClient
+    from conftest import construir, db_directa
+    s_ = construir(tmp_path, monkeypatch)
+    (tmp_path / "DEMO-LEDGER.md").write_text(
+        "### [wiki-vault·64bis] 2026-07-19T09:15:17Z — ledger dormido\n\ncuerpo\n")
+    with TestClient(s_.app):
+        s_.barrido()
+
+    con = db_directa(s_)
+    e = con.execute("SELECT eid FROM entries WHERE head LIKE '%dormido%'").fetchone()
+    assert e, "no se sembró"
+    # Estado de un extractor VIEJO: capturó el carril y alguien lo interpretó.
+    # El canon YA está aplicado —su sello es el actual—, así que `migrar_canon()`
+    # no volverá a mirar nada: si el arrastre no ocurre aquí, no ocurre.
+    con.execute("UPDATE entries SET raw_tipo='RESP', tipo='RESP' WHERE eid=?", (e["eid"],))
+    con.execute("DELETE FROM meta WHERE k='raw_tipo_v'")
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('canon_v', ?)", (s_.CANON_V,))
+    con.commit()
+
+    s_.migrar_raw_tipo(con)      # sólo ésta: sin reindex, sin tocar el fichero
+
+    ver = db_directa(s_)
+    f = ver.execute("SELECT tipo, raw_tipo FROM entries WHERE eid=?", (e["eid"],)).fetchone()
+    assert f["raw_tipo"] is None, f"el extractor nuevo debía retirar el lexema: {f['raw_tipo']!r}"
+    assert f["tipo"] is None, \
+        f"`tipo`={f['tipo']!r} sobrevive a su lexema: el arrastre no ocurrió en esta transacción"

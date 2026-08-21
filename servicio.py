@@ -652,11 +652,23 @@ def migrar_raw_tipo(con) -> None:
         # POSITIVOS (algo que se tomó por tipo y no lo era — el titular con
         # `· trampa]`), así que `derivado is None` con valor guardado también es
         # un cambio que hay que escribir.
-        cambios = [(d, r["ledger"], r["eid"])
+        # `tipo` VIAJA CON EL LEXEMA, en la MISMA transacción. Es el tercer writer
+        # de `raw_tipo` y era el único sin la regla: recalculaba el lexema de todo
+        # el corpus y dejaba el tipo con el valor del ANTERIOR. El saneamiento no
+        # lo rescata —`migrar_canon()` corre después y hace `return` si su sello ya
+        # está—, y en un ledger DORMIDO tampoco hay `reindex()` que lo arregle:
+        # `barrido()` lo salta mientras tamaño y mtime no cambien.
+        #
+        # No se invalida `canon_v` ni se inventa un sello compuesto: eso volvería a
+        # mezclar materialización con semántica, que es lo que la separación de
+        # ejes evita. La regla, ahora para los TRES writers de `raw_tipo`:
+        # quien lo cambia, deja su derivado coherente aquí mismo.
+        cambios = [(d, lp.canonical_tipo(d), r["ledger"], r["eid"])
                    for r in con.execute("SELECT ledger, eid, head, raw_tipo FROM entries")
                    if (d := lp.raw_tipo_de(r["head"])) != r["raw_tipo"]]
         if cambios:
-            con.executemany("UPDATE entries SET raw_tipo=? WHERE ledger=? AND eid=?", cambios)
+            con.executemany("UPDATE entries SET raw_tipo=?, tipo=? WHERE ledger=? AND eid=?",
+                            cambios)
         # El sello va en la MISMA transacción que los datos: un `commit` entre
         # medias dejaría una base a medio migrar sellada como migrada.
         con.execute("INSERT OR REPLACE INTO meta VALUES ('raw_tipo_v', ?)", (RAW_TIPO_V,))
@@ -2072,6 +2084,20 @@ def _preparar_indice(con: sqlite3.Connection) -> None:
     # disciplina —26 de 96 cerrados (27 %)—, porque «qa: 10 de 10» incluía el relevo
     # que le hice yo esa mañana. Un dato que no distingue las dos cosas se lee como
     # la buena.
+    # ÍNDICES AÑADIDOS: por la vía aditiva, NO dentro de `SCHEMA`. Meterlo ahí
+    # rompió 172 tests en la primera versión — `SCHEMA` se aplica en un camino que
+    # no tolera lo que le añadí, y el efecto no fue un error claro sino «no such
+    # table: cursors»: la base entera dejaba de construirse.
+    #
+    # `raw_tipo` PRIMERO en el índice, y el orden importa: `/entries?raw_tipo=` se
+    # consulta SIN ledger —es búsqueda global por lexema—, así que uno que empezara
+    # por `ledger` no lo cubriría. Con `ledger` detrás sigue sirviendo la acotada.
+    # NOCASE para que case con el filtro del endpoint.
+    try:
+        con.execute("CREATE INDEX IF NOT EXISTS i_raw_tipo "
+                    "ON entries(raw_tipo COLLATE NOCASE, ledger)")
+    except sqlite3.OperationalError as e:
+        print(f"[arranque] no pude crear i_raw_tipo: {e}", flush=True)
     for tabla, col, tipo in COLUMNAS_ANADIDAS:
         try:
             hay = {r[1] for r in con.execute(f"PRAGMA table_info({tabla})")}
@@ -2513,7 +2539,14 @@ def entries(respuesta: Response,ledger: str | None = None, to: str | None = None
         # significa?». Búsqueda sin caja porque `raw_tipo` conserva la del autor
         # (`MEDIDO` y `Medido` conviven), pero lo GUARDADO y lo DEVUELTO no se
         # normaliza nunca: es evidencia.
-        w.append("lower(e.raw_tipo)=?"); p.append(raw_tipo.strip().lower())
+        # `COLLATE NOCASE`, no `lower()`: aplicar una función a la columna impide
+        # usar el índice, y además mezclaba dos reglas distintas —el `lower()` de
+        # SQLite es esencialmente ASCII, el de Python es Unicode—, así que un
+        # lexema con acentos se comparaba con criterios que no coinciden.
+        # ⚠️ NOCASE da comparación case-insensitive ASCII. Suficiente para el
+        # vocabulario real (HEARTBEAT · MEDIDO · RESP); NO es casefold Unicode, y
+        # no se promete como tal. El día que haga falta, se diseña aparte.
+        w.append("e.raw_tipo = ? COLLATE NOCASE"); p.append(raw_tipo.strip())
     if since:
         w.append("e.ts>=?"); p.append(since)
     if q:
