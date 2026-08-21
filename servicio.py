@@ -605,7 +605,16 @@ def migrar_canon_v1(con) -> None:
         print(f"[migración] canon v1 NO aplicada: {e}", flush=True)
 
 
-RAW_TIPO_V = "2"
+# v3: el CONTRATO de esta migración cambió, no la semántica del canon. v2
+# materializaba `head → raw_tipo`; v3 materializa `head → raw_tipo` Y su derivado
+# `tipo`, ATÓMICAMENTE. Por eso sube aquí y `CANON_V` sigue en 1: son dos ejes, y
+# meter uno dentro del otro —el sello compuesto que se propuso— volvería a
+# mezclar materialización con semántica.
+#
+# El bump obliga a que una base sellada en v2 pase UNA vez por el writer nuevo,
+# aunque su canon ya esté aplicado y sus ledgers estén dormidos. Sin él, esas
+# bases se quedan con un `tipo` derivado de un lexema que ya no existe.
+RAW_TIPO_V = "3"
 
 
 def migrar_raw_tipo(con) -> None:
@@ -2516,7 +2525,12 @@ def entries(respuesta: Response,ledger: str | None = None, to: str | None = None
     # flota VERIFICA enrutado, así que un 0 falso dispara re-trabajo real.
     if actor:
         w.append("e.actor=?"); p.append(lp.canonico(actor))
-    if tipo:
+    # `is not None`, no truthiness: `?tipo=` es un valor SUMINISTRADO, y si `tipo`
+    # es vocabulario gobernado, cualquier valor suministrado y no canonizable
+    # falla. Con `if tipo:` la cadena vacía se ignoraba en silencio y devolvía el
+    # corpus ENTERO a quien creía estar filtrando. No poner el parámetro sigue
+    # siendo «sin filtro»; ponerlo vacío es una consulta inválida.
+    if tipo is not None:
         # `tipo` ES VOCABULARIO GOBERNADO, y el endpoint lo hace cumplir. Un valor
         # fuera del canon NO devuelve `[]`: eso lo lee un cliente antiguo como «no
         # hay latidos» cuando significa «tu consulta ya no vale bajo este

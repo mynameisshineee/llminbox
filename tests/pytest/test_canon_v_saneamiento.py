@@ -301,3 +301,87 @@ def test_el_indice_de_raw_tipo_existe_en_una_base_NUEVA(tmp_path, monkeypatch):
     idx = [r[0] for r in db_directa(s_).execute(
         "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='entries'")]
     assert "i_raw_tipo" in idx, f"el índice no se creó en una base nueva: {idx}"
+
+
+def test_un_tipo_VACIO_tambien_falla(cliente):
+    """`?tipo=` entraba por `if tipo:` y equivalía a NO poner filtro.
+
+    Si `tipo` es vocabulario gobernado, cualquier valor SUMINISTRADO y no
+    canonizable falla — y la cadena vacía es un valor suministrado. Ignorarla en
+    silencio devuelve el corpus entero a quien creía estar filtrando.
+
+    FALSADOR: con `if tipo:` esto da 200 y la aserción cae.
+    """
+    assert cliente.get("/entries?tipo=").status_code == 422
+    assert cliente.get("/entries").status_code == 200          # SIN parámetro: sin filtro
+
+
+def test_el_indice_es_EL_QUE_DISENAMOS_no_uno_cualquiera(tmp_path, monkeypatch):
+    """Que exista `i_raw_tipo` no basta: tiene que ser el índice decidido.
+
+    Las tres propiedades se eligieron por motivos concretos y un test que sólo
+    mire el nombre las deja caer sin avisar:
+        raw_tipo PRIMERO  → `/entries?raw_tipo=` se consulta SIN ledger
+        NOCASE            → case-insensitive ASCII, que es lo que el filtro usa
+        ledger DETRÁS     → sigue ayudando cuando sí se acota
+
+    FALSADOR: invertir el orden o quitar la collation deja el índice existiendo y
+    sirviendo mal — exactamente el fallo que no se ve.
+    """
+    from fastapi.testclient import TestClient
+    from conftest import construir, db_directa
+    s_ = construir(tmp_path, monkeypatch)
+    with TestClient(s_.app):
+        s_.barrido()
+    con = db_directa(s_)
+    assert "i_raw_tipo" in [r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='entries'")]
+    cols = [r["name"] for r in con.execute("PRAGMA index_info(i_raw_tipo)")]
+    assert cols == ["raw_tipo", "ledger"], f"orden equivocado: {cols}"
+    x = {r["name"]: r["coll"] for r in con.execute("PRAGMA index_xinfo(i_raw_tipo)") if r["name"]}
+    assert x.get("raw_tipo", "").upper() == "NOCASE", f"collation de raw_tipo: {x}"
+
+
+def test_subir_RAW_TIPO_V_arrastra_el_tipo_sin_reindex(tmp_path, monkeypatch):
+    """El contrato de ESA migración cambió, así que su versión sube.
+
+    v2 materializaba `head → raw_tipo`. v3 materializa `head → raw_tipo` **y** su
+    derivado, atómicamente. No es Canon v2 —la semántica `raw_tipo → tipo` no ha
+    cambiado— y por eso `CANON_V` sigue en 1: son dos ejes distintos y el sello
+    compuesto que se propuso volvería a mezclarlos.
+
+    El bump obliga a que una base sellada en v2 pase UNA vez por el writer nuevo,
+    aunque su canon ya esté aplicado y su ledger esté dormido.
+
+    FALSADOR: sin subir la versión, `migrar_raw_tipo` hace `return` y la fila se
+    queda con el tipo de un lexema que ya no existe.
+    """
+    from fastapi.testclient import TestClient
+    from conftest import construir, db_directa
+    import os
+    s_ = construir(tmp_path, monkeypatch)
+    led = tmp_path / "DEMO-LEDGER.md"
+    led.write_text("### [wiki-vault·64bis] 2026-07-19T09:15:17Z — sellada en v2\n\ncuerpo\n")
+    with TestClient(s_.app):
+        s_.barrido()
+
+    con = db_directa(s_)
+    e = con.execute("SELECT eid FROM entries WHERE head LIKE '%sellada en v2%'").fetchone()
+    con.execute("UPDATE entries SET raw_tipo='RESP', tipo='RESP' WHERE eid=?", (e["eid"],))
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('raw_tipo_v', '2')")
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('canon_v', ?)", (s_.CANON_V,))
+    con.commit()
+    contenido, mtime = led.read_bytes(), led.stat().st_mtime
+
+    s2 = construir(tmp_path, monkeypatch)          # arranque: _preparar_indice
+    led.write_bytes(contenido); os.utime(led, (mtime, mtime))
+    with TestClient(s2.app):
+        pass                                        # sin barrido: sólo el arranque
+
+    ver = db_directa(s2)
+    f = ver.execute("SELECT tipo, raw_tipo FROM entries WHERE eid=?", (e["eid"],)).fetchone()
+    assert f["raw_tipo"] is None, f"el lexema no se recalculó: {f['raw_tipo']!r}"
+    assert f["tipo"] is None, f"`tipo`={f['tipo']!r} sobrevive a su lexema"
+    m = dict(ver.execute("SELECT k,v FROM meta WHERE k IN ('raw_tipo_v','canon_v')").fetchall())
+    assert m["raw_tipo_v"] == "3", m
+    assert m["canon_v"] == s2.CANON_V == "1", f"CANON_V no debía moverse: {m}"
