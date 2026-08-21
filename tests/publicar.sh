@@ -122,6 +122,23 @@ else
   mal "lexema conservado" "cabecera con · MEDIDO ·" "$(grep -o '· [A-Z]*\]' "$T/L.md" | tail -1)"
 fi
 
+publica cto-A qa MeDiDo "y el caso también se teclea" >/dev/null 2>&1
+if grep -q '^### \[cto-A → qa · MeDiDo\]' "$T/L.md"; then
+  bien "y conserva la GRAFÍA exacta (MeDiDo), no la mayusculiza"
+else
+  mal "grafía conservada" "cabecera con · MeDiDo ·" "$(grep -o '· [A-Za-z]*\]' "$T/L.md" | tail -1)"
+fi
+# Y sigue siendo publicable e interpretable: si el troceador no leyera el slot en
+# minúsculas, conservar la grafía sería emitir algo que el indexador no rutea.
+python3 -c "
+import sys; sys.path.insert(0,'.')
+import ledger_parse as lp
+h = [l for l in open('$T/L.md') if 'MeDiDo' in l][-1]
+r = lp.raw_tipo_de(h)
+sys.exit(0 if r == 'MeDiDo' and lp.canonical_tipo(r) == 'MEASURED' else 1)" \
+  && bien "y el troceador la lee: raw_tipo=MeDiDo · tipo=MEASURED" \
+  || mal "grafía rara indexable" "raw_tipo=MeDiDo tipo=MEASURED" "no resuelve"
+
 echo "── el carril no es opcional ──"
 # «Un carril, una ledger por sesión» deja de ser disciplina y pasa a ser mecánica.
 S="$(printf 'x\n' | env -u BIK_CARRIL -u LLMI_LEDGER LLMI_YO=cto-A LLMI_A=qa LLMI_TIPO=FYI \

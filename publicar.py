@@ -124,7 +124,22 @@ def ledger_del_carril() -> tuple[str, str]:
 def main() -> None:
     yo = os.environ["LLMI_YO"].strip()
     crudos = [d.strip() for d in os.environ["LLMI_A"].split(",") if d.strip()]
-    tipo = os.environ["LLMI_TIPO"].strip().upper()
+    # SIN `.upper()`: lo que se teclea es lo que se escribe. Lo llevaba desde el
+    # principio y contradecía el contrato que este mismo fichero enuncia doce líneas
+    # más abajo — «lo que va a la cabecera es el lexema tecleado». Con el `.upper()`
+    # iba el lexema MAYUSCULIZADO, que no es lo mismo.
+    #
+    # Quitarlo no rompe nada aguas abajo, medido y no supuesto: el troceador lee el
+    # slot tal cual (`· medido]` → raw_tipo='medido'), `canonical_tipo` normaliza el
+    # caso al interpretar (medido → MEASURED), y `/entries?raw_tipo=` compara con
+    # `COLLATE NOCASE`. Ni el enrutado ni el filtro dependen del caso.
+    #
+    # Y el caso no es evidencia de vocabulario: de los 271 lexemas del corpus, UNA
+    # familia difiere sólo en caso (AVISO:45 · aviso:35), y no es canónica. Lo que
+    # `raw_tipo` prueba es QUÉ PALABRA escribió la flota — por eso se conserva el
+    # alias MEDIDO y no se reescribe a MEASURED. El caso viaja con ella porque es
+    # más barato conservarlo que justificar por qué se toca.
+    tipo = os.environ["LLMI_TIPO"].strip()
     titular = os.environ["LLMI_TITULAR"].strip()
 
     # ① identidad: la del que firma y la de cada destinatario. Un nombre fuera del
