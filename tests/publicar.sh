@@ -130,14 +130,17 @@ else
 fi
 # Y sigue siendo publicable e interpretable: si el troceador no leyera el slot en
 # minúsculas, conservar la grafía sería emitir algo que el indexador no rutea.
-python3 -c "
+if python3 -c "
 import sys; sys.path.insert(0,'.')
 import ledger_parse as lp
 h = [l for l in open('$T/L.md') if 'MeDiDo' in l][-1]
 r = lp.raw_tipo_de(h)
-sys.exit(0 if r == 'MeDiDo' and lp.canonical_tipo(r) == 'MEASURED' else 1)" \
-  && bien "y el troceador la lee: raw_tipo=MeDiDo · tipo=MEASURED" \
-  || mal "grafía rara indexable" "raw_tipo=MeDiDo tipo=MEASURED" "no resuelve"
+sys.exit(0 if r == 'MeDiDo' and lp.canonical_tipo(r) == 'MEASURED' else 1)"
+then
+  bien "y el troceador la lee: raw_tipo=MeDiDo · tipo=MEASURED"
+else
+  mal "grafía rara indexable" "raw_tipo=MeDiDo tipo=MEASURED" "no resuelve"
+fi
 
 echo "── el carril no es opcional ──"
 # «Un carril, una ledger por sesión» deja de ser disciplina y pasa a ser mecánica.
