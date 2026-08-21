@@ -124,7 +124,22 @@ def ledger_del_carril() -> tuple[str, str]:
 def main() -> None:
     yo = os.environ["LLMI_YO"].strip()
     crudos = [d.strip() for d in os.environ["LLMI_A"].split(",") if d.strip()]
-    tipo = os.environ["LLMI_TIPO"].strip().upper()
+    # SIN `.upper()`: lo que se teclea es lo que se escribe. Lo llevaba desde el
+    # principio y contradecía el contrato que este mismo fichero enuncia doce líneas
+    # más abajo — «lo que va a la cabecera es el lexema tecleado». Con el `.upper()`
+    # iba el lexema MAYUSCULIZADO, que no es lo mismo.
+    #
+    # Quitarlo no rompe nada aguas abajo, medido y no supuesto: el troceador lee el
+    # slot tal cual (`· medido]` → raw_tipo='medido'), `canonical_tipo` normaliza el
+    # caso al interpretar (medido → MEASURED), y `/entries?raw_tipo=` compara con
+    # `COLLATE NOCASE`. Ni el enrutado ni el filtro dependen del caso.
+    #
+    # Y el caso no es evidencia de vocabulario: de los 271 lexemas del corpus, UNA
+    # familia difiere sólo en caso (AVISO:45 · aviso:35), y no es canónica. Lo que
+    # `raw_tipo` prueba es QUÉ PALABRA escribió la flota — por eso se conserva el
+    # alias MEDIDO y no se reescribe a MEASURED. El caso viaja con ella porque es
+    # más barato conservarlo que justificar por qué se toca.
+    tipo = os.environ["LLMI_TIPO"].strip()
     titular = os.environ["LLMI_TITULAR"].strip()
 
     # ① identidad: la del que firma y la de cada destinatario. Un nombre fuera del
@@ -142,10 +157,22 @@ def main() -> None:
                   "un nombre mal tecleado parece dirigido y no llega a nadie")
         dest.append(lp.canonico(d))
 
-    # ② tipo declarado. `TIPOS` es el mismo tuple que lee el troceador: si mañana se
-    # añade uno, esto lo acepta sin tocarse.
-    if tipo not in lp.TIPOS:
-        muere(f"tipo '{tipo}' no declarado", "los válidos son: " + " · ".join(lp.TIPOS))
+    # ② tipo declarado, y la autoridad es UNA: `canonical_tipo` — la misma que gobierna
+    # `/entries?tipo=` y la que decide qué se guarda en `entries.tipo`. Antes esto leía
+    # `lp.TIPOS` (8 lexemas) mientras la API ya gobernaba por el canon (12 + alias), así
+    # que había dos autoridades y la más estrecha estaba en la puerta: el 21-ago-2026
+    # dos hallazgos reales se publicaron como PRODUCED porque FINDING no pasaba.
+    #
+    # No se amplía `TIPOS`: eso sería volver a tener dos listas que hay que sincronizar
+    # a mano. Se delega. Y se delega la ACEPTACIÓN, no la escritura: lo que va a la
+    # cabecera es `tipo`, el lexema tecleado — `raw_tipo` es la evidencia y el canon su
+    # interpretación. Si aquí escribiéramos el canónico, MEDIDO desaparecería del corpus
+    # y con él la medida que justifica el alias.
+    if lp.canonical_tipo(tipo) is None:
+        muere(f"tipo '{tipo}' no declarado",
+              "los válidos son: " + " · ".join(sorted(lp.CANON_TIPOS))
+              + (" · alias: " + " · ".join(f"{a}→{c}" for a, c in sorted(lp.ALIASES.items()))
+                 if lp.ALIASES else ""))
     if not titular:
         muere("sin titular", "el titular viaja solo: es lo único que muchos leerán")
 
