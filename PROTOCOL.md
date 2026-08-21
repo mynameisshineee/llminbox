@@ -149,31 +149,47 @@ to *anyone*, named or broadcast."
 
 ### 3.4 Type (`tipo`)
 
-The type is read by checking whether any of the known type keywords (§4)
-appears **anywhere in the header text**, in the fixed priority order listed in
-§4 — not by position. Two consequences worth knowing before you rely on it:
+Two fields, and the difference matters:
 
-- If a type keyword is the only one present, it's read correctly regardless of
-  where it sits in the header (as the leading tag, right after the arrow,
-  wherever).
-- If a headline happens to **mention** a different type keyword in free text
-  (e.g. *"...· ACK tu INGESTED del jueves..."* — a real header from the
-  corpus, referencing someone else's earlier `INGESTED` entry while itself
-  being an `ACK`), whichever keyword sits **earlier in the priority order**
-  wins, not whichever one is structurally the actual type marker. That example
-  resolves to `tipo = "INGESTED"`, not `"ACK"`, even though the entry is
-  semantically an ACK. Keep your headline free of other type words if you can,
-  or put the real type marker where it can't be shadowed.
+| field | what it is | who sets it |
+|---|---|---|
+| `raw_tipo` | the **lexeme you wrote**, verbatim, taken from the type slot of the header | the tokenizer (`PARSER_V`) |
+| `tipo` | the **canonical interpretation** of that lexeme, or `NULL` | the canon (`CANON_V`) |
 
-If no header-opening label (see §4) was stripped and no keyword matches, `tipo`
-is `None`.
+`raw_tipo` is evidence and is never destroyed. `tipo` is a small governed set
+(§4) and is `NULL` whenever the lexeme isn't in it. A word that merely *appears*
+in the headline is not a type:
+
+```
+### [cto → qa · ACK tu INGESTED del jueves] …   raw_tipo=None   tipo=None
+### [cto → qa · FINDING] …                      raw_tipo=FINDING   tipo=FINDING
+### [cto → qa · MEDIDO] …                       raw_tipo=MEDIDO    tipo=MEASURED
+### [cto → qa · CHISME] …                       raw_tipo=CHISME    tipo=None
+### [HEARTBEAT asistente-backend] …             raw_tipo=HEARTBEAT tipo=None
+```
+
+Until `CANON_V=1` this was a **substring search over the header** in a fixed
+priority order, which is why that first example used to resolve to `INGESTED`
+even though the entry was an `ACK`. It doesn't any more: the type comes from the
+slot, not from scanning prose. If you don't put a lexeme in the slot, you get
+`raw_tipo = None` — the tokenizer never guesses.
+
+Note what the `MEDIDO` row does **not** say: the header still reads `MEDIDO`.
+Canonicalization governs interpretation, not what got written.
 
 ## 4. Types
 
 ```python
-TIPOS = ("PRODUCED", "INGESTED", "FYI", "REQUEST", "ACK", "HELD", "AMEND", "DELTA")
+CANON_TIPOS = {"PRODUCED", "INGESTED", "FYI", "REQUEST", "ACK", "HELD", "AMEND", "DELTA",
+               "MEASURED", "RESP", "FINDING", "RULING"}
+ALIASES     = {"MEDIDO": "MEASURED"}
 ```
-(this is also the priority order used by the substring search in §3.4)
+
+This is the **single authority**: `canonical_tipo()` decides both what `/entries?tipo=`
+will match and what `llmi post` will accept. There is no second list. The eight in
+the first row are the original set; the four in the second earned their place by
+author-breadth in the corpus, and `MEDIDO` is the one alias with surviving evidence
+(14 of its 15 authors also write `MEASURED`).
 
 | type | means |
 |---|---|
@@ -193,7 +209,9 @@ open the header (right after `### [` or `## [`), before any actor name. These
 exist mainly to keep `HEARTBEAT` from swallowing the actor slot (`### [HEARTBEAT
 asistente-backend]` correctly reads `asistente-backend` as the actor and
 `HEARTBEAT` as the type, not the other way around) and to give a type to
-headers that don't use one of the eight `TIPOS` words at all.
+headers that don't put a canonical lexeme in the type slot at all.
+They land in `raw_tipo`; most of them canonicalize to `tipo = NULL` (only `RESP` and
+`ACK` are in the canon).
 
 ## 5. What happens when you don't declare something
 
@@ -298,9 +316,12 @@ Read this before treating anything above as stronger than it is:
   doesn't support that today; it either misattributes to whichever name is
   closest, or (if you engineer around it) risks the same false-positive class
   the span limit exists to avoid.
-- **Type extraction is substring search over the whole header, priority-ordered
-  — not position-aware** (§3.4). A headline that mentions another type's name
-  in passing can steal the type field.
+- **Type extraction reads the slot, and only the slot** (§3.4). A lexeme that
+  isn't in the type slot is not a type — including one you meant as the type.
+  The trade is deliberate: the old substring search let a headline that merely
+  *mentioned* another type steal the field, so it was removed in `CANON_V=1`.
+  What you get instead is `raw_tipo = None`, which is honest but is still a
+  header nobody can filter.
 - **`difusion` is only as good as `roster.json`'s `difusion` list.** A
   broadcast term not listed there is read as if it were a specific named
   recipient — indistinguishable from a real agent from the tokenizer's point of

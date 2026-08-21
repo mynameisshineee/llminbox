@@ -74,6 +74,49 @@ S="$(publica cto-A qa CHISME "algo")"
 grep -q "no declarado" <<<"$S" && bien "un tipo inventado se rechaza, y enseña los válidos" \
   || mal "tipo inventado" "«no declarado» + lista" "$S"
 
+echo "── una sola autoridad de tipo: la del canon, no un tuple paralelo ──"
+# El defecto que esto cierra NO era latente: el 21-ago-2026 hubo que publicar dos
+# hallazgos reales del fit-gap como PRODUCED porque el publicador rechazaba FINDING.
+# La API ya gobernaba por `canonical_tipo`; el publicador seguía leyendo `TIPOS`. Dos
+# autoridades ⇒ la flota etiqueta mal lo que sí sabe nombrar.
+#
+# FALSADOR DE LA REGLA, no de la lista: se recorre el dominio de `canonical_tipo`
+# —canon + alias— y se exige que el publicador acepte EXACTAMENTE eso. Si mañana
+# alguien vuelve a meter un tuple aparte, este bucle se pone rojo solo, sin editarlo.
+DOMINIO="$(python3 -c "
+import sys; sys.path.insert(0,'.')
+import ledger_parse as lp
+print(' '.join(sorted(set(lp.CANON_TIPOS) | set(lp.ALIASES))))")"
+FALLOS=0
+for t in $DOMINIO; do
+  publica cto-A qa "$t" "titular de $t" >/dev/null 2>&1 || { FALLOS=$((FALLOS+1)); echo "     · rechazado: $t"; }
+done
+[ "$FALLOS" = "0" ] && bien "el publicador acepta todo el dominio del canon ($(wc -w <<<"$DOMINIO" | tr -d ' ') lexemas, alias incluidos)" \
+  || mal "dominio del canon publicable" "0 rechazos" "$FALLOS rechazos"
+
+# CONTRACONTROL: aceptar de más sería peor que aceptar de menos. Un tipo que el canon
+# no reconoce entra a `entries.tipo` como NULL y desaparece de `/entries?tipo=`.
+for t in HEARTBEAT DONE CLAIM MSG CHISME; do
+  S="$(publica cto-A qa "$t" "algo")"
+  # No basta con «salida≠0»: un rechazo por OTRO motivo (tipo vacío, censo, carril)
+  # dejaría este falsador en verde sin medir nada. Se exige el motivo Y el lexema.
+  if grep -q "no declarado" <<<"$S" && grep -q "'$t'" <<<"$S"; then
+    bien "$t fuera del canon se rechaza, y el rechazo lo nombra"
+  else
+    mal "$t fuera del canon" "«tipo '$t' no declarado»" "$(head -1 <<<"$S")"
+  fi
+done
+
+echo "── canonizar gobierna la aceptación, no borra la evidencia ──"
+# `MEDIDO` se acepta PORQUE `canonical_tipo` lo alias-ea a MEASURED. Pero lo que se
+# escribe en la ledger es el lexema que el autor tecleó: `raw_tipo` es la prueba, y
+# `tipo` es la interpretación. Si el publicador escribiera MEASURED, destruiría el
+# dato con el que se midió que 14 de 15 autores de MEDIDO también escriben MEASURED.
+publica cto-A qa MEDIDO "un alias conserva su lexema" >/dev/null 2>&1
+grep -q '^### \[cto-A → qa · MEDIDO\]' "$T/L.md" \
+  && bien "el alias se publica con SU lexema (MEDIDO), no reescrito a MEASURED" \
+  || mal "lexema conservado" "cabecera con · MEDIDO ·" "$(grep -o '· [A-Z]*\]' "$T/L.md" | tail -1)"
+
 echo "── el carril no es opcional ──"
 # «Un carril, una ledger por sesión» deja de ser disciplina y pasa a ser mecánica.
 S="$(printf 'x\n' | env -u BIK_CARRIL -u LLMI_LEDGER LLMI_YO=cto-A LLMI_A=qa LLMI_TIPO=FYI \
