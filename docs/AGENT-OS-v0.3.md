@@ -650,6 +650,23 @@ intente `renew` con su lease de antes ⇒ **rechazo**. Si lo acepta, los estados
 revisión no son lease-free y el fencing tiene un hueco por el que vuelve el
 ataque de la generación viva.
 
+**Y la carrera, que es el caso que de verdad importa.** F-J3 tal como está escrito
+es secuencial, y así no mide nada interesante: `renew` y `result_submit` pueden
+llegar a la vez —es lo normal cuando el heartbeat corre en un hilo aparte del que
+entrega—. `renew` **no** es una excepción al contrato transaccional de §16: se
+serializa con `BEGIN IMMEDIATE` como cualquier otra mutación, así que sólo hay dos
+órdenes posibles y **las dos son seguras**:
+
+| quién commitea primero | qué pasa |
+|---|---|
+| `result_submit` | el estado ya es `RESULT_SUBMITTED`; la comprobación de estado del `renew` falla ⇒ **rechazo**. Es F-J3, ahora por carrera y no por secuencia |
+| `renew` | extiende un lease que `result_submit` libera un instante después. **Inocuo**: no cambia el estado, no crea generación, y el lease muere igual en la transacción siguiente |
+
+Lo que **no** puede ocurrir es que las dos se entrelacen y quede un lease vivo
+sobre un job entregado — que es justo el hueco por el que volvería el ataque de la
+generación viva. Sin `BEGIN IMMEDIATE` esa tercera posibilidad existiría, y por eso
+el contrato de §16 es precondición de L-1, no un detalle de implementación.
+
 **`unblock` es una transición con contrato, no un botón.** La API expone `POST /jobs/{id}/unblock` y §9 no decía de dónde sale ni adónde va, que es justo lo que un worker necesita saber para no quedarse esperando un lease que ya no tiene:
 
 | | |
