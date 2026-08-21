@@ -498,6 +498,70 @@ def huella_censo() -> str:
 # los ledgers dormidos no vuelven a pasar por `reindex()`—, que es literalmente el
 # defecto que esta migración nació para cerrar. Medido sobre una copia de la base
 # viva: la re-pasada rescata 66 entradas y no pierde ninguna.
+# TRES REVISIONES INDEPENDIENTES, y separarlas es el contrato que sustituye a la
+# regla transitoria de #15 («REDERIVAR jamás toca tipo»). Cada una gobierna un
+# tramo distinto de la derivación, y confundirlas fue lo que produjo el defecto:
+#
+#   ROSTER_V   identidad · actor · routing     → rederiva actor/recipients, NO tipo
+#   PARSER_V   markdown → raw_tipo             → rederiva raw_tipo, y tipo detrás
+#   CANON_V    raw_tipo → tipo                 → rederiva SÓLO tipo, sin re-parsear
+#
+# No es un framework de migraciones: son tres enteros y su valor aplicado en
+# `meta`. Lo que importa es que un cambio de vocabulario no obligue a re-leer el
+# markdown, y que un cambio de parser no deje `tipo` incoherente con el `raw_tipo`
+# nuevo — que es exactamente el agujero que #15 tapó a mano.
+# CANON_V VERSIONA LA SEMÁNTICA, no las fases de migración. Escribí "2" pensando
+# «#15 fue la uno, #16 es la dos» y eso vuelve a mezclar los dos conceptos que
+# esta separación existe para distinguir: #15 y #16 usan EL MISMO canon —los
+# mismos 12 tipos, el mismo alias MEDIDO→MEASURED, la misma `canonical_tipo()`—.
+# Lo que cambia es la MATERIALIZACIÓN histórica, no las reglas.
+#
+# El día que cambie la función —p.ej. adjudicar ADJUDICADO→RULING— entonces sí:
+# CANON_V 1 → 2, y eso dispara la rederivación porque la semántica es otra.
+#
+# `canon_v1_v` queda SÓLO como sello histórico de la migración aditiva de #15
+# («¿corrí aquel backfill?»), nunca como revisión semántica.
+CANON_V = "1"
+
+
+def migrar_canon(con) -> None:
+    """`tipo = canonical_tipo(raw_tipo)` para TODO el corpus. Sin excepciones.
+
+    #15 fue aditiva a propósito —rellenó huecos y no tocó nada poblado— y eso dejó
+    la columna a medias: 29.708 de 68.822 filas seguían diciendo algo que su lexema
+    no sostiene, porque el matcher por subcadena las clasificó desde la PROSA.
+
+    Medido antes de escribirla, sobre el corpus vivo:
+        tipo → NULL ....... 29.414   HEARTBEAT 21.630 · FYI 4.943 · ACK 1.039
+        tipo → OTRO ..........  294   FYI→RESP 112 · FYI→ACK 67 · ACK→RESP 29
+        NULL → tipo ..........    0
+    Las 294 son falsos positivos corrigiéndose: su lexema real era otro.
+
+    NADA de `old or new`, ni excepción para HEARTBEAT. La autoridad es `raw_tipo`,
+    aunque eso implique PERDER clasificación derivada históricamente: una entrada
+    sin lexema no tiene tipo, por mucho que alguien se lo adivinara antes.
+    `raw_tipo` NO se toca — es la evidencia.
+    """
+    try:
+        fila = con.execute("SELECT v FROM meta WHERE k='canon_v'").fetchone()
+        if fila and fila["v"] == CANON_V:
+            return
+        cambios = [(t, r["ledger"], r["eid"])
+                   for r in con.execute("SELECT ledger, eid, tipo, raw_tipo FROM entries")
+                   if (t := lp.canonical_tipo(r["raw_tipo"])) != r["tipo"]]
+        if cambios:
+            con.executemany("UPDATE entries SET tipo=? WHERE ledger=? AND eid=?", cambios)
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('canon_v', ?)", (CANON_V,))
+        con.commit()
+        perdidas = sum(1 for t, _, _ in cambios if t is None)
+        print(f"[migración] canon semántico v{CANON_V}: {len(cambios)} entradas recalculadas "
+              f"({perdidas} pierden `tipo` por no tener lexema canónico; el lexema "
+              f"se conserva íntegro en `raw_tipo`)", flush=True)
+    except sqlite3.OperationalError as e:
+        con.rollback()
+        print(f"[migración] canon v{CANON_V} NO aplicada: {e}", flush=True)
+
+
 CANON_V1_V = "1"
 
 
@@ -541,7 +605,16 @@ def migrar_canon_v1(con) -> None:
         print(f"[migración] canon v1 NO aplicada: {e}", flush=True)
 
 
-RAW_TIPO_V = "2"
+# v3: el CONTRATO de esta migración cambió, no la semántica del canon. v2
+# materializaba `head → raw_tipo`; v3 materializa `head → raw_tipo` Y su derivado
+# `tipo`, ATÓMICAMENTE. Por eso sube aquí y `CANON_V` sigue en 1: son dos ejes, y
+# meter uno dentro del otro —el sello compuesto que se propuso— volvería a
+# mezclar materialización con semántica.
+#
+# El bump obliga a que una base sellada en v2 pase UNA vez por el writer nuevo,
+# aunque su canon ya esté aplicado y sus ledgers estén dormidos. Sin él, esas
+# bases se quedan con un `tipo` derivado de un lexema que ya no existe.
+RAW_TIPO_V = "3"
 
 
 def migrar_raw_tipo(con) -> None:
@@ -588,11 +661,23 @@ def migrar_raw_tipo(con) -> None:
         # POSITIVOS (algo que se tomó por tipo y no lo era — el titular con
         # `· trampa]`), así que `derivado is None` con valor guardado también es
         # un cambio que hay que escribir.
-        cambios = [(d, r["ledger"], r["eid"])
+        # `tipo` VIAJA CON EL LEXEMA, en la MISMA transacción. Es el tercer writer
+        # de `raw_tipo` y era el único sin la regla: recalculaba el lexema de todo
+        # el corpus y dejaba el tipo con el valor del ANTERIOR. El saneamiento no
+        # lo rescata —`migrar_canon()` corre después y hace `return` si su sello ya
+        # está—, y en un ledger DORMIDO tampoco hay `reindex()` que lo arregle:
+        # `barrido()` lo salta mientras tamaño y mtime no cambien.
+        #
+        # No se invalida `canon_v` ni se inventa un sello compuesto: eso volvería a
+        # mezclar materialización con semántica, que es lo que la separación de
+        # ejes evita. La regla, ahora para los TRES writers de `raw_tipo`:
+        # quien lo cambia, deja su derivado coherente aquí mismo.
+        cambios = [(d, lp.canonical_tipo(d), r["ledger"], r["eid"])
                    for r in con.execute("SELECT ledger, eid, head, raw_tipo FROM entries")
                    if (d := lp.raw_tipo_de(r["head"])) != r["raw_tipo"]]
         if cambios:
-            con.executemany("UPDATE entries SET raw_tipo=? WHERE ledger=? AND eid=?", cambios)
+            con.executemany("UPDATE entries SET raw_tipo=?, tipo=? WHERE ledger=? AND eid=?",
+                            cambios)
         # El sello va en la MISMA transacción que los datos: un `commit` entre
         # medias dejaría una base a medio migrar sellada como migrada.
         con.execute("INSERT OR REPLACE INTO meta VALUES ('raw_tipo_v', ?)", (RAW_TIPO_V,))
@@ -1264,9 +1349,24 @@ def reindex(ledger: str, path: str, con) -> dict:
                     or prev["byte_off"] != e.byte_off
                     or prev["provisional"] != prov or prev["ausente"] is not None
                     or prev["raw_tipo"] != e.raw_tipo):
+                # `tipo` VIAJA CON `raw_tipo` CUANDO EL LEXEMA CAMBIA, y sólo ahí.
+                # La regla de #15 —«REDERIVAR jamás toca tipo»— era transitoria y
+                # correcta entonces: B no podía sanear histórico. Fosilizarla deja
+                # un `tipo` derivado de un lexema QUE YA NO EXISTE, que es lo que
+                # pasa tras un bump de PARSER_V: el capturador retira el carril
+                # falso de `### [wiki-vault·64bis]`, `raw_tipo` pasa a NULL y el
+                # tipo se quedaba en el valor de la captura anterior.
+                #
+                # No es saneamiento —eso lo hace `migrar_canon()` sobre TODO el
+                # corpus—: la guarda de arriba sólo entra cuando `raw_tipo` ha
+                # cambiado de verdad, así que aquí `tipo` se mantiene COHERENTE
+                # con su lexema, no se reinterpreta. Los dos ejes siguen separados:
+                #     ROSTER_V → actor/recipients (más abajo), NO tipo
+                #     PARSER_V → raw_tipo, y tipo detrás
                 con.execute("UPDATE entries SET seq=?, line_no=?, byte_off=?, ausente=NULL, "
-                            "provisional=?, raw_tipo=? WHERE ledger=? AND eid=?",
-                            (pos, e.line_no, e.byte_off, prov, e.raw_tipo, ledger, e.sha))
+                            "provisional=?, raw_tipo=?, tipo=? WHERE ledger=? AND eid=?",
+                            (pos, e.line_no, e.byte_off, prov, e.raw_tipo,
+                             lp.canonical_tipo(e.raw_tipo), ledger, e.sha))
                 refrescadas += 1
             # RE-DERIVAR SÍ respeta el corte, y aquí está su razón de ser: recalcular
             # el histórico con el router de `@` añadiría 1.679 entradas de golpe a las
@@ -2001,8 +2101,24 @@ def _preparar_indice(con: sqlite3.Connection) -> None:
                 print(f"[arranque] {tabla}: columna {col} añadida", flush=True)
         except sqlite3.OperationalError as e:
             print(f"[arranque] no pude añadir {tabla}.{col}: {e}", flush=True)
+    # ÍNDICES AÑADIDOS — DESPUÉS del bucle, y el orden ERA el defecto: `SCHEMA`
+    # crea `entries` SIN `raw_tipo` (la columna llega por la vía aditiva de
+    # arriba), así que crearlo antes fallaba con «no such column» en TODA base
+    # nueva, el `except` lo registraba y nadie reintentaba: quedaba sin el
+    # índice que `?raw_tipo=` necesita, en silencio.
+    #
+    # Va por vía aditiva y no dentro de `SCHEMA` porque meterlo ahí rompió 172
+    # tests. Y `raw_tipo` PRIMERO: `/entries?raw_tipo=` se consulta SIN ledger
+    # —búsqueda global por lexema—, y uno que empezara por `ledger` no lo
+    # cubriría; con `ledger` detrás sigue sirviendo la consulta acotada.
+    try:
+        con.execute("CREATE INDEX IF NOT EXISTS i_raw_tipo "
+                    "ON entries(raw_tipo COLLATE NOCASE, ledger)")
+    except sqlite3.OperationalError as e:
+        print(f"[arranque] no pude crear i_raw_tipo: {e}", flush=True)
     migrar_raw_tipo(con)           # rellena el corpus ya indexado (ver la función)
     migrar_canon_v1(con)           # ADITIVA: sólo donde `tipo` está vacío (ver la función)
+    migrar_canon(con)              # GLOBAL: tipo = canonical_tipo(raw_tipo) (ver la función)
     migrar_alias_a_rol(con)        # ② — después de SCHEMA (tablas garantizadas),
                                     # antes de CENSO cambiado (orden no crítico entre
                                     # ambas, pero así quedan agrupados: migraciones de
@@ -2377,7 +2493,8 @@ def roster():
 
 @app.get("/entries", dependencies=GATE)
 def entries(respuesta: Response,ledger: str | None = None, to: str | None = None, actor: str | None = None,
-            tipo: str | None = None, since: str | None = None, q: str | None = None,
+            tipo: str | None = None, raw_tipo: str | None = None,
+            since: str | None = None, q: str | None = None,
             limit: int = Query(50, le=500), cuerpo: bool = False,
             orden: str = Query("ts", pattern="^(ts|arrival)$")):
     # PEDIR CUERPOS ACOTA LA CONSULTA. `cuerpo=true` no capaba `limit`, así que una
@@ -2408,8 +2525,43 @@ def entries(respuesta: Response,ledger: str | None = None, to: str | None = None
     # flota VERIFICA enrutado, así que un 0 falso dispara re-trabajo real.
     if actor:
         w.append("e.actor=?"); p.append(lp.canonico(actor))
-    if tipo:
-        w.append("e.tipo=?"); p.append(tipo)
+    # `is not None`, no truthiness: `?tipo=` es un valor SUMINISTRADO, y si `tipo`
+    # es vocabulario gobernado, cualquier valor suministrado y no canonizable
+    # falla. Con `if tipo:` la cadena vacía se ignoraba en silencio y devolvía el
+    # corpus ENTERO a quien creía estar filtrando. No poner el parámetro sigue
+    # siendo «sin filtro»; ponerlo vacío es una consulta inválida.
+    if tipo is not None:
+        # `tipo` ES VOCABULARIO GOBERNADO, y el endpoint lo hace cumplir. Un valor
+        # fuera del canon NO devuelve `[]`: eso lo lee un cliente antiguo como «no
+        # hay latidos» cuando significa «tu consulta ya no vale bajo este
+        # contrato» — la rotura silenciosa exacta que llevamos días quitando. Y el
+        # mismo normalizador que gobierna el almacenamiento gobierna el filtro, o
+        # la API contradice a la base: `?tipo=MEDIDO` tiene que encontrar lo que se
+        # guardó como MEASURED.
+        canon = lp.canonical_tipo(tipo)
+        if canon is None:
+            raise HTTPException(422, {
+                "error": "tipo_no_canonico",
+                "tipo": tipo,
+                "use": "raw_tipo",
+                "detalle": (f"`{tipo}` no está en el vocabulario canónico. Si buscas el "
+                            f"LEXEMA que escribió el autor —protocolo legacy—, usa "
+                            f"`?raw_tipo={tipo}`."),
+                "canon": sorted(lp.CANON_TIPOS)})
+        w.append("e.tipo=?"); p.append(canon)
+    if raw_tipo:
+        # EL LEXEMA, que es otra pregunta: «¿qué escribió el autor?», no «¿qué
+        # significa?». Búsqueda sin caja porque `raw_tipo` conserva la del autor
+        # (`MEDIDO` y `Medido` conviven), pero lo GUARDADO y lo DEVUELTO no se
+        # normaliza nunca: es evidencia.
+        # `COLLATE NOCASE`, no `lower()`: aplicar una función a la columna impide
+        # usar el índice, y además mezclaba dos reglas distintas —el `lower()` de
+        # SQLite es esencialmente ASCII, el de Python es Unicode—, así que un
+        # lexema con acentos se comparaba con criterios que no coinciden.
+        # ⚠️ NOCASE da comparación case-insensitive ASCII. Suficiente para el
+        # vocabulario real (HEARTBEAT · MEDIDO · RESP); NO es casefold Unicode, y
+        # no se promete como tal. El día que haga falta, se diseña aparte.
+        w.append("e.raw_tipo = ? COLLATE NOCASE"); p.append(raw_tipo.strip())
     if since:
         w.append("e.ts>=?"); p.append(since)
     if q:
@@ -2441,7 +2593,11 @@ def entries(respuesta: Response,ledger: str | None = None, to: str | None = None
         join = "JOIN recipients r ON r.ledger=e.ledger AND r.eid=e.eid"
         w.append("r.who=?"); p.append(lp.canonico(to))
     w.append("e.ausente IS NULL")           # lo desaparecido no se sirve como vigente
-    sql = (f"SELECT e.ledger,e.eid,e.arrival,e.seq,e.ts,e.actor,e.tipo,e.line_no,e.head"
+    # `raw_tipo` VIAJA EN LA FILA: recomendar `?raw_tipo=` en el 422 y no devolver
+    # el campo dejaría al cliente filtrando a ciegas, sin poder ver qué lexema
+    # encontró. Y es el que sostiene la distinción evidencia/interpretación que
+    # #13 declaró en `actor_provenance`.
+    sql = (f"SELECT e.ledger,e.eid,e.arrival,e.seq,e.ts,e.actor,e.tipo,e.raw_tipo,e.line_no,e.head"
            f"{',e.body' if cuerpo else ''} FROM entries e {join}"
            # `orden=arrival` — LA CABEZA DEL LEDGER NO LA PUEDE DECIDIR EL EMISOR.
            # Por defecto se ordena por `ts`, que sella QUIEN ESCRIBE: una entrada con

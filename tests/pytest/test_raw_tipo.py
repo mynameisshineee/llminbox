@@ -551,6 +551,10 @@ def test_el_fallo_de_la_migracion_no_se_lleva_por_delante_la_columna(tmp_path, m
         s.barrido()
 
     con = db_directa(s)
+    # El índice `i_raw_tipo` (#16) apunta a la columna, así que SQLite no deja
+    # soltarla mientras exista. Se retira porque este test simula un estado
+    # HISTÓRICO anterior a los dos, y el arranque lo vuelve a crear.
+    con.execute("DROP INDEX IF EXISTS i_raw_tipo")
     con.execute("ALTER TABLE entries DROP COLUMN raw_tipo")
     con.execute("DELETE FROM meta WHERE k='raw_tipo_v'")
     con.commit()
