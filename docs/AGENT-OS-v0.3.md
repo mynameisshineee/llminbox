@@ -6,7 +6,8 @@
 |---|---|
 | **Estado** | Especificación de implementación. Sustituye a v0.1 §9-13, §16-22, §30-37, §60-61, §80, §97-98 y a v0.2 §C, §E.1, §E.2, §E.6, §H, §I. |
 | **Conserva** | La tesis de v0.1 (§A de v0.2) y el mapa de frontera de v0.2 §D/§F, que son su mejor aportación. |
-| **Fecha** | 2026-08-18 |
+| **Fecha** | 2026-08-18 · **enmendada 2026-08-21 (v0.3.1)** |
+| **Enmiendas** | **v0.3.1** — §9: `CHANGES_REQUESTED → READY` (era `→ RUNNING`) · invariante **L-1**: los estados de revisión no sostienen lease de ejecución · `RUNNING → RESULT_SUBMITTED` libera el lease · `renew` se comprueba contra el estado. Adjudicada por el operador tras el adversarial de RFC-0001 (`crm-pm-api!242`). **Enmienda deliberada, no corrección de erratas**: cambia el contrato. |
 | **Autor** | `llminbox` (carril de infraestructura de la flota) |
 | **Para** | `cto` (dueño del control-plane) · `harness-biklabs` (capa ICM) · desarrollo |
 | **Principio rector** | *Los agentes producen trabajo; el sistema coordina.* — heredado, intacto. |
@@ -591,16 +592,80 @@ Para eso, necesariamente API/CLI validada. Esto conserva la propiedad de que el 
 # §9 · Job y máquina de estados
 
 ```
-DRAFT → QUEUED → READY → CLAIMED → RUNNING → RESULT_SUBMITTED
-                                      ↓ ↑         ↓
-                                    BLOCKED   REVIEW_PENDING
-                                                  ↓        ↓
-                                            APPROVED  CHANGES_REQUESTED
-                                                  ↓        ↓
-                                               DONE     RUNNING
+   DRAFT → QUEUED → READY → CLAIMED → RUNNING → RESULT_SUBMITTED
+                      ↑                 ↓ ↑             ↓
+                      │               BLOCKED     REVIEW_PENDING
+                      │                                 ↓
+                      │                    APPROVED ←────┴────→ CHANGES_REQUESTED
+                      │                        ↓                        │
+                      │                      DONE                       │
+                      └────────────────────────────────────────────────-┘
+                        v0.3.1: vuelve a READY ⇒ exige un claim NUEVO
+                        (era «→ RUNNING», que daba por vivo el lease anterior)
+
+   terminales: FAILED · CANCELLED        dimensión: escalation_open (NO es estado)
 ```
 
 Terminales adicionales: `FAILED` · `CANCELLED`. `ESCALATED` **no es un estado**: es una dimensión independiente (`escalation_open: bool`) que convive con `RUNNING` o `BLOCKED`.
+
+**Enmienda v0.3.1 — `CHANGES_REQUESTED` va a `READY`, no a `RUNNING`.** La v0.3
+original dibujaba `CHANGES_REQUESTED → RUNNING`, y eso afirma en silencio dos
+cosas que el resto de esta spec ya aprendió a no dar por buenas: **que el mismo
+ejecutor sigue siendo el correcto**, y **que su lease sigue vivo**. Tras un ciclo
+de revisión las dos pueden ser falsas — y la segunda lo es casi siempre, porque
+una revisión humana dura más que cualquier TTL razonable.
+
+Es exactamente el mismo razonamiento por el que `unblock` vuelve a `READY` y no a
+`CLAIMED`, escrito tres párrafos más abajo. Tenerlo en un sitio y no en el otro
+era una inconsistencia interna, no dos decisiones distintas.
+
+**No hay «reanudar al dueño anterior».** Volver a ejecutar exige un `claim`
+nuevo, por las reglas normales.
+
+### Invariante L-1 — los estados de revisión **no sostienen lease de ejecución**
+
+| estado | ¿admite execution lease? |
+|---|---|
+| `CLAIMED` · `RUNNING` · `BLOCKED` | **sí** |
+| `DRAFT` · `QUEUED` · `READY` | no (todavía no hay ejecutor) |
+| `RESULT_SUBMITTED` · `REVIEW_PENDING` · `CHANGES_REQUESTED` · `APPROVED` | **no — el trabajo ya se entregó** |
+| `DONE` · `FAILED` · `CANCELLED` | no (terminales) |
+
+Por tanto **`RUNNING → RESULT_SUBMITTED` libera el lease de ejecución en la misma
+transacción** que el cambio de estado, el evento y la fila de outbox. Entregar el
+resultado ES el fin de la autoridad de ejecución.
+
+`BLOCKED` sí lo conserva —por eso `unblock` tiene que liberarlo explícitamente— y
+esa asimetría es deliberada: un job bloqueado sigue siendo *de alguien*, un job
+entregado ya no.
+
+**Y `renew` se comprueba contra el estado, no sólo contra el lease.** Un `renew`
+válido exige, además de principal · generación · `expires_at > now()` ·
+`released_at IS NULL`, que **el job esté en un estado que admita lease**. Sin esa
+condición, un lease que sobreviviera por descuido a `RESULT_SUBMITTED` se podría
+renovar indefinidamente sobre un trabajo que ya está en revisión.
+
+**Falsador F-J3** — entregar resultado (`RESULT_SUBMITTED`) y que el mismo worker
+intente `renew` con su lease de antes ⇒ **rechazo**. Si lo acepta, los estados de
+revisión no son lease-free y el fencing tiene un hueco por el que vuelve el
+ataque de la generación viva.
+
+**Y la carrera, que es el caso que de verdad importa.** F-J3 tal como está escrito
+es secuencial, y así no mide nada interesante: `renew` y `result_submit` pueden
+llegar a la vez —es lo normal cuando el heartbeat corre en un hilo aparte del que
+entrega—. `renew` **no** es una excepción al contrato transaccional de §16: se
+serializa con `BEGIN IMMEDIATE` como cualquier otra mutación, así que sólo hay dos
+órdenes posibles y **las dos son seguras**:
+
+| quién commitea primero | qué pasa |
+|---|---|
+| `result_submit` | el estado ya es `RESULT_SUBMITTED`; la comprobación de estado del `renew` falla ⇒ **rechazo**. Es F-J3, ahora por carrera y no por secuencia |
+| `renew` | extiende un lease que `result_submit` libera un instante después. **Inocuo**: no cambia el estado, no crea generación, y el lease muere igual en la transacción siguiente |
+
+Lo que **no** puede ocurrir es que las dos se entrelacen y quede un lease vivo
+sobre un job entregado — que es justo el hueco por el que volvería el ataque de la
+generación viva. Sin `BEGIN IMMEDIATE` esa tercera posibilidad existiría, y por eso
+el contrato de §16 es precondición de L-1, no un detalle de implementación.
 
 **`unblock` es una transición con contrato, no un botón.** La API expone `POST /jobs/{id}/unblock` y §9 no decía de dónde sale ni adónde va, que es justo lo que un worker necesita saber para no quedarse esperando un lease que ya no tiene:
 
