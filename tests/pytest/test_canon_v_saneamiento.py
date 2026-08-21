@@ -374,7 +374,8 @@ def test_subir_RAW_TIPO_V_arrastra_el_tipo_sin_reindex(tmp_path, monkeypatch):
     contenido, mtime = led.read_bytes(), led.stat().st_mtime
 
     s2 = construir(tmp_path, monkeypatch)          # arranque: _preparar_indice
-    led.write_bytes(contenido); os.utime(led, (mtime, mtime))
+    led.write_bytes(contenido)
+    os.utime(led, (mtime, mtime))
     with TestClient(s2.app):
         pass                                        # sin barrido: sólo el arranque
 
