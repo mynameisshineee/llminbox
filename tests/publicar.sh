@@ -91,8 +91,11 @@ FALLOS=0
 for t in $DOMINIO; do
   publica cto-A qa "$t" "titular de $t" >/dev/null 2>&1 || { FALLOS=$((FALLOS+1)); echo "     · rechazado: $t"; }
 done
-[ "$FALLOS" = "0" ] && bien "el publicador acepta todo el dominio del canon ($(wc -w <<<"$DOMINIO" | tr -d ' ') lexemas, alias incluidos)" \
-  || mal "dominio del canon publicable" "0 rechazos" "$FALLOS rechazos"
+if [ "$FALLOS" = "0" ]; then
+  bien "el publicador acepta todo el dominio del canon ($(wc -w <<<"$DOMINIO" | tr -d ' ') lexemas, alias incluidos)"
+else
+  mal "dominio del canon publicable" "0 rechazos" "$FALLOS rechazos"
+fi
 
 # CONTRACONTROL: aceptar de más sería peor que aceptar de menos. Un tipo que el canon
 # no reconoce entra a `entries.tipo` como NULL y desaparece de `/entries?tipo=`.
@@ -113,9 +116,11 @@ echo "── canonizar gobierna la aceptación, no borra la evidencia ──"
 # `tipo` es la interpretación. Si el publicador escribiera MEASURED, destruiría el
 # dato con el que se midió que 14 de 15 autores de MEDIDO también escriben MEASURED.
 publica cto-A qa MEDIDO "un alias conserva su lexema" >/dev/null 2>&1
-grep -q '^### \[cto-A → qa · MEDIDO\]' "$T/L.md" \
-  && bien "el alias se publica con SU lexema (MEDIDO), no reescrito a MEASURED" \
-  || mal "lexema conservado" "cabecera con · MEDIDO ·" "$(grep -o '· [A-Z]*\]' "$T/L.md" | tail -1)"
+if grep -q '^### \[cto-A → qa · MEDIDO\]' "$T/L.md"; then
+  bien "el alias se publica con SU lexema (MEDIDO), no reescrito a MEASURED"
+else
+  mal "lexema conservado" "cabecera con · MEDIDO ·" "$(grep -o '· [A-Z]*\]' "$T/L.md" | tail -1)"
+fi
 
 echo "── el carril no es opcional ──"
 # «Un carril, una ledger por sesión» deja de ser disciplina y pasa a ser mecánica.

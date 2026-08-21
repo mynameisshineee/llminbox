@@ -160,7 +160,7 @@ Two fields, and the difference matters:
 (§4) and is `NULL` whenever the lexeme isn't in it. A word that merely *appears*
 in the headline is not a type:
 
-```
+```text
 ### [cto → qa · ACK tu INGESTED del jueves] …   raw_tipo=None   tipo=None
 ### [cto → qa · FINDING] …                      raw_tipo=FINDING   tipo=FINDING
 ### [cto → qa · MEDIDO] …                       raw_tipo=MEDIDO    tipo=MEASURED
@@ -168,7 +168,19 @@ in the headline is not a type:
 ### [HEARTBEAT asistente-backend] …             raw_tipo=HEARTBEAT tipo=None
 ```
 
-Until `CANON_V=1` this was a **substring search over the header** in a fixed
+Two sources, in this order:
+
+1. **The type slot** — what sits after the last `·` in the bracket. This wins.
+2. **The opening label** (§4) — only if there's no slot. `### [HEARTBEAT
+   asistente-backend]` has no `·`, so the label is all there is, and that row
+   above is the one case where `raw_tipo` doesn't come from a slot. Put both in
+   and the slot still wins: `### [HEARTBEAT cto → qa · FYI]` reads `FYI`.
+
+Either way, `tipo` is still `canonical_tipo(raw_tipo)` — and most opening labels
+canonicalize to `NULL`, because only `RESP` and `ACK` are in the canon. That's why
+`HEARTBEAT` has a `raw_tipo` and no `tipo`.
+
+Until `CANON_V=1` the type was instead a **substring search over the header** in a fixed
 priority order, which is why that first example used to resolve to `INGESTED`
 even though the entry was an `ACK`. It doesn't any more: the type comes from the
 slot, not from scanning prose. If you don't put a lexeme in the slot, you get
@@ -316,8 +328,9 @@ Read this before treating anything above as stronger than it is:
   doesn't support that today; it either misattributes to whichever name is
   closest, or (if you engineer around it) risks the same false-positive class
   the span limit exists to avoid.
-- **Type extraction reads the slot, and only the slot** (§3.4). A lexeme that
-  isn't in the type slot is not a type — including one you meant as the type.
+- **Type extraction reads the slot, or the opening label if there is no slot —
+  and nothing else** (§3.4). A lexeme sitting anywhere else in the header is not
+  a type, including one you meant as the type.
   The trade is deliberate: the old substring search let a headline that merely
   *mentioned* another type steal the field, so it was removed in `CANON_V=1`.
   What you get instead is `raw_tipo = None`, which is honest but is still a
