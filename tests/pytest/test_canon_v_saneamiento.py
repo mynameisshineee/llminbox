@@ -277,3 +277,27 @@ def test_migrar_raw_tipo_arrastra_el_tipo_en_la_MISMA_transaccion(tmp_path, monk
     assert f["raw_tipo"] is None, f"el extractor nuevo debía retirar el lexema: {f['raw_tipo']!r}"
     assert f["tipo"] is None, \
         f"`tipo`={f['tipo']!r} sobrevive a su lexema: el arrastre no ocurrió en esta transacción"
+
+
+def test_el_indice_de_raw_tipo_existe_en_una_base_NUEVA(tmp_path, monkeypatch):
+    """El índice se creaba ANTES de la columna que indexa.
+
+    `SCHEMA` crea `entries` sin `raw_tipo` —la columna llega por la vía aditiva de
+    `COLUMNAS_ANADIDAS`—, así que en una base nueva mi `CREATE INDEX` fallaba con
+    `no such column: raw_tipo`, el `except` lo registraba y nadie reintentaba: la
+    base quedaba **sin el índice que `?raw_tipo=` necesita**, en silencio.
+
+    Es la tercera vez en esta PR que el orden de dos operaciones importa más que
+    su contenido —el índice dentro de `SCHEMA`, el saneamiento tras el sello, y
+    ahora esto—. El síntoma nunca fue un fallo ruidoso.
+
+    FALSADOR: con el bloque antes del bucle de columnas, el índice no existe.
+    """
+    from fastapi.testclient import TestClient
+    from conftest import construir, db_directa
+    s_ = construir(tmp_path, monkeypatch)          # base recién creada
+    with TestClient(s_.app):
+        s_.barrido()
+    idx = [r[0] for r in db_directa(s_).execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='entries'")]
+    assert "i_raw_tipo" in idx, f"el índice no se creó en una base nueva: {idx}"

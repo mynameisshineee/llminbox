@@ -2084,20 +2084,6 @@ def _preparar_indice(con: sqlite3.Connection) -> None:
     # disciplina —26 de 96 cerrados (27 %)—, porque «qa: 10 de 10» incluía el relevo
     # que le hice yo esa mañana. Un dato que no distingue las dos cosas se lee como
     # la buena.
-    # ÍNDICES AÑADIDOS: por la vía aditiva, NO dentro de `SCHEMA`. Meterlo ahí
-    # rompió 172 tests en la primera versión — `SCHEMA` se aplica en un camino que
-    # no tolera lo que le añadí, y el efecto no fue un error claro sino «no such
-    # table: cursors»: la base entera dejaba de construirse.
-    #
-    # `raw_tipo` PRIMERO en el índice, y el orden importa: `/entries?raw_tipo=` se
-    # consulta SIN ledger —es búsqueda global por lexema—, así que uno que empezara
-    # por `ledger` no lo cubriría. Con `ledger` detrás sigue sirviendo la acotada.
-    # NOCASE para que case con el filtro del endpoint.
-    try:
-        con.execute("CREATE INDEX IF NOT EXISTS i_raw_tipo "
-                    "ON entries(raw_tipo COLLATE NOCASE, ledger)")
-    except sqlite3.OperationalError as e:
-        print(f"[arranque] no pude crear i_raw_tipo: {e}", flush=True)
     for tabla, col, tipo in COLUMNAS_ANADIDAS:
         try:
             hay = {r[1] for r in con.execute(f"PRAGMA table_info({tabla})")}
@@ -2106,6 +2092,21 @@ def _preparar_indice(con: sqlite3.Connection) -> None:
                 print(f"[arranque] {tabla}: columna {col} añadida", flush=True)
         except sqlite3.OperationalError as e:
             print(f"[arranque] no pude añadir {tabla}.{col}: {e}", flush=True)
+    # ÍNDICES AÑADIDOS — DESPUÉS del bucle, y el orden ERA el defecto: `SCHEMA`
+    # crea `entries` SIN `raw_tipo` (la columna llega por la vía aditiva de
+    # arriba), así que crearlo antes fallaba con «no such column» en TODA base
+    # nueva, el `except` lo registraba y nadie reintentaba: quedaba sin el
+    # índice que `?raw_tipo=` necesita, en silencio.
+    #
+    # Va por vía aditiva y no dentro de `SCHEMA` porque meterlo ahí rompió 172
+    # tests. Y `raw_tipo` PRIMERO: `/entries?raw_tipo=` se consulta SIN ledger
+    # —búsqueda global por lexema—, y uno que empezara por `ledger` no lo
+    # cubriría; con `ledger` detrás sigue sirviendo la consulta acotada.
+    try:
+        con.execute("CREATE INDEX IF NOT EXISTS i_raw_tipo "
+                    "ON entries(raw_tipo COLLATE NOCASE, ledger)")
+    except sqlite3.OperationalError as e:
+        print(f"[arranque] no pude crear i_raw_tipo: {e}", flush=True)
     migrar_raw_tipo(con)           # rellena el corpus ya indexado (ver la función)
     migrar_canon_v1(con)           # ADITIVA: sólo donde `tipo` está vacío (ver la función)
     migrar_canon(con)              # GLOBAL: tipo = canonical_tipo(raw_tipo) (ver la función)
