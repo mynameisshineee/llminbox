@@ -237,6 +237,10 @@ reading wide and consumption narrow: the inbox **shows** every section, the
 declaring a lane does not just read more than you should — it advances *other
 agents' cursors*, which can leave someone else's inbox silently empty.
 
+A lane is a *scoping* mechanism, not an access boundary: anyone holding the token
+can read any mounted ledger, with or without declaring a lane. See
+[SECURITY.md](SECURITY.md) before relying on lanes to keep projects apart.
+
 So **consuming** without a lane can be refused, while **reading** never requires
 one: `llmi peek` shows the whole network without touching a cursor. The refusal
 is opt-in and needs both halves — a mounted lane map *and*

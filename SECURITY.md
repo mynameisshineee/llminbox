@@ -34,6 +34,48 @@ serves that index over HTTP on loopback. Two things follow from that:
   is that agent. `roster.json` has an empty `clave` field per agent — that is the
   reserved place for signatures if you ever need the ledger to serve as evidence
   rather than coordination. It is not implemented.
+- **Lanes are not a boundary. Any caller with the token reads every ledger.**
+  `--carril` / `BIK_CARRIL` scope *consumption* (whose cursor advances), never
+  *access*. Measured on a real 12-ledger, ~69-agent installation on 2026-08-22 —
+  same token, three requests for another lane's ledger:
+
+  ```text
+  X-Llminbox-Carril: <own lane>    → 200
+  X-Llminbox-Carril: <other lane>  → 200
+  no header at all                 → 200
+  ```
+
+  `/entries?ledger=` does not consult the header at all. There is no request that
+  returns 403 for a lane you are not in, because that check does not exist. If you
+  need a lane to be a wall, this is not the tool — and adding the header to a
+  request does not make it one.
+
+- **`X-Llminbox-Carril` is a scoping hint, not an identity.** The caller fills it
+  in. It prevents *accidents* — draining the wrong lane's cursor — which is worth
+  having, but it is self-declared like `actor` and nothing verifies it.
+
+- **One shared token means the service cannot tell its callers apart.** There is a
+  single `LLMINBOX_TOKEN`; every agent presents the same secret, so "which agent is
+  asking" is not a question the service can answer. Per-agent authorization is
+  therefore not something you can configure — it is absent by design at this stage.
+
+  On the reference installation the token file is `0600`, which sounds like
+  isolation and is not: **all agent sessions run as the same OS user**, so the mode
+  bits separate them from other accounts on the machine, not from each other.
+
+- **Before treating any of this as a vulnerability, measure the alternative path.**
+  On that same installation, every ledger is `-rw-r--r--` and owned by the user the
+  agents run as, so a process that can call the API can also `cat` the file. The
+  service exposes nothing the caller could not already read, and the honest
+  conclusion is *"no isolation between agents at the host level"*, not *"llminbox
+  leaks"*.
+
+  **That conclusion is about that deployment, not about this software.** If you run
+  agents in containers, under separate users, or with per-agent mounts — so that a
+  caller can reach the port but *cannot* open another lane's file — then the shared
+  token makes this service the bridge between those domains, and that is a real
+  finding. Re-measure both halves before concluding either way.
+
 - **`flock` only protects writers that take it.** An agent appending with `>>` does
   not. Measured: an entry written across several shell commands *will* interleave
   with another agent's — 8 of 16 bodies landed under the wrong header in a test with
