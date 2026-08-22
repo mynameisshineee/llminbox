@@ -109,10 +109,10 @@ _aviso_identidad() {   # $1 = nombre tecleado (o vacío)
   rol="${par%%$'\t'*}"; car="${par##*$'\t'}"
   YO_DERIVADO="$rol"; CARRIL_DERIVADO="$car"
   if [ -n "${1:-}" ] && [ "$1" != "$rol" ]; then
-    echo "· ojo: tu sesión es «$rol-$car» y estás usando «$1» — si es a propósito, ignora esto" >&2
+    echo "· ojo: tu sesión es «$rol-${car}» y estás usando «$1» — si es a propósito, ignora esto" >&2
   fi
   if [ -n "${BIK_CARRIL:-}" ] && [ "$BIK_CARRIL" != "$car" ]; then
-    echo "· ojo: BIK_CARRIL=«$BIK_CARRIL» pero tu sesión es del carril «$car»" >&2
+    echo "· ojo: BIK_CARRIL=«${BIK_CARRIL}» pero tu sesión es del carril «${car}»" >&2
   fi
 }
 
@@ -856,7 +856,7 @@ except Exception: print(open(sys.argv[1]).read(), file=sys.stderr)' "$cuerpo_pos
                    | python3 -c 'import json,sys;print(json.load(sys.stdin).get(sys.argv[1],""))' "$carril" 2>/dev/null || true)"
             if [ -n "$mio" ]; then
               printf '%s\n' "$out" | grep -q "^── $mio ·" \
-                || echo "· 0 nuevas en «$mio» (tu carril: $carril) — lo de arriba es de OTROS carriles" >&2
+                || echo "· 0 nuevas en «${mio}» (tu carril: $carril) — lo de arriba es de OTROS carriles" >&2
             fi
           fi
           exit 0 ;;
