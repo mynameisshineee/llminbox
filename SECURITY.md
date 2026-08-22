@@ -39,7 +39,7 @@ serves that index over HTTP on loopback. Two things follow from that:
   *access*. Measured on a real 12-ledger, ~69-agent installation on 2026-08-22 —
   same token, three requests for another lane's ledger:
 
-  ```
+  ```text
   X-Llminbox-Carril: <own lane>    → 200
   X-Llminbox-Carril: <other lane>  → 200
   no header at all                 → 200
